@@ -65,14 +65,59 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         "XLE", "XLB", "XLV", "XLU", "GLDM", "DBC",
     })
 
-    def _CgSubResolution(self, ticker) -> Resolution:
-        """V17849: tradable CoreGrowth ETFs at MINUTE for intraday fills; others DAILY."""
-        if str(ticker or "").strip().upper() in self._CG_MINUTE_ETFS:
-            return Resolution.MINUTE
-        return Resolution.DAILY
+    # [E0] Tradable universe: any equity that can receive orders => MINUTE.
+    _CG_TRADABLE = _CG_MINUTE_ETFS | frozenset({"MU", "NVDA", "AVGO", "USFR"})
+
+    def _CgRegisterEquity(self, ticker, tradable: bool = False):
+        """[E0] Central equity registration: tradable=>MINUTE, signal=>DAILY; sticky+deduped."""
+        tkr = str(ticker or "").strip().upper()
+        if not hasattr(self, "_cg_sub_registry"):
+            self._cg_sub_registry = {}
+        is_tradable = (bool(tradable) or tkr in self._CG_TRADABLE
+                       or bool(self._cg_sub_registry.get(tkr, False)))
+        sec = self.add_equity(tkr, Resolution.MINUTE if is_tradable else Resolution.DAILY)
+        self._cg_sub_registry[tkr] = is_tradable
+        return sec
 
     def _CgAddEquity(self, ticker):
-        return self.add_equity(ticker, self._CgSubResolution(ticker))
+        return self._CgRegisterEquity(ticker, tradable=False)
+
+    def _CgSubscriptionAudit(self) -> None:
+        """[E0] Flag any tradable equity left on DAILY. Backtest: raise. Live: log."""
+        info = {}
+        try:
+            subs = list(self.subscription_manager.subscriptions)
+        except Exception:
+            subs = []
+        for cfg in subs:
+            try:
+                tkr = str(cfg.symbol.value)
+                st  = cfg.symbol.security_type
+            except Exception:
+                continue
+            d = info.setdefault(tkr, {"minute": False, "equity": False})
+            if cfg.resolution == Resolution.MINUTE: d["minute"] = True
+            if st == SecurityType.EQUITY: d["equity"] = True
+        reg = getattr(self, "_cg_sub_registry", {})
+        tm, sd, cd, vio = [], [], [], []
+        for tkr in sorted(info.keys()):
+            d = info[tkr]
+            if not d["equity"]:
+                cd.append(tkr); continue
+            if bool(reg.get(tkr, False)) or (tkr in self._CG_TRADABLE):
+                tm.append(tkr)
+                if not d["minute"]: vio.append(f"{tkr}:DAILY")
+            else:
+                sd.append(tkr)
+        v = "NONE" if not vio else "; ".join(vio)
+        self.log("[INIT] CG_SUBSCRIPTION_AUDIT | "
+                 f"tradable minute: {', '.join(tm)} | signal daily: {', '.join(sd)} | "
+                 f"custom daily: {', '.join(cd)} | violations: {v}")
+        if vio:
+            if self.live_mode:
+                self.log(f"[INIT] CG_SUB_VIOLATION live-mode log-only: {v}")
+            else:
+                raise Exception(f"CG_SUBSCRIPTION_AUDIT violations: {v}")
 
     def Initialize(self):
         if not self.live_mode:
@@ -378,6 +423,8 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
         self.vix = self.add_data(Fred, "VIXCLS", Resolution.DAILY).Symbol
         self.yc  = self.add_data(Fred, "T10Y3M", Resolution.DAILY).Symbol
+
+        self._CgSubscriptionAudit()  # [E0] subscription integrity check
 
         self.current_regime    = None
         self.regime_start_date = None

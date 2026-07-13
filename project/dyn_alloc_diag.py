@@ -67,10 +67,10 @@ class DynamicAllocationDiagMixin:
 
         self.rr_candidates = []
         for ticker in ["MU", "NVDA", "AVGO"]:
-            self.rr_candidates.append(self.add_equity(ticker, Resolution.DAILY).Symbol)
-        self.rr_smh = self.add_equity("SMH", Resolution.DAILY).Symbol
-        self.rr_qqq = self.add_equity("QQQ", Resolution.DAILY).Symbol
-        self.rr_cash = self.add_equity(self.dyn_alloc_rr_cash_ticker, Resolution.DAILY).Symbol
+            self.rr_candidates.append(self._CgRegisterEquity(ticker, tradable=True).Symbol)
+        self.rr_smh = self._CgRegisterEquity("SMH").Symbol
+        self.rr_qqq = self._CgRegisterEquity("QQQ").Symbol
+        self.rr_cash = self._CgRegisterEquity(self.dyn_alloc_rr_cash_ticker, tradable=True).Symbol
 
         self.rr_sma50 = {s: self.sma(s, 50, Resolution.DAILY) for s in self.rr_candidates}
         self.rr_sma200 = {s: self.sma(s, 200, Resolution.DAILY) for s in self.rr_candidates}

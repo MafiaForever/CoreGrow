@@ -82,10 +82,10 @@ class RideRocketSleeve:
         """Called from algo.Initialize() after base CG symbols are added."""
         a = self.algo
         tickers = ["MU", "NVDA", "AVGO"]
-        self.candidates = [a.add_equity(t, Resolution.DAILY).symbol for t in tickers]
-        self.smh  = a.add_equity("SMH",  Resolution.DAILY).symbol
-        self.qqq  = a.add_equity("QQQ",  Resolution.DAILY).symbol
-        self.usfr = a.add_equity("USFR", Resolution.DAILY).symbol
+        self.candidates = [a._CgRegisterEquity(t, tradable=True).symbol for t in tickers]
+        self.smh  = a._CgRegisterEquity("SMH").symbol
+        self.qqq  = a._CgRegisterEquity("QQQ").symbol
+        self.usfr = a._CgRegisterEquity("USFR", tradable=True).symbol
         self.all_syms = self.candidates + [self.smh, self.qqq, self.usfr]
 
         # ── Parameters (all overridable via get_parameter) ────────────────────
@@ -148,7 +148,7 @@ class RideRocketSleeve:
         # ── SPY relative-strength gate  [SPY_GATE] ────────────────────────────
         self.spy = getattr(a, "sym_spy", None)
         if self.spy is None:
-            self.spy = a.add_equity("SPY", Resolution.DAILY).symbol
+            self.spy = a._CgRegisterEquity("SPY").symbol
         self.roc20_spy = a.roc(self.spy, 20, Resolution.DAILY)
         self.roc5_spy  = a.roc(self.spy,  5, Resolution.DAILY)
 

@@ -501,6 +501,9 @@ class RRXSectorDiagMixin:
         self.rrx_rotq_max_rsi       = float(_gf("rrx_rotq_max_rsi",   82.0))
         self.rrx_rotq_spy_edge      = float(_gf("rrx_rotq_spy_edge",   0.01))
 
+        # [E0] RRX universe is tradable only when the trade bridge can route orders.
+        _rrx_tradable_sub = _gb("rrx_trade_bridge_enable", 0)
+
         self._rrx_etf_sym:    dict = {}
         self._rrx_stk_sym:    dict = {}
         self._rrx_etf_roc20:  dict = {}
@@ -522,7 +525,7 @@ class RRXSectorDiagMixin:
         for theme, cfg in RRX_THEMES.items():
             etf_ticker = cfg["etf"]
             try:
-                etf_sym = self.add_equity(etf_ticker, Resolution.DAILY).Symbol
+                etf_sym = self._CgRegisterEquity(etf_ticker, tradable=_rrx_tradable_sub).Symbol
             except Exception:
                 continue
             self._rrx_etf_sym[theme] = etf_sym
@@ -539,7 +542,7 @@ class RRXSectorDiagMixin:
             stk_syms: list = []
             for stk_ticker in cfg.get("stocks", []):
                 try:
-                    stk_sym = self.add_equity(stk_ticker, Resolution.DAILY).Symbol
+                    stk_sym = self._CgRegisterEquity(stk_ticker, tradable=_rrx_tradable_sub).Symbol
                 except Exception:
                     continue
                 stk_syms.append(stk_sym)
@@ -555,8 +558,8 @@ class RRXSectorDiagMixin:
                 all_syms.append(stk_sym)
             self._rrx_stk_sym[theme] = stk_syms
 
-        spy = getattr(self, "sym_spy", None) or self.add_equity("SPY", Resolution.DAILY).Symbol
-        qqq = self.add_equity("QQQ", Resolution.DAILY).Symbol
+        spy = getattr(self, "sym_spy", None) or self._CgRegisterEquity("SPY").Symbol
+        qqq = self._CgRegisterEquity("QQQ").Symbol
         self._rrx_spy_roc20 = self.roc(spy, 20, Resolution.DAILY)
         self._rrx_spy_roc60 = self.roc(spy, 60, Resolution.DAILY)
         self._rrx_qqq_roc20 = self.roc(qqq, 20, Resolution.DAILY)
