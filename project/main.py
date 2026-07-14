@@ -10,11 +10,12 @@ from stress_scenarios import StressScenarioMixin
 from cg_market_structure import CoreGrowthMarketStructureMixin
 from dyn_thresh_diag import DynamicThresholdDiagMixin
 from dyn_alloc_diag import DynamicAllocationDiagMixin
-from rr_xsector_diag import RRXSectorDiagMixin          # [RRX]
+from rr_xsector_diag import RRXSectorDiagMixin
 from cashflow_live import LiveCashFlowMixin
-from cg_subscriptions import CoreGrowthSubscriptionMixin  # [E0.1]
-from cg_core_recovery_diag import CgCoreRecoveryDiagMixin  # [CORE-D0.2]
-from cg_ids_normal_cap_diag import CgIdsNormalCapDiagMixin  # [IDS-CAP-D0]
+from cg_subscriptions import CoreGrowthSubscriptionMixin
+from cg_core_recovery_diag import CgCoreRecoveryDiagMixin
+from cg_ids_normal_cap_diag import CgIdsNormalCapDiagMixin
+from cg_legacy_params import CgLegacyParamProfileMixin
 
 
 class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
@@ -80,9 +81,9 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
         self.force_rebalance_date = self._ParseDateParam(_param("force_rebalance_date")) or date(2026,5,29)
 
-        # [E0.5.1] Parse fast-baseline flag before any diagnostic init that reads it.
         self.cg_fast_baseline_mode = str(_param("cg_fast_baseline_mode") or "1").strip().lower() in ("1","true","yes","on")
         self._cg_fast_disabled = []
+        self.cg_legacy_param_profile_enable = str(_param("cg_legacy_param_profile_enable") or "0").strip().lower() in ("1","true","yes","on")
 
         self._CgBuildTradableExtra()  # [E0.1] before any equity subscription
 
@@ -143,6 +144,9 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self.short_shock_1d_threshold = float(self.get_parameter("short_shock_1d_threshold") or 2.0)
         self.short_shock_2d_threshold = float(self.get_parameter("short_shock_2d_threshold") or 4.0)
         self.short_shock_3d_threshold = float(self.get_parameter("short_shock_3d_threshold") or 4.2)
+        self.short_shock_decay_days = 1
+        self.sh_profit_signal_threshold = 0.007
+        self.sh_profit_spy_scale = 0.60
 
         self.neutral_decay_days = 20
         self.neutral_decay_factor = 0.90
@@ -301,6 +305,14 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self.trend_enable_vix_pct = 0.70
         self.trend_sleeve_weight_cap = 0.30
         self.regime_min_persist_days = 3
+        self.trend_ma_period = 160
+        self.spy_ema_fast_period = 9
+        self.spy_ema_mid_period = 75
+        self.spy_ema_slow_period = 120
+        self.spy_long_sma_period = 200
+        self.max_symbol_weight = 2.5
+        self.max_total_exposure = 1.9
+        self.c1r_ge4_enable = False
 
         self.sym_spy   = self._CgAddEquity("SPY").Symbol
         self.sym_gld   = self._CgAddEquity("GLD").Symbol
@@ -342,10 +354,11 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self._ids_diag_date     = None
 
         self.sh_mode = str(self.get_parameter("sh_mode") or "SPY_CUT_ONLY").upper()  # FULL | SPY_CUT_ONLY
+        self.CgLegacyParamProfileApply()  # before SH/indicators; never emergency_dd
         self.SHInitialize()
 
-        self.DynAllocInitialize()  # [DYN_ALLOC_D0]
-        self.RRXInitialize()       # [RRX]
+        self.DynAllocInitialize()
+        self.RRXInitialize()
 
         self.active_symbols = set([
             self.sym_spy, self.sym_gld, self.sym_bnd, self.sym_tip,
@@ -356,11 +369,11 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
               + getattr(self, "rrx_active_symbols", []))  # [RRX]
 
         self.cash_gate_ma    = self.sma(self.sym_cash, 80, Resolution.DAILY)
-        self.trend_ma    = self.sma(self.sym_spy, 160, Resolution.DAILY)
-        self.spy_ema_75  = self.ema(self.sym_spy, 75,  Resolution.DAILY)
-        self.spy_sma_200 = self.sma(self.sym_spy, 200, Resolution.DAILY)
-        self.spy_ema_9  = self.ema(self.sym_spy, 9,  Resolution.DAILY)
-        self.spy_ema_120 = self.ema(self.sym_spy, 120, Resolution.DAILY)
+        self.trend_ma    = self.sma(self.sym_spy, int(self.trend_ma_period), Resolution.DAILY)
+        self.spy_ema_75  = self.ema(self.sym_spy, int(self.spy_ema_mid_period), Resolution.DAILY)
+        self.spy_sma_200 = self.sma(self.sym_spy, int(self.spy_long_sma_period), Resolution.DAILY)
+        self.spy_ema_9  = self.ema(self.sym_spy, int(self.spy_ema_fast_period), Resolution.DAILY)
+        self.spy_ema_120 = self.ema(self.sym_spy, int(self.spy_ema_slow_period), Resolution.DAILY)
 
         self.def_ma = {
             self.sym_tip:  self.sma(self.sym_tip,  self.def_tilt_trend_ma_period, Resolution.DAILY),
@@ -375,16 +388,14 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self.vix = self.add_data(Fred, "VIXCLS", Resolution.DAILY).Symbol
         self.yc  = self.add_data(Fred, "T10Y3M", Resolution.DAILY).Symbol
 
-        self._CgSubscriptionAudit()  # [E0] subscription integrity check
-        self._CgDiagGuardStartupLog()  # [E0.4] diagnostic trade guard status
+        self._CgSubscriptionAudit()
+        self._CgDiagGuardStartupLog()
 
-        # [E0.5.1] Fast-baseline overrides were applied at each flag's own source
-        # (before its expensive diagnostic init); report what was actually forced off.
         if self.cg_fast_baseline_mode:
             self.log(f"[INIT] CG_FAST_BASELINE mode=1 disabled={','.join(self._cg_fast_disabled)}")
 
-        self.CgCoreRecoveryInit()  # [CORE-D0.2]
-        self.CgIdsNormalCapInit()  # [IDS-CAP-D0]
+        self.CgCoreRecoveryInit()
+        self.CgIdsNormalCapInit()
 
         self.current_regime    = None
         self.regime_start_date = None
@@ -428,12 +439,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
         self.short_shock_flag       = False
         self._short_shock_set_date  = None
-        self.short_shock_decay_days = 1
-
-        self.sh_profit_signal_threshold = 0.007    # [SH_PROFIT_SIGNAL] min sh_move  profitable exit
-        self.sh_profit_spy_scale        = 0.60     # [SH_PROFIT_SIGNAL] scale   restore_spy   
-
-        self._sh_profit_exit_signal     = False    # [SH_PROFIT_SIGNAL]
+        self._sh_profit_exit_signal = False
 
         self._last_core_targets    = {}
         self._last_overlay_targets = {}
@@ -447,6 +453,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             self.emergency_dd_limit              = 0.15
         else:
             self.emergency_dd_limit              = 0.50
+        self.CgLegacyParamProfileAudit()  # after emergency_dd; never overrides it
 
         self.emergency_stop_triggered        = False
         self.emergency_liquidation_executed  = False
@@ -1066,8 +1073,8 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
             self.EmitDynAllocD0(combined)  # [DYN_ALLOC_D0]
             self.SPYGSatTrade(combined)    # [SPYG_SAT]
-            self.CgCoreRecoveryUpdate(combined)  # [CORE-D0.2] after final targets, before orders
-            self.CgIdsNormalCapUpdate(combined)  # [IDS-CAP-D0] shadow only
+            self.CgCoreRecoveryUpdate(combined)
+            self.CgIdsNormalCapUpdate(combined)
 
             _no_state = self.live_mode and not getattr(self,"_live_state_loaded",True)
             _save_err = self.live_mode and not getattr(self,"_state_save_ok",True)  # [LSS2]
@@ -1089,15 +1096,10 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
                 self._lfc_force_rebalance = False
                 self._lfc_force_reduce = False
         else:
-            # [CORE-D0.4] daily diag snapshot on non-rebalance days (no trade impact)
             try:
-                _crd_c = self.MergeSleeves(
-                    getattr(self, "_last_core_targets", {}) or {},
-                    getattr(self, "_last_overlay_targets", {}) or {})
-                self.CgCoreRecoveryUpdate(_crd_c)
-                self.CgIdsNormalCapUpdate(_crd_c)  # [IDS-CAP-D0]
-            except Exception:
-                pass
+                _c=self.MergeSleeves(getattr(self,"_last_core_targets",{})or{},getattr(self,"_last_overlay_targets",{})or{})
+                self.CgCoreRecoveryUpdate(_c); self.CgIdsNormalCapUpdate(_c)
+            except Exception: pass
 
         self._EmitDiagLog()
         self._EmitShadowLog()  # [SHADOW]
@@ -1224,14 +1226,12 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
     def OnEndOfAlgorithm(self):
         self._SaveState()
         self.RRXEmitFinalSummary()                        # [RRX]
-        try:
-            self.CgCoreRecoveryEmitFinal()                # [CORE-D0.4]
-        except Exception as exc:
-            self.log(f"[EOA] CG_CORE_RECOVERY_ERROR,stage=final,type={type(exc).__name__}")
-        try:
-            self.CgIdsNormalCapEmitFinal()                # [IDS-CAP-D0]
-        except Exception as exc:
-            self.log(f"[EOA] CG_IDS_CAP_ERROR,stage=final,type={type(exc).__name__}")
+        try: self.CgCoreRecoveryEmitFinal()
+        except Exception as exc: self.log(f"[EOA] CG_CORE_RECOVERY_ERROR,stage=final,type={type(exc).__name__}")
+        try: self.CgIdsNormalCapEmitFinal()
+        except Exception as exc: self.log(f"[EOA] CG_IDS_CAP_ERROR,stage=final,type={type(exc).__name__}")
+        try: self.CgLegacyParamProfileEmitDiff()
+        except Exception as exc: self.log(f"[EOA] CG_LEGACY_PARAM_ERROR,type={type(exc).__name__}")
         self.log("[EOA] final snapshot saved")
         if self.live_mode: self._EmitWorstDays(label="FINAL")
         getattr(self, "EmitXRegimeFinalDist", lambda: None)()  # [XRD]
@@ -1243,6 +1243,6 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
 from sh_hedge import _SH_IDLE, _SH_HEDGED, _SH_ENTRY_PENDING, _SH_EXIT_PENDING  # noqa: F401
 
-for _cls in (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin):
+for _cls in (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgLegacyParamProfileMixin):
     for _name, _fn in inspect.getmembers(_cls, predicate=inspect.isfunction):
         setattr(CoreGrowthPlusConditionalTrendSleeve, _name, _fn)

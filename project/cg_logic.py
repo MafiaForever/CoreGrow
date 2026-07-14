@@ -380,7 +380,7 @@ class CoreGrowthLogic(CoreGrowthRiskTacticalMixin):
         gross_mult = getattr(self, "_ApplyIntradayStressGrossCap", lambda x: x)(gross_mult) # [IDS_V2]
         for sym in merged:
             merged[sym] *= gross_mult
-        max_symbol_weight = 2.5
+        max_symbol_weight = float(getattr(self, "max_symbol_weight", 2.5))
         symbol_cap_hit = False
         for sym in merged:
             original = merged[sym]
@@ -388,7 +388,7 @@ class CoreGrowthLogic(CoreGrowthRiskTacticalMixin):
             if merged[sym] != original:
                 symbol_cap_hit = True
         self._diag['symbol_cap_triggered'] = self._bool_diag(symbol_cap_hit)
-        max_total_exposure = 1.9
+        max_total_exposure = float(getattr(self, "max_total_exposure", 1.9))
         gross = sum(abs(w) for w in merged.values())
         if gross > max_total_exposure:
             scale = max_total_exposure / gross
