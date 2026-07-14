@@ -444,7 +444,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         if self.live_mode:
             self.emergency_dd_limit              = 0.15
         else:
-            self.emergency_dd_limit              = 0.25
+            self.emergency_dd_limit              = 0.50
 
         self.emergency_stop_triggered        = False
         self.emergency_liquidation_executed  = False
