@@ -62,7 +62,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
     def Initialize(self):
         if not self.live_mode:
             self.set_start_date(2012, 1, 1)
-            self.set_end_date  (2026, 6, 20)
+            self.set_end_date  (2026, 7, 1)
             self.set_cash(10000)
 
         try:
@@ -79,7 +79,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self.force_rebalance_date = self._ParseDateParam(_param("force_rebalance_date")) or date(2026,5,29)
 
         # [E0.5.1] Parse fast-baseline flag before any diagnostic init that reads it.
-        self.cg_fast_baseline_mode = str(_param("cg_fast_baseline_mode") or "0").strip().lower() in ("1","true","yes","on")
+        self.cg_fast_baseline_mode = str(_param("cg_fast_baseline_mode") or "1").strip().lower() in ("1","true","yes","on")
         self._cg_fast_disabled = []
 
         self._CgBuildTradableExtra()  # [E0.1] before any equity subscription
