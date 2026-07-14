@@ -369,6 +369,18 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self._CgSubscriptionAudit()  # [E0] subscription integrity check
         self._CgDiagGuardStartupLog()  # [E0.4] diagnostic trade guard status
 
+        # [E0.5] Optional fast baseline mode: disable diagnostic-only workloads only.
+        self.cg_fast_baseline_mode = str(_param("cg_fast_baseline_mode") or "0").strip().lower() in ("1","true","yes","on")
+        if self.cg_fast_baseline_mode:
+            _fast_disabled = []
+            for _attr in ("rrx_sat_sr_support_premium_enable",
+                          "rrx_d6_log_daily", "rrx_d6_log_monthly",
+                          "rrx_d8_log_monthly", "plot_enable"):
+                if getattr(self, _attr, False):
+                    setattr(self, _attr, False)
+                    _fast_disabled.append(_attr)
+            self.log(f"[INIT] CG_FAST_BASELINE mode=1 disabled={','.join(_fast_disabled)}")
+
         self.current_regime    = None
         self.regime_start_date = None
         self.prev_regime       = None
