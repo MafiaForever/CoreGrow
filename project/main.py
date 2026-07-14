@@ -78,6 +78,10 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
         self.force_rebalance_date = self._ParseDateParam(_param("force_rebalance_date")) or date(2026,5,29)
 
+        # [E0.5.1] Parse fast-baseline flag before any diagnostic init that reads it.
+        self.cg_fast_baseline_mode = str(_param("cg_fast_baseline_mode") or "0").strip().lower() in ("1","true","yes","on")
+        self._cg_fast_disabled = []
+
         self._CgBuildTradableExtra()  # [E0.1] before any equity subscription
 
         self.set_brokerage_model(BrokerageName.INTERACTIVE_BROKERS_BROKERAGE)
@@ -93,6 +97,9 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self.plot_enable = str(
             self.get_parameter("plot_enable") or "1"
         ).strip().lower() in ("1","true","yes","on")
+        if self.cg_fast_baseline_mode and self.plot_enable:  # [E0.5.1]
+            self.plot_enable = False
+            self._cg_fast_disabled.append("plot_enable")
 
         self.testFloat = float(self.get_parameter("testFloat") or 1.3)
 
@@ -369,17 +376,10 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self._CgSubscriptionAudit()  # [E0] subscription integrity check
         self._CgDiagGuardStartupLog()  # [E0.4] diagnostic trade guard status
 
-        # [E0.5] Optional fast baseline mode: disable diagnostic-only workloads only.
-        self.cg_fast_baseline_mode = str(_param("cg_fast_baseline_mode") or "0").strip().lower() in ("1","true","yes","on")
+        # [E0.5.1] Fast-baseline overrides were applied at each flag's own source
+        # (before its expensive diagnostic init); report what was actually forced off.
         if self.cg_fast_baseline_mode:
-            _fast_disabled = []
-            for _attr in ("rrx_sat_sr_support_premium_enable",
-                          "rrx_d6_log_daily", "rrx_d6_log_monthly",
-                          "rrx_d8_log_monthly", "plot_enable"):
-                if getattr(self, _attr, False):
-                    setattr(self, _attr, False)
-                    _fast_disabled.append(_attr)
-            self.log(f"[INIT] CG_FAST_BASELINE mode=1 disabled={','.join(_fast_disabled)}")
+            self.log(f"[INIT] CG_FAST_BASELINE mode=1 disabled={','.join(self._cg_fast_disabled)}")
 
         self.current_regime    = None
         self.regime_start_date = None

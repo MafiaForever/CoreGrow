@@ -151,6 +151,15 @@ def D8SwitchDiagInitialize(self) -> None:
         except Exception:
             return float(d)
     self.rrx_d8_log_monthly = _gb("rrx_d8_log_monthly", 0)
+    self.rrx_eqwin_enable = _gb("rrx_eqwin_enable", 1)
+    if getattr(self, "cg_fast_baseline_mode", False):  # [E0.5.1] diagnostic-only
+        _fd = getattr(self, "_cg_fast_disabled", None)
+        if self.rrx_d8_log_monthly:
+            self.rrx_d8_log_monthly = False
+            if _fd is not None: _fd.append("rrx_d8_log_monthly")
+        if self.rrx_eqwin_enable:
+            self.rrx_eqwin_enable = False
+            if _fd is not None: _fd.append("rrx_eqwin_enable")
     # Shadow NAV
     self._d8_sw_nav  = 1.0; self._d8_sw_peak = 1.0; self._d8_sw_maxdd = 0.0
     self._d8_sw_held = None; self._d8_sw_held_px = 0.0; self._d8_sw_weight = 0.0
@@ -213,13 +222,18 @@ def D8SwitchDiagInitialize(self) -> None:
         "W23_24:2023-06-01:2024-04-01|"
         "W25_26:2025-01-01:2026-05-23"
     ))
-    for _chunk in _wdef.split("|"):
-        _p = [x.strip() for x in _chunk.split(":")]
-        if len(_p) == 3 and _p[0] and _p[1] and _p[2]:
-            self._d8_diag_windows.append((_p[0], _p[1], _p[2]))
-            self._d8_alloc_win[_p[0]] = {"base": _d8_curve_blank(), "sat20": _d8_curve_blank()}
+    if self.rrx_eqwin_enable:  # [E0.5.1] skip window collectors when disabled
+        for _chunk in _wdef.split("|"):
+            _p = [x.strip() for x in _chunk.split(":")]
+            if len(_p) == 3 and _p[0] and _p[1] and _p[2]:
+                self._d8_diag_windows.append((_p[0], _p[1], _p[2]))
+                self._d8_alloc_win[_p[0]] = {"base": _d8_curve_blank(), "sat20": _d8_curve_blank()}
     # SAT_SR_SUPPORT_PREMIUM_COMPARE_D0: support permits full baseline cap.
     self.rrx_sat_sr_support_premium_enable = _gb("rrx_sat_sr_support_premium_enable", 0)
+    if getattr(self, "cg_fast_baseline_mode", False) and self.rrx_sat_sr_support_premium_enable:  # [E0.5.1]
+        self.rrx_sat_sr_support_premium_enable = False
+        _fd = getattr(self, "_cg_fast_disabled", None)
+        if _fd is not None: _fd.append("rrx_sat_sr_support_premium_enable")
     self.rrx_sat_sr_lookback = int(_gf("rrx_sat_sr_lookback", 120))
     self.rrx_sat_sr_k = int(_gf("rrx_sat_sr_k", 5))
     self.rrx_sat_sr_near_sup_atr = float(_gf("rrx_sat_sr_near_sup_atr", 1.00))
