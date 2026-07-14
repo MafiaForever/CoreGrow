@@ -59,6 +59,80 @@ class CoreGrowthSubscriptionMixin:
     def _CgAddEquity(self, ticker):
         return self._CgRegisterEquity(ticker, tradable=False)
 
+    def _CgTicker(self, sym) -> str:
+        try:
+            return str(sym.Value).upper()
+        except Exception:
+            try:
+                return str(sym.value).upper()
+            except Exception:
+                return str(sym).upper()
+
+    def _CgSymbolBlockedForTrade(self, sym) -> bool:
+        """[E0.4] True only for signal-only diagnostic equities that must never
+        receive a real order. Classification uses the centralized registry and the
+        explicit tradable sets, never RRX_THEMES membership. Explicitly tradable
+        symbols (CoreGrowth, active RR MU/NVDA/AVGO/USFR, SPYG, bridge-enabled RRX)
+        return False."""
+        tkr = self._CgTicker(sym)
+        if tkr in _CG_TRADABLE or tkr in getattr(self, "_cg_tradable_extra", frozenset()):
+            return False
+        rec = getattr(self, "_cg_sub_registry", {}).get(tkr)
+        return bool(rec is not None and not rec.get("tradable", False))
+
+    def _CgApplyDiagTradeGuard(self, combined) -> None:
+        """[E0.4] Source/merge-path fix: strip signal-only diagnostic symbols from
+        real portfolio targets before execution. Does not touch valid tradable weights."""
+        if not combined:
+            return
+        seen = getattr(self, "_cg_diag_blocked_seen", None)
+        if seen is None:
+            seen = set()
+            self._cg_diag_blocked_seen = seen
+        for sym in list(combined.keys()):
+            try:
+                w = float(combined.get(sym, 0.0) or 0.0)
+            except Exception:
+                w = 0.0
+            if w != 0.0 and self._CgSymbolBlockedForTrade(sym):
+                combined[sym] = 0.0
+                tkr = self._CgTicker(sym)
+                if tkr not in seen:
+                    seen.add(tkr)
+                    self.log(f"[INIT] CG_DIAG_TRADE_BLOCK:{tkr}")
+
+    def _CgFinalTradeGate(self, targets):
+        """[E0.4] Final safety gate immediately before order submission.
+        Non-zero real target for a signal-only diagnostic symbol:
+        backtest -> raise; live -> drop that target and log."""
+        if not targets:
+            return targets
+        out = None
+        for sym in list(targets.keys()):
+            try:
+                w = float(targets.get(sym, 0.0) or 0.0)
+            except Exception:
+                w = 0.0
+            if w != 0.0 and self._CgSymbolBlockedForTrade(sym):
+                tkr = self._CgTicker(sym)
+                if not self.live_mode:
+                    raise Exception(f"CG_DIAG_TRADE_BLOCK:{tkr}")
+                if out is None:
+                    out = dict(targets)
+                out[sym] = 0.0
+                self.log(f"[INIT] CG_DIAG_TRADE_BLOCK:{tkr}")
+        return out if out is not None else targets
+
+    def _CgDiagGuardStartupLog(self) -> None:
+        """[E0.4] One compact startup line."""
+        try:
+            bridge = 1 if getattr(self, "_cg_tradable_extra", None) else 0
+        except Exception:
+            bridge = 0
+        c2n = 1 if getattr(self, "dyn_alloc_c2n_trade_enable", False) else 0
+        self.log(f"[INIT] CG_DIAG_TRADE_GUARD diag_trade_guard=ON "
+                 f"rrx_bridge={bridge} dyn_c2n_trade={c2n}")
+
     def _CgSubscriptionAudit(self) -> None:
         """[E0.1] Per-equity minute/daily/duplicate audit.
         Tradable valid: minute>=1 and daily==0. Signal valid: daily>=1 and minute==0.

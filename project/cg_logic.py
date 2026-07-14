@@ -642,6 +642,7 @@ class CoreGrowthLogic(CoreGrowthRiskTacticalMixin):
         if getattr(self, "emergency_stop_triggered", False):
             self._diag['emergency_stop'] = 1
             return
+        targets = self._CgFinalTradeGate(targets)  # [E0.4] final diagnostic-trade safety gate
         targets = self.ApplyCapitalCap(targets)
         _cd = self.InCooldown()
         _fe = self.AllowFastExitOnCooldown()

@@ -367,6 +367,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self.yc  = self.add_data(Fred, "T10Y3M", Resolution.DAILY).Symbol
 
         self._CgSubscriptionAudit()  # [E0] subscription integrity check
+        self._CgDiagGuardStartupLog()  # [E0.4] diagnostic trade guard status
 
         self.current_regime    = None
         self.regime_start_date = None
@@ -1048,6 +1049,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
             self.EmitDynAllocD0(combined)  # [DYN_ALLOC_D0]
             self.SPYGSatTrade(combined)    # [SPYG_SAT]
+            self._CgApplyDiagTradeGuard(combined)  # [E0.4] block diagnostic-universe trades
 
             _no_state = self.live_mode and not getattr(self,"_live_state_loaded",True)
             _save_err = self.live_mode and not getattr(self,"_state_save_ok",True)  # [LSS2]
