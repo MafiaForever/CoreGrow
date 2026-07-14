@@ -13,25 +13,45 @@ _CG_TRADABLE = _CG_MINUTE_ETFS | frozenset({"MU", "NVDA", "AVGO", "USFR"})
 
 class CoreGrowthSubscriptionMixin:
 
-    def _CgBuildTradableExtra(self) -> None:
-        """[E0.1] RRX universe counts as tradable for SUBSCRIPTION only when the
-        trade bridge can route orders. Never alters strategy logic."""
-        extra = set()
+    def _CgFlag(self, name: str) -> bool:
         try:
             ov = getattr(self, "_rrx_param_overrides", {}) or {}
-            v = self.get_parameter("rrx_trade_bridge_enable")
+            v = self.get_parameter(name)
             if v is None or str(v).strip() == "":
-                v = ov.get("rrx_trade_bridge_enable")
-            bridge = str(v or "0").strip().lower() in ("1", "true", "yes", "on")
+                v = ov.get(name)
+            return str(v or "0").strip().lower() in ("1", "true", "yes", "on")
         except Exception:
-            bridge = False
-        if bridge:
+            return False
+
+    def _CgBuildTradableExtra(self) -> None:
+        """[E0.4.1] RRX symbols count as tradable for SUBSCRIPTION purposes only
+        for the specific symbols each enabled real trading path can route orders
+        to. Never alters which symbol is selected or sized -- that logic is
+        untouched. Two independent sources, both execution-only:
+          * rrx_trade_bridge_enable -> full RRX_THEMES universe (bridge leader).
+          * spyg_sat_trade_enable   -> SPY_GROWTH-bucket stocks only (the only
+            pool SPYGSatTrade's leader-first signal can ever select from)."""
+        extra = set()
+        self._cg_rrx_bridge_flag = self._CgFlag("rrx_trade_bridge_enable")
+        self._cg_spyg_sat_flag   = self._CgFlag("spyg_sat_trade_enable")
+        if self._cg_rrx_bridge_flag:
             try:
                 from rr_xsector_diag import RRX_THEMES
                 for c in RRX_THEMES.values():
                     extra.add(str(c.get("etf", "")).upper())
                     for s in c.get("stocks", []):
                         extra.add(str(s).upper())
+            except Exception:
+                pass
+        if self._cg_spyg_sat_flag:
+            try:
+                from rr_xsector_diag import RRX_THEMES
+                from rrx_leader_first_diag import _BUCKET_BY_GROUP
+                for c in RRX_THEMES.values():
+                    rg = str(c.get("risk_group", ""))
+                    if _BUCKET_BY_GROUP.get(rg, "") == "SPY_GROWTH":
+                        for s in c.get("stocks", []):
+                            extra.add(str(s).upper())
             except Exception:
                 pass
         self._cg_tradable_extra = extra
@@ -80,27 +100,6 @@ class CoreGrowthSubscriptionMixin:
         rec = getattr(self, "_cg_sub_registry", {}).get(tkr)
         return bool(rec is not None and not rec.get("tradable", False))
 
-    def _CgApplyDiagTradeGuard(self, combined) -> None:
-        """[E0.4] Source/merge-path fix: strip signal-only diagnostic symbols from
-        real portfolio targets before execution. Does not touch valid tradable weights."""
-        if not combined:
-            return
-        seen = getattr(self, "_cg_diag_blocked_seen", None)
-        if seen is None:
-            seen = set()
-            self._cg_diag_blocked_seen = seen
-        for sym in list(combined.keys()):
-            try:
-                w = float(combined.get(sym, 0.0) or 0.0)
-            except Exception:
-                w = 0.0
-            if w != 0.0 and self._CgSymbolBlockedForTrade(sym):
-                combined[sym] = 0.0
-                tkr = self._CgTicker(sym)
-                if tkr not in seen:
-                    seen.add(tkr)
-                    self.log(f"[INIT] CG_DIAG_TRADE_BLOCK:{tkr}")
-
     def _CgFinalTradeGate(self, targets):
         """[E0.4] Final safety gate immediately before order submission.
         Non-zero real target for a signal-only diagnostic symbol:
@@ -125,13 +124,11 @@ class CoreGrowthSubscriptionMixin:
 
     def _CgDiagGuardStartupLog(self) -> None:
         """[E0.4] One compact startup line."""
-        try:
-            bridge = 1 if getattr(self, "_cg_tradable_extra", None) else 0
-        except Exception:
-            bridge = 0
+        bridge = 1 if getattr(self, "_cg_rrx_bridge_flag", False) else 0
+        spyg   = 1 if getattr(self, "_cg_spyg_sat_flag", False) else 0
         c2n = 1 if getattr(self, "dyn_alloc_c2n_trade_enable", False) else 0
         self.log(f"[INIT] CG_DIAG_TRADE_GUARD diag_trade_guard=ON "
-                 f"rrx_bridge={bridge} dyn_c2n_trade={c2n}")
+                 f"rrx_bridge={bridge} spyg_sat_trade={spyg} dyn_c2n_trade={c2n}")
 
     def _CgSubscriptionAudit(self) -> None:
         """[E0.1] Per-equity minute/daily/duplicate audit.

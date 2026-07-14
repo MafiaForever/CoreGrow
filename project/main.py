@@ -1061,7 +1061,6 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
             self.EmitDynAllocD0(combined)  # [DYN_ALLOC_D0]
             self.SPYGSatTrade(combined)    # [SPYG_SAT]
-            self._CgApplyDiagTradeGuard(combined)  # [E0.4] block diagnostic-universe trades
 
             _no_state = self.live_mode and not getattr(self,"_live_state_loaded",True)
             _save_err = self.live_mode and not getattr(self,"_state_save_ok",True)  # [LSS2]
