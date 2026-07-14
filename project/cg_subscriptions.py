@@ -44,11 +44,13 @@ class CoreGrowthSubscriptionMixin:
         if not hasattr(self, "_cg_sub_registry"):
             self._cg_sub_registry = {}
         reg = self._cg_sub_registry
-        rec = reg.get(tkr)
-        if rec is not None:
-            return rec["security"]
         is_tradable = (bool(tradable) or tkr in _CG_TRADABLE
                        or tkr in getattr(self, "_cg_tradable_extra", frozenset()))
+        rec = reg.get(tkr)
+        if rec is not None:
+            if is_tradable and not bool(rec.get("tradable", False)):
+                raise Exception(f"CG_SUB_LATE_UPGRADE:{tkr}:DAILY_TO_MINUTE")
+            return rec["security"]
         res = Resolution.MINUTE if is_tradable else Resolution.DAILY
         sec = self.add_equity(tkr, res)
         reg[tkr] = {"security": sec, "resolution": res, "tradable": is_tradable}
@@ -98,7 +100,7 @@ class CoreGrowthSubscriptionMixin:
                     vio.append(f"{tkr}:NO_MINUTE")
                 if nmin > 0 and nday > 0:
                     vio.append(f"{tkr}:MIXED_DAILY_MINUTE")
-                if nmin > 2:
+                if nmin > 1:
                     vio.append(f"{tkr}:DUPLICATE_MINUTE")
             else:
                 sd.append(rep)
