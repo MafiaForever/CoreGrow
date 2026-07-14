@@ -1211,7 +1211,10 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
     def OnEndOfAlgorithm(self):
         self._SaveState()
         self.RRXEmitFinalSummary()                        # [RRX]
-        self.CgCoreRecoveryEmitFinal()                    # [CORE-D0.2]
+        try:
+            self.CgCoreRecoveryEmitFinal()                # [CORE-D0.2]
+        except Exception as exc:
+            self.log(f"CG_CORE_RECOVERY_ERROR,stage=final,type={type(exc).__name__}")
         self.log("[EOA] final snapshot saved")
         if self.live_mode: self._EmitWorstDays(label="FINAL")
         getattr(self, "EmitXRegimeFinalDist", lambda: None)()  # [XRD]

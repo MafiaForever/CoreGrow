@@ -469,8 +469,6 @@ class CgCoreRecoveryDiagMixin:
         cagr = _ann(self._crd_sum_r, n)
         vol = _vol(self._crd_sum_r, self._crd_sum_r2, n)
         sh = _sharpe(self._crd_sum_r, self._crd_sum_r2, n)
-        # reserve for mandatory finals (~800 bytes each)
-        reserve = 2000
         # windows first (optional priority but needed for readiness)
         win_lines = []
         for name, _, _ in _CORE_WINDOWS:
@@ -478,6 +476,8 @@ class CgCoreRecoveryDiagMixin:
             if st["n"] <= 0:
                 continue
             win_lines.append(self._CrdFmtStats("CG_CORE_WINDOW_FINAL", name, st))
+        if not win_lines:
+            win_lines.append("CG_CORE_WINDOW_FINAL,status=NO_DATA")
         # readiness depends on windows
         train = self._crd_win["TRAIN"]
         oos = self._crd_win["OOS"]
@@ -530,85 +530,97 @@ class CgCoreRecoveryDiagMixin:
                 f"diag_trade_violations={self._crd_diag_block},"
                 f"moc_orders_detected={self._crd_moc},"
                 f"ready={ready},reasons={rsn}")
-        # emit mandatory first
+        # optional categories, precomputed so every category yields >=1 line
+        reg_lines = []
+        for r in _REGIMES:
+            st = self._crd_reg[r]
+            if st["n"] > 0:
+                reg_lines.append(self._CrdFmtStats("CG_CORE_REGIME_FINAL", r, st))
+        if not reg_lines:
+            reg_lines.append("CG_CORE_REGIME_FINAL,status=NO_DATA")
+        dd_lines = []
+        for i, ep in enumerate(self._crd_dd_list[:_DD_MAX], 1):
+            nn = max(1, ep.get("n", 1))
+            dd_lines.append(
+                f"CG_CORE_DD_FINAL,rank={i},"
+                f"peak={ep['peak_date']},trough={ep['trough_date']},"
+                f"rec={ep['rec_date'] or 'OPEN'},depth={_f(ep['depth'])},"
+                f"pt_days={(ep['trough_date']-ep['peak_date']).days},"
+                f"tr_days={ep['rec_days'] if ep['rec_days'] is not None else 'OPEN'},"
+                f"reg_p={ep['reg_peak']},reg_t={ep['reg_trough']},"
+                f"panic_t={ep['panic_t']},ids_t={ep['ids_t']},"
+                f"avg_g={_f(ep['sum_g']/nn)},avg_c={_f(ep['sum_c']/nn)},"
+                f"worst={_f(ep['worst'],6)},"
+                f"def_b={ep['def_before']},def_a={ep['def_after']},"
+                f"ron_b={ep['ron_before']},ron_a={ep['ron_after']}")
+        if not dd_lines:
+            dd_lines.append("CG_CORE_DD_FINAL,status=NO_DATA")
+        timing_lines = []
+        for t in _TIMING_TYPES:
+            tm = self._crd_timing[t]
+            if tm["n"] <= 0:
+                continue
+            parts = [f"CG_CORE_TIMING_FINAL,{t},n={tm['n']}"]
+            for h in (1, 3, 5, 10, 20):
+                arr = tm["fwd"][h]
+                if not arr:
+                    parts.append(f"d{h}=NA")
+                    continue
+                mean = sum(arr) / len(arr)
+                sarr = sorted(arr)
+                med = sarr[len(sarr) // 2]
+                pos = sum(1 for x in arr if x > 0) / len(arr)
+                worst = sarr[0]
+                parts.append(f"d{h}={_f(mean,4)}/{_f(med,4)}/{_f(pos,2)}/{_f(worst,4)}")
+            timing_lines.append(",".join(parts))
+        if not timing_lines:
+            timing_lines.append("CG_CORE_TIMING_FINAL,status=NO_DATA")
+        state_lines = []
+        for sk, st in list(self._crd_states.items())[:_STATE_MAX]:
+            if st["n"] > 0:
+                state_lines.append(self._CrdFmtStats("CG_CORE_STATE_FINAL", sk, st))
+        if not state_lines:
+            state_lines.append("CG_CORE_STATE_FINAL,status=NO_DATA")
+        cash_lines = []
+        for r in _REGIMES:
+            cs = self._crd_cash[r]
+            if cs["n"] <= 0:
+                continue
+            nn = cs["n"]
+            cash_lines.append(
+                f"CG_CORE_CASH_FINAL,{r},days={nn},"
+                f"avg_c={_f(cs['sum_c']/nn)},"
+                f"port={_f(cs['sum_pr']/nn,6)},"
+                f"spy={_f(cs['sum_sr']/nn,6)},"
+                f"diff={_f((cs['sum_pr']-cs['sum_sr'])/nn,6)},"
+                f"good={cs['good']},bad={cs['bad']},"
+                f"opp={_f(cs['opp'])}")
+        if not cash_lines:
+            cash_lines.append("CG_CORE_CASH_FINAL,status=NO_DATA")
+        exp_lines = []
+        for b in _EXP_BUCKETS:
+            st = self._crd_exp[b]
+            if st["n"] > 0:
+                exp_lines.append(self._CrdFmtStats("CG_CORE_EXPOSURE_FINAL", b, st))
+        if not exp_lines:
+            exp_lines.append("CG_CORE_EXPOSURE_FINAL,status=NO_DATA")
+        # emit mandatory first, then optional in priority order
         self._CrdEmit(lines, recovery)
         self._CrdEmit(lines, live)
         omitted = []
-        # optional priority: windows, regimes, drawdowns, timing, states, cash, exposure
-        for ln in win_lines:
-            if not self._CrdEmit(lines, ln):
-                omitted.append("windows"); break
-        else:
-            for r in _REGIMES:
-                st = self._crd_reg[r]
-                if st["n"] <= 0:
-                    continue
-                if not self._CrdEmit(lines, self._CrdFmtStats("CG_CORE_REGIME_FINAL", r, st)):
-                    omitted.append("regimes"); break
-            else:
-                for i, ep in enumerate(self._crd_dd_list[:_DD_MAX], 1):
-                    nn = max(1, ep.get("n", 1))
-                    ln = (f"CG_CORE_DD_FINAL,rank={i},"
-                          f"peak={ep['peak_date']},trough={ep['trough_date']},"
-                          f"rec={ep['rec_date'] or 'OPEN'},depth={_f(ep['depth'])},"
-                          f"pt_days={(ep['trough_date']-ep['peak_date']).days},"
-                          f"tr_days={ep['rec_days'] if ep['rec_days'] is not None else 'OPEN'},"
-                          f"reg_p={ep['reg_peak']},reg_t={ep['reg_trough']},"
-                          f"panic_t={ep['panic_t']},ids_t={ep['ids_t']},"
-                          f"avg_g={_f(ep['sum_g']/nn)},avg_c={_f(ep['sum_c']/nn)},"
-                          f"worst={_f(ep['worst'],6)},"
-                          f"def_b={ep['def_before']},def_a={ep['def_after']},"
-                          f"ron_b={ep['ron_before']},ron_a={ep['ron_after']}")
-                    if not self._CrdEmit(lines, ln):
-                        omitted.append("drawdowns"); break
-                else:
-                    for t in _TIMING_TYPES:
-                        tm = self._crd_timing[t]
-                        if tm["n"] <= 0:
-                            continue
-                        parts = [f"CG_CORE_TIMING_FINAL,{t},n={tm['n']}"]
-                        for h in (1, 3, 5, 10, 20):
-                            arr = tm["fwd"][h]
-                            if not arr:
-                                parts.append(f"d{h}=NA")
-                                continue
-                            mean = sum(arr) / len(arr)
-                            sarr = sorted(arr)
-                            med = sarr[len(sarr) // 2]
-                            pos = sum(1 for x in arr if x > 0) / len(arr)
-                            worst = sarr[0]
-                            parts.append(f"d{h}={_f(mean,4)}/{_f(med,4)}/{_f(pos,2)}/{_f(worst,4)}")
-                        if not self._CrdEmit(lines, ",".join(parts)):
-                            omitted.append("timing"); break
-                    else:
-                        for sk, st in list(self._crd_states.items())[:_STATE_MAX]:
-                            if st["n"] <= 0:
-                                continue
-                            if not self._CrdEmit(lines, self._CrdFmtStats("CG_CORE_STATE_FINAL", sk, st)):
-                                omitted.append("states"); break
-                        else:
-                            for r in _REGIMES:
-                                cs = self._crd_cash[r]
-                                if cs["n"] <= 0:
-                                    continue
-                                nn = cs["n"]
-                                ln = (f"CG_CORE_CASH_FINAL,{r},days={nn},"
-                                      f"avg_c={_f(cs['sum_c']/nn)},"
-                                      f"port={_f(cs['sum_pr']/nn,6)},"
-                                      f"spy={_f(cs['sum_sr']/nn,6)},"
-                                      f"diff={_f((cs['sum_pr']-cs['sum_sr'])/nn,6)},"
-                                      f"good={cs['good']},bad={cs['bad']},"
-                                      f"opp={_f(cs['opp'])}")
-                                if not self._CrdEmit(lines, ln):
-                                    omitted.append("cash"); break
-                            else:
-                                for b in _EXP_BUCKETS:
-                                    st = self._crd_exp[b]
-                                    if st["n"] <= 0:
-                                        continue
-                                    if not self._CrdEmit(lines, self._CrdFmtStats(
-                                            "CG_CORE_EXPOSURE_FINAL", b, st)):
-                                        omitted.append("exposure"); break
+        for cat_name, cat_lines in (
+            ("windows", win_lines), ("regimes", reg_lines), ("drawdowns", dd_lines),
+            ("timing", timing_lines), ("states", state_lines), ("cash", cash_lines),
+            ("exposure", exp_lines),
+        ):
+            stop = False
+            for ln in cat_lines:
+                if not self._CrdEmit(lines, ln):
+                    omitted.append(cat_name)
+                    stop = True
+                    break
+            if stop:
+                break
         if omitted:
             self._CrdEmit(lines, f"CG_CORE_LOG_TRUNCATED,bytes={self._crd_log_bytes},"
                                  f"omitted={'|'.join(omitted)}")

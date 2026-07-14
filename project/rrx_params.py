@@ -122,5 +122,5 @@ RRX_PARAMS = {
     "dyn_rr_add_exp":                  "0.00",
     "dyn_rr_max_exp":                  "0.25",
     # Log filter
-    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,RRX_SAT_SR_SUPPORT_PREMIUM_FINAL,[EOA]",
+    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,RRX_SAT_SR_SUPPORT_PREMIUM_FINAL,[EOA],CG_CORE_",
 }
