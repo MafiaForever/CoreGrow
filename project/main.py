@@ -1085,6 +1085,15 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             if _lfc_clear_ok:
                 self._lfc_force_rebalance = False
                 self._lfc_force_reduce = False
+        else:
+            # [CORE-D0.4] daily diag snapshot on non-rebalance days (no trade impact)
+            try:
+                _crd_c = self.MergeSleeves(
+                    getattr(self, "_last_core_targets", {}) or {},
+                    getattr(self, "_last_overlay_targets", {}) or {})
+                self.CgCoreRecoveryUpdate(_crd_c)
+            except Exception:
+                pass
 
         self._EmitDiagLog()
         self._EmitShadowLog()  # [SHADOW]
@@ -1212,9 +1221,9 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         self._SaveState()
         self.RRXEmitFinalSummary()                        # [RRX]
         try:
-            self.CgCoreRecoveryEmitFinal()                # [CORE-D0.2]
+            self.CgCoreRecoveryEmitFinal()                # [CORE-D0.4]
         except Exception as exc:
-            self.log(f"CG_CORE_RECOVERY_ERROR,stage=final,type={type(exc).__name__}")
+            self.log(f"[EOA] CG_CORE_RECOVERY_ERROR,stage=final,type={type(exc).__name__}")
         self.log("[EOA] final snapshot saved")
         if self.live_mode: self._EmitWorstDays(label="FINAL")
         getattr(self, "EmitXRegimeFinalDist", lambda: None)()  # [XRD]

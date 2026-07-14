@@ -1,5 +1,5 @@
 # cg_core_recovery_diag.py
-# CORE-D0.2: compact CoreGrowth recovery diagnostics. Diagnostic-only. Zero trading impact.
+# CORE-D0.2/D0.4: compact CoreGrowth recovery diagnostics. Diagnostic-only. Zero trading impact.
 from datetime import date as _date
 from collections import deque
 
@@ -19,9 +19,12 @@ _TIMING_TYPES = ("RISK_INCREASE", "RISK_DECREASE", "FULL_EXIT", "REENTRY",
                  "DEFENSIVE_ENTRY", "DEFENSIVE_EXIT")
 _EXP_BUCKETS = ("CASHY", "DEFENSIVE", "NORMAL", "LEVERED")
 _LOG_BUDGET = 90000
+_SMOKE_BUDGET = 12000
 _LINE_MAX = 1800
 _DD_MAX = 8
 _STATE_MAX = 10
+_PENDING_MAX = 256
+_SAMPLE_MAX = 128
 
 
 def _blank_stats():
@@ -88,84 +91,115 @@ def _f(x, d=4):
         return "NA"
 
 
-def _ticker(sym):
-    try:
-        return str(sym.Value)
-    except Exception:
-        try:
-            return str(sym.value)
-        except Exception:
-            return str(sym)
+def _trim_dd(lst):
+    """O(n) cap without full sort; final sort only at emit."""
+    while len(lst) > _DD_MAX:
+        mi, md = 0, lst[0]["depth"]
+        for i in range(1, len(lst)):
+            if lst[i]["depth"] < md:
+                mi, md = i, lst[i]["depth"]
+        lst.pop(mi)
 
 
 class CgCoreRecoveryDiagMixin:
 
     def CgCoreRecoveryInit(self) -> None:
-        ov = getattr(self, "_rrx_param_overrides", {}) or {}
-        def _p(k, d=""):
-            v = self.get_parameter(k)
-            if v is None or str(v).strip() == "":
-                v = ov.get(k, d)
-            return v
-        def _gb(k, d):
-            return str(_p(k, d) or d).strip().lower() in ("1", "true", "yes", "on")
-        def _gf(k, d):
+        try:
+            ov = getattr(self, "_rrx_param_overrides", {}) or {}
+            def _p(k, d=""):
+                v = self.get_parameter(k)
+                if v is None or str(v).strip() == "":
+                    v = ov.get(k, d)
+                return v
+            def _gb(k, d):
+                return str(_p(k, d) or d).strip().lower() in ("1", "true", "yes", "on")
+            def _gf(k, d):
+                try:
+                    return float(_p(k, d) if _p(k, d) not in (None, "") else d)
+                except Exception:
+                    return float(d)
+            def _gi(k, d):
+                try:
+                    return int(float(_p(k, d) if _p(k, d) not in (None, "") else d))
+                except Exception:
+                    return int(d)
+            self.cg_core_recovery_diag_enable = _gb("cg_core_recovery_diag_enable", "1")
+            self.cg_core_diag_event_weight_threshold = _gf("cg_core_diag_event_weight_threshold", 0.05)
+            self.cg_core_diag_cash_threshold = _gf("cg_core_diag_cash_threshold", 0.20)
+            self.cg_core_diag_bad_cash_spy5 = _gf("cg_core_diag_bad_cash_spy5", 0.02)
+            self.cg_core_diag_exp_cashy = _gf("cg_core_diag_exp_cashy", 0.35)
+            self.cg_core_diag_exp_def = _gf("cg_core_diag_exp_def", 0.70)
+            self.cg_core_diag_exp_lev = _gf("cg_core_diag_exp_lev", 1.10)
+            self.cg_core_diag_smoke_mode = _gb("cg_core_diag_smoke_mode", "0")
+            self.cg_core_diag_checkpoint_days = max(0, _gi("cg_core_diag_checkpoint_days", 0))
+            self.cg_core_diag_timing_enable = _gb("cg_core_diag_timing_enable", "1")
+            # QC project parameters override RRX_PARAMS defaults; mandatory diagnostic
+            # prefix must therefore be appended at runtime.
+            prefix_ok = 0
+            if self.cg_core_recovery_diag_enable:
+                lp = list(getattr(self, "log_only_prefixes", None) or [])
+                if "CG_CORE_" not in lp:
+                    lp.append("CG_CORE_")
+                self.log_only_prefixes = lp
+                mp = list(getattr(self, "log_mute_prefixes", None) or [])
+                if "CG_CORE_" in mp:
+                    self.log_mute_prefixes = [x for x in mp if x != "CG_CORE_"]
+                prefix_ok = 1
+            sat = 1 if getattr(self, "_cg_spyg_sat_flag", False) else 0
+            fast = 1 if getattr(self, "cg_fast_baseline_mode", False) else 0
+            self.log(f"[INIT] CG_CORE_RECOVERY_DIAG enable={int(self.cg_core_recovery_diag_enable)} "
+                     f"sat_trade={sat} fast_mode={fast} prefix_allowed={prefix_ok}")
+            if not self.cg_core_recovery_diag_enable:
+                return
+            self._crd_start = None
+            self._crd_end = None
+            self._crd_prev_nav = None
+            self._crd_prev_spy_px = None
+            self._crd_prev_gross = None
+            self._crd_prev_spy_w = None
+            self._crd_prev_def_w = None
+            self._crd_prev_cash_w = None
+            self._crd_peak_nav = None
+            self._crd_peak_date = None
+            self._crd_trough_nav = None
+            self._crd_trough_date = None
+            self._crd_in_dd = False
+            self._crd_dd_list = []
+            self._crd_open_dd = None
+            self._crd_max_rec_days = 0
+            self._crd_reg = {r: _blank_stats() for r in _REGIMES}
+            self._crd_states = {}
+            self._crd_win = {w[0]: _blank_stats() for w in _CORE_WINDOWS}
+            self._crd_exp = {b: _blank_stats() for b in _EXP_BUCKETS}
+            self._crd_timing = {t: {"n": 0, "fwd": {h: [] for h in (1, 3, 5, 10, 20)}}
+                                for t in _TIMING_TYPES}
+            self._crd_pending = []
+            self._crd_cash = {r: {"n": 0, "sum_c": 0.0, "sum_pr": 0.0, "sum_sr": 0.0,
+                                  "good": 0, "bad": 0, "opp": 0.0} for r in _REGIMES}
+            self._crd_cash_pend = []
+            self._crd_spy_rets = deque(maxlen=40)
+            self._crd_port_rets = deque(maxlen=40)
+            self._crd_dates = deque(maxlen=40)
+            self._crd_moc = 0
+            self._crd_diag_block = 0
+            self._crd_n_days = 0
+            self._crd_sum_r = 0.0
+            self._crd_sum_r2 = 0.0
+            self._crd_nav_m = 1.0
+            self._crd_peak_m = 1.0
+            self._crd_maxdd = 0.0
+            self._crd_orders = 0
+            self._crd_log_bytes = 0
+            self._crd_last_update_date = None
+            self._crd_update_ok_logged = False
+            self._crd_checkpoint_emitted = False
+            self._crd_update_err_logged = False
+            self._crd_error = False
+        except Exception as e:
             try:
-                return float(_p(k, d) if _p(k, d) not in (None, "") else d)
+                self.log(f"[INIT] CG_CORE_RECOVERY_ERROR,stage=init,type={type(e).__name__}")
             except Exception:
-                return float(d)
-        self.cg_core_recovery_diag_enable = _gb("cg_core_recovery_diag_enable", "1")
-        self.cg_core_diag_event_weight_threshold = _gf("cg_core_diag_event_weight_threshold", 0.05)
-        self.cg_core_diag_cash_threshold = _gf("cg_core_diag_cash_threshold", 0.20)
-        self.cg_core_diag_bad_cash_spy5 = _gf("cg_core_diag_bad_cash_spy5", 0.02)
-        self.cg_core_diag_exp_cashy = _gf("cg_core_diag_exp_cashy", 0.35)
-        self.cg_core_diag_exp_def = _gf("cg_core_diag_exp_def", 0.70)
-        self.cg_core_diag_exp_lev = _gf("cg_core_diag_exp_lev", 1.10)
-        sat = 1 if getattr(self, "_cg_spyg_sat_flag", False) else 0
-        fast = 1 if getattr(self, "cg_fast_baseline_mode", False) else 0
-        self.log(f"[INIT] CG_CORE_RECOVERY_DIAG enable={int(self.cg_core_recovery_diag_enable)} "
-                 f"sat_trade={sat} fast_mode={fast}")
-        if not self.cg_core_recovery_diag_enable:
-            return
-        self._crd_start = None
-        self._crd_end = None
-        self._crd_prev_nav = None
-        self._crd_prev_spy_px = None
-        self._crd_prev_gross = None
-        self._crd_prev_spy_w = None
-        self._crd_prev_def_w = None
-        self._crd_prev_cash_w = None
-        self._crd_peak_nav = None
-        self._crd_peak_date = None
-        self._crd_trough_nav = None
-        self._crd_trough_date = None
-        self._crd_in_dd = False
-        self._crd_dd_list = []
-        self._crd_open_dd = None
-        self._crd_max_rec_days = 0
-        self._crd_reg = {r: _blank_stats() for r in _REGIMES}
-        self._crd_states = {}
-        self._crd_win = {w[0]: _blank_stats() for w in _CORE_WINDOWS}
-        self._crd_exp = {b: _blank_stats() for b in _EXP_BUCKETS}
-        self._crd_timing = {t: {"n": 0, "fwd": {h: [] for h in (1, 3, 5, 10, 20)}}
-                            for t in _TIMING_TYPES}
-        self._crd_pending = []
-        self._crd_cash = {r: {"n": 0, "sum_c": 0.0, "sum_pr": 0.0, "sum_sr": 0.0,
-                              "good": 0, "bad": 0, "opp": 0.0} for r in _REGIMES}
-        self._crd_cash_pend = []
-        self._crd_spy_rets = deque(maxlen=30)
-        self._crd_port_rets = deque(maxlen=30)
-        self._crd_dates = deque(maxlen=30)
-        self._crd_moc = 0
-        self._crd_diag_block = 0
-        self._crd_n_days = 0
-        self._crd_sum_r = 0.0
-        self._crd_sum_r2 = 0.0
-        self._crd_nav_m = 1.0
-        self._crd_peak_m = 1.0
-        self._crd_maxdd = 0.0
-        self._crd_orders = 0
-        self._crd_log_bytes = 0
+                pass
 
     def _CrdW(self, combined, sym):
         if sym is None or not combined:
@@ -217,6 +251,18 @@ class CgCoreRecoveryDiagMixin:
                 f"shock={int(bool(getattr(self,'short_shock_flag',False)))}|"
                 f"estop={int(bool(getattr(self,'emergency_stop_triggered',False)))}")
 
+    def _CrdAppendSample(self, arr, val):
+        if len(arr) < _SAMPLE_MAX:
+            arr.append(val)
+
+    def _CrdFwdProd(self, rets, h):
+        if len(rets) < h:
+            return None
+        fwd = 1.0
+        for x in list(rets)[-h:]:
+            fwd *= (1.0 + x)
+        return fwd - 1.0
+
     def CgCoreRecoveryOnOrder(self, order_event) -> None:
         if not getattr(self, "cg_core_recovery_diag_enable", False):
             return
@@ -235,11 +281,13 @@ class CgCoreRecoveryDiagMixin:
             pass
 
     def CgCoreRecoveryUpdate(self, combined) -> None:
-        """Daily update after final targets, before ExecuteTargets. Diagnostic-only."""
+        """Daily update after final targets, before order execution. Diagnostic-only."""
         if not getattr(self, "cg_core_recovery_diag_enable", False):
             return
         try:
             today = self.time.date()
+            if self._crd_last_update_date == today:
+                return
             nav = float(self.portfolio.total_portfolio_value)
             if nav <= 0:
                 return
@@ -257,7 +305,6 @@ class CgCoreRecoveryDiagMixin:
             if self._crd_prev_spy_px and self._crd_prev_spy_px > 0 and spy_px > 0:
                 spy_r = spy_px / self._crd_prev_spy_px - 1.0
             spy_w, sh_w, cash_w, def_w, tac_w, gross, nz, act = self._CrdWeights(combined)
-            # count diagnostic trade leaks without modifying targets
             for s, w in (combined or {}).items():
                 try:
                     wf = float(w or 0.0)
@@ -270,7 +317,6 @@ class CgCoreRecoveryDiagMixin:
                 regime = "UNKNOWN"
             panic = str(getattr(self, "_panic_state", "NORMAL") or "NORMAL")
             ids = str(getattr(self, "_ids_state", "NORMAL") or "NORMAL")
-            dd = 0.0
             if self._crd_peak_nav is None or nav >= self._crd_peak_nav:
                 if self._crd_in_dd and self._crd_open_dd is not None:
                     ep = self._crd_open_dd
@@ -279,7 +325,7 @@ class CgCoreRecoveryDiagMixin:
                     if ep["rec_days"] > self._crd_max_rec_days:
                         self._crd_max_rec_days = ep["rec_days"]
                     self._crd_dd_list.append(ep)
-                    self._crd_dd_list = sorted(self._crd_dd_list, key=lambda x: -x["depth"])[:_DD_MAX]
+                    _trim_dd(self._crd_dd_list)
                     self._crd_open_dd = None
                     self._crd_in_dd = False
                 self._crd_peak_nav = nav
@@ -319,7 +365,6 @@ class CgCoreRecoveryDiagMixin:
                             ep["def_after"] = 1
                         if regime == "RISK_ON" and today > ep["trough_date"]:
                             ep["ron_before"] = 1
-            # global stats
             self._crd_n_days += 1
             self._crd_sum_r += r
             self._crd_sum_r2 += r * r
@@ -341,9 +386,9 @@ class CgCoreRecoveryDiagMixin:
                 if s <= today <= ee:
                     _upd_stats(self._crd_win[name], r, gross, cash_w)
             _upd_stats(self._crd_exp[self._CrdExpBucket(gross)], r, gross, cash_w)
-            # timing events vs previous day
             thr = self.cg_core_diag_event_weight_threshold
-            if self._crd_prev_gross is not None:
+            timing_on = bool(getattr(self, "cg_core_diag_timing_enable", True))
+            if timing_on and self._crd_prev_gross is not None:
                 dg = gross - self._crd_prev_gross
                 ds = spy_w - (self._crd_prev_spy_w or 0.0)
                 dd_w = def_w - (self._crd_prev_def_w or 0.0)
@@ -363,78 +408,102 @@ class CgCoreRecoveryDiagMixin:
                     etypes.append("DEFENSIVE_EXIT")
                 for et in etypes:
                     self._crd_timing[et]["n"] += 1
-                    self._crd_pending.append({"type": et, "i": len(self._crd_port_rets),
-                                              "left": {1, 3, 5, 10, 20}})
+                    if len(self._crd_pending) < _PENDING_MAX:
+                        self._crd_pending.append({"type": et, "age": 0, "left": {1, 3, 5, 10, 20}})
                     if et == "RISK_INCREASE":
                         self._crd_reg[regime]["entries"] += 1
                     if et == "RISK_DECREASE":
                         self._crd_reg[regime]["exits"] += 1
-            # resolve pending forward returns
             self._crd_port_rets.append(r)
             self._crd_spy_rets.append(spy_r)
             self._crd_dates.append(today)
-            nrets = len(self._crd_port_rets)
-            still = []
-            for p in self._crd_pending:
-                done = set()
-                for h in list(p["left"]):
-                    if nrets - 1 >= p["i"] + h:
-                        fwd = 1.0
-                        for j in range(p["i"] + 1, p["i"] + h + 1):
-                            if 0 <= j < nrets:
-                                fwd *= (1.0 + self._crd_port_rets[j])
-                        self._crd_timing[p["type"]]["fwd"][h].append(fwd - 1.0)
-                        done.add(h)
-                p["left"] -= done
-                if p["left"]:
-                    still.append(p)
-            self._crd_pending = still[-200:]
-            # cash drag
+            if timing_on:
+                still = []
+                for p in self._crd_pending:
+                    p["age"] += 1
+                    done = set()
+                    for h in list(p["left"]):
+                        if p["age"] == h:
+                            fv = self._CrdFwdProd(self._crd_port_rets, h)
+                            if fv is not None:
+                                self._CrdAppendSample(self._crd_timing[p["type"]]["fwd"][h], fv)
+                            done.add(h)
+                    p["left"] -= done
+                    if p["left"]:
+                        still.append(p)
+                self._crd_pending = still[-_PENDING_MAX:]
             if cash_w >= self.cg_core_diag_cash_threshold:
                 cs = self._crd_cash[regime]
                 cs["n"] += 1
                 cs["sum_c"] += cash_w
                 cs["sum_pr"] += r
                 cs["sum_sr"] += spy_r
-                self._crd_cash_pend.append({"i": nrets - 1, "reg": regime, "left": {5, 20}})
+                if len(self._crd_cash_pend) < _PENDING_MAX:
+                    self._crd_cash_pend.append({"age": 0, "reg": regime, "left": {5, 20}})
             cstill = []
             for p in self._crd_cash_pend:
-                if 5 in p["left"] and nrets - 1 >= p["i"] + 5:
-                    fwd = 1.0
-                    for j in range(p["i"] + 1, p["i"] + 6):
-                        if 0 <= j < len(self._crd_spy_rets):
-                            fwd *= (1.0 + self._crd_spy_rets[j])
-                    f5 = fwd - 1.0
-                    cs = self._crd_cash[p["reg"]]
-                    if f5 < 0:
-                        cs["good"] += 1
-                    if f5 > self.cg_core_diag_bad_cash_spy5:
-                        cs["bad"] += 1
-                        cs["opp"] += f5
+                p["age"] += 1
+                if 5 in p["left"] and p["age"] == 5:
+                    f5 = self._CrdFwdProd(self._crd_spy_rets, 5)
+                    if f5 is not None:
+                        cs = self._crd_cash[p["reg"]]
+                        if f5 < 0:
+                            cs["good"] += 1
+                        if f5 > self.cg_core_diag_bad_cash_spy5:
+                            cs["bad"] += 1
+                            cs["opp"] += f5
                     p["left"].discard(5)
-                if 20 in p["left"] and nrets - 1 >= p["i"] + 20:
+                if 20 in p["left"] and p["age"] == 20:
                     p["left"].discard(20)
                 if p["left"]:
                     cstill.append(p)
-            self._crd_cash_pend = cstill[-200:]
+            self._crd_cash_pend = cstill[-_PENDING_MAX:]
             self._crd_prev_nav = nav
             self._crd_prev_spy_px = spy_px
             self._crd_prev_gross = gross
             self._crd_prev_spy_w = spy_w
             self._crd_prev_def_w = def_w
             self._crd_prev_cash_w = cash_w
+            self._crd_last_update_date = today
+            if not self._crd_update_ok_logged:
+                self._crd_update_ok_logged = True
+                self.log(f"[INIT] CG_CORE_RECOVERY_UPDATE_OK,date={today},n=1")
+            cpd = int(getattr(self, "cg_core_diag_checkpoint_days", 0) or 0)
+            if (cpd > 0 and not self._crd_checkpoint_emitted
+                    and self._crd_n_days >= cpd):
+                self._crd_checkpoint_emitted = True
+                n_reg = sum(1 for st in self._crd_reg.values() if st["n"] > 0)
+                n_st = sum(1 for st in self._crd_states.values() if st["n"] > 0)
+                pend = len(self._crd_pending) + len(self._crd_cash_pend)
+                dd = 0.0
+                if self._crd_peak_nav and self._crd_peak_nav > 0:
+                    dd = max(0.0, 1.0 - nav / self._crd_peak_nav)
+                self.log(
+                    f"CG_CORE_CHECKPOINT,n={self._crd_n_days},"
+                    f"start={self._crd_start},end={self._crd_end},"
+                    f"nav={_f(self._crd_nav_m)},dd={_f(dd)},"
+                    f"regimes={n_reg},states={n_st},"
+                    f"pending_events={pend},log_bytes={self._crd_log_bytes}")
         except Exception as e:
-            try:
-                self.log(f"CG_CORE_DIAG_ERR,{type(e).__name__}")
-            except Exception:
-                pass
+            self._crd_error = True
+            if not getattr(self, "_crd_update_err_logged", False):
+                self._crd_update_err_logged = True
+                try:
+                    self.log(f"[INIT] CG_CORE_RECOVERY_ERROR,stage=update,type={type(e).__name__}")
+                except Exception:
+                    pass
+
+    def _CrdBudget(self):
+        if getattr(self, "cg_core_diag_smoke_mode", False):
+            return _SMOKE_BUDGET
+        return _LOG_BUDGET
 
     def _CrdEmit(self, lines, line, reserved=0):
         b = len(line.encode("utf-8"))
         if b > _LINE_MAX:
             line = line[:_LINE_MAX - 20] + "...TRUNC"
             b = len(line.encode("utf-8"))
-        if self._crd_log_bytes + b + reserved > _LOG_BUDGET:
+        if self._crd_log_bytes + b + reserved > self._CrdBudget():
             return False
         lines.append(line)
         self._crd_log_bytes += b
@@ -456,20 +525,21 @@ class CgCoreRecoveryDiagMixin:
     def CgCoreRecoveryEmitFinal(self) -> None:
         if not getattr(self, "cg_core_recovery_diag_enable", False):
             return
+        self.log(f"[EOA] CG_CORE_RECOVERY_EMIT_START,n={getattr(self,'_crd_n_days',0)},"
+                 f"bytes={getattr(self,'_crd_log_bytes',0)}")
         lines = []
         self._crd_log_bytes = 0
-        # close open DD
+        smoke = bool(getattr(self, "cg_core_diag_smoke_mode", False))
         if self._crd_open_dd is not None:
             ep = self._crd_open_dd
             ep["rec_date"] = None
             ep["rec_days"] = None
             self._crd_dd_list.append(ep)
-            self._crd_dd_list = sorted(self._crd_dd_list, key=lambda x: -x["depth"])[:_DD_MAX]
+        self._crd_dd_list = sorted(self._crd_dd_list, key=lambda x: -x["depth"])[:_DD_MAX]
         n = self._crd_n_days
         cagr = _ann(self._crd_sum_r, n)
         vol = _vol(self._crd_sum_r, self._crd_sum_r2, n)
         sh = _sharpe(self._crd_sum_r, self._crd_sum_r2, n)
-        # windows first (optional priority but needed for readiness)
         win_lines = []
         for name, _, _ in _CORE_WINDOWS:
             st = self._crd_win[name]
@@ -478,7 +548,6 @@ class CgCoreRecoveryDiagMixin:
             win_lines.append(self._CrdFmtStats("CG_CORE_WINDOW_FINAL", name, st))
         if not win_lines:
             win_lines.append("CG_CORE_WINDOW_FINAL,status=NO_DATA")
-        # readiness depends on windows
         train = self._crd_win["TRAIN"]
         oos = self._crd_win["OOS"]
         crisis = self._crd_win["CRISIS"]
@@ -530,7 +599,6 @@ class CgCoreRecoveryDiagMixin:
                 f"diag_trade_violations={self._crd_diag_block},"
                 f"moc_orders_detected={self._crd_moc},"
                 f"ready={ready},reasons={rsn}")
-        # optional categories, precomputed so every category yields >=1 line
         reg_lines = []
         for r in _REGIMES:
             st = self._crd_reg[r]
@@ -538,81 +606,82 @@ class CgCoreRecoveryDiagMixin:
                 reg_lines.append(self._CrdFmtStats("CG_CORE_REGIME_FINAL", r, st))
         if not reg_lines:
             reg_lines.append("CG_CORE_REGIME_FINAL,status=NO_DATA")
-        dd_lines = []
-        for i, ep in enumerate(self._crd_dd_list[:_DD_MAX], 1):
-            nn = max(1, ep.get("n", 1))
-            dd_lines.append(
-                f"CG_CORE_DD_FINAL,rank={i},"
-                f"peak={ep['peak_date']},trough={ep['trough_date']},"
-                f"rec={ep['rec_date'] or 'OPEN'},depth={_f(ep['depth'])},"
-                f"pt_days={(ep['trough_date']-ep['peak_date']).days},"
-                f"tr_days={ep['rec_days'] if ep['rec_days'] is not None else 'OPEN'},"
-                f"reg_p={ep['reg_peak']},reg_t={ep['reg_trough']},"
-                f"panic_t={ep['panic_t']},ids_t={ep['ids_t']},"
-                f"avg_g={_f(ep['sum_g']/nn)},avg_c={_f(ep['sum_c']/nn)},"
-                f"worst={_f(ep['worst'],6)},"
-                f"def_b={ep['def_before']},def_a={ep['def_after']},"
-                f"ron_b={ep['ron_before']},ron_a={ep['ron_after']}")
-        if not dd_lines:
-            dd_lines.append("CG_CORE_DD_FINAL,status=NO_DATA")
-        timing_lines = []
-        for t in _TIMING_TYPES:
-            tm = self._crd_timing[t]
-            if tm["n"] <= 0:
-                continue
-            parts = [f"CG_CORE_TIMING_FINAL,{t},n={tm['n']}"]
-            for h in (1, 3, 5, 10, 20):
-                arr = tm["fwd"][h]
-                if not arr:
-                    parts.append(f"d{h}=NA")
-                    continue
-                mean = sum(arr) / len(arr)
-                sarr = sorted(arr)
-                med = sarr[len(sarr) // 2]
-                pos = sum(1 for x in arr if x > 0) / len(arr)
-                worst = sarr[0]
-                parts.append(f"d{h}={_f(mean,4)}/{_f(med,4)}/{_f(pos,2)}/{_f(worst,4)}")
-            timing_lines.append(",".join(parts))
-        if not timing_lines:
-            timing_lines.append("CG_CORE_TIMING_FINAL,status=NO_DATA")
-        state_lines = []
-        for sk, st in list(self._crd_states.items())[:_STATE_MAX]:
-            if st["n"] > 0:
-                state_lines.append(self._CrdFmtStats("CG_CORE_STATE_FINAL", sk, st))
-        if not state_lines:
-            state_lines.append("CG_CORE_STATE_FINAL,status=NO_DATA")
-        cash_lines = []
-        for r in _REGIMES:
-            cs = self._crd_cash[r]
-            if cs["n"] <= 0:
-                continue
-            nn = cs["n"]
-            cash_lines.append(
-                f"CG_CORE_CASH_FINAL,{r},days={nn},"
-                f"avg_c={_f(cs['sum_c']/nn)},"
-                f"port={_f(cs['sum_pr']/nn,6)},"
-                f"spy={_f(cs['sum_sr']/nn,6)},"
-                f"diff={_f((cs['sum_pr']-cs['sum_sr'])/nn,6)},"
-                f"good={cs['good']},bad={cs['bad']},"
-                f"opp={_f(cs['opp'])}")
-        if not cash_lines:
-            cash_lines.append("CG_CORE_CASH_FINAL,status=NO_DATA")
-        exp_lines = []
-        for b in _EXP_BUCKETS:
-            st = self._crd_exp[b]
-            if st["n"] > 0:
-                exp_lines.append(self._CrdFmtStats("CG_CORE_EXPOSURE_FINAL", b, st))
-        if not exp_lines:
-            exp_lines.append("CG_CORE_EXPOSURE_FINAL,status=NO_DATA")
-        # emit mandatory first, then optional in priority order
         self._CrdEmit(lines, recovery)
         self._CrdEmit(lines, live)
         omitted = []
-        for cat_name, cat_lines in (
-            ("windows", win_lines), ("regimes", reg_lines), ("drawdowns", dd_lines),
-            ("timing", timing_lines), ("states", state_lines), ("cash", cash_lines),
-            ("exposure", exp_lines),
-        ):
+        cats = [("windows", win_lines), ("regimes", reg_lines)]
+        if not smoke:
+            dd_lines = []
+            for i, ep in enumerate(self._crd_dd_list[:_DD_MAX], 1):
+                nn = max(1, ep.get("n", 1))
+                dd_lines.append(
+                    f"CG_CORE_DD_FINAL,rank={i},"
+                    f"peak={ep['peak_date']},trough={ep['trough_date']},"
+                    f"rec={ep['rec_date'] or 'OPEN'},depth={_f(ep['depth'])},"
+                    f"pt_days={(ep['trough_date']-ep['peak_date']).days},"
+                    f"tr_days={ep['rec_days'] if ep['rec_days'] is not None else 'OPEN'},"
+                    f"reg_p={ep['reg_peak']},reg_t={ep['reg_trough']},"
+                    f"panic_t={ep['panic_t']},ids_t={ep['ids_t']},"
+                    f"avg_g={_f(ep['sum_g']/nn)},avg_c={_f(ep['sum_c']/nn)},"
+                    f"worst={_f(ep['worst'],6)},"
+                    f"def_b={ep['def_before']},def_a={ep['def_after']},"
+                    f"ron_b={ep['ron_before']},ron_a={ep['ron_after']}")
+            if not dd_lines:
+                dd_lines.append("CG_CORE_DD_FINAL,status=NO_DATA")
+            timing_lines = []
+            for t in _TIMING_TYPES:
+                tm = self._crd_timing[t]
+                if tm["n"] <= 0:
+                    continue
+                parts = [f"CG_CORE_TIMING_FINAL,{t},n={tm['n']}"]
+                for h in (1, 3, 5, 10, 20):
+                    arr = tm["fwd"][h]
+                    if not arr:
+                        parts.append(f"d{h}=NA")
+                        continue
+                    mean = sum(arr) / len(arr)
+                    sarr = sorted(arr)
+                    med = sarr[len(sarr) // 2]
+                    pos = sum(1 for x in arr if x > 0) / len(arr)
+                    worst = sarr[0]
+                    parts.append(f"d{h}={_f(mean,4)}/{_f(med,4)}/{_f(pos,2)}/{_f(worst,4)}")
+                timing_lines.append(",".join(parts))
+            if not timing_lines:
+                timing_lines.append("CG_CORE_TIMING_FINAL,status=NO_DATA")
+            state_lines = []
+            for sk, st in list(self._crd_states.items())[:_STATE_MAX]:
+                if st["n"] > 0:
+                    state_lines.append(self._CrdFmtStats("CG_CORE_STATE_FINAL", sk, st))
+            if not state_lines:
+                state_lines.append("CG_CORE_STATE_FINAL,status=NO_DATA")
+            cash_lines = []
+            for r in _REGIMES:
+                cs = self._crd_cash[r]
+                if cs["n"] <= 0:
+                    continue
+                nn = cs["n"]
+                cash_lines.append(
+                    f"CG_CORE_CASH_FINAL,{r},days={nn},"
+                    f"avg_c={_f(cs['sum_c']/nn)},"
+                    f"port={_f(cs['sum_pr']/nn,6)},"
+                    f"spy={_f(cs['sum_sr']/nn,6)},"
+                    f"diff={_f((cs['sum_pr']-cs['sum_sr'])/nn,6)},"
+                    f"good={cs['good']},bad={cs['bad']},"
+                    f"opp={_f(cs['opp'])}")
+            if not cash_lines:
+                cash_lines.append("CG_CORE_CASH_FINAL,status=NO_DATA")
+            exp_lines = []
+            for b in _EXP_BUCKETS:
+                st = self._crd_exp[b]
+                if st["n"] > 0:
+                    exp_lines.append(self._CrdFmtStats("CG_CORE_EXPOSURE_FINAL", b, st))
+            if not exp_lines:
+                exp_lines.append("CG_CORE_EXPOSURE_FINAL,status=NO_DATA")
+            cats.extend([
+                ("drawdowns", dd_lines), ("timing", timing_lines),
+                ("states", state_lines), ("cash", cash_lines), ("exposure", exp_lines),
+            ])
+        for cat_name, cat_lines in cats:
             stop = False
             for ln in cat_lines:
                 if not self._CrdEmit(lines, ln):
@@ -626,3 +695,4 @@ class CgCoreRecoveryDiagMixin:
                                  f"omitted={'|'.join(omitted)}")
         for ln in lines:
             self.log(ln)
+        self.log(f"[EOA] CG_CORE_RECOVERY_EMIT_DONE,lines={len(lines)},bytes={self._crd_log_bytes}")
