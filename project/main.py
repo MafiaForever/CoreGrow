@@ -13,6 +13,7 @@ from dyn_alloc_diag import DynamicAllocationDiagMixin
 from rr_xsector_diag import RRXSectorDiagMixin          # [RRX]
 from cashflow_live import LiveCashFlowMixin
 from cg_subscriptions import CoreGrowthSubscriptionMixin  # [E0.1]
+from cg_core_recovery_diag import CgCoreRecoveryDiagMixin  # [CORE-D0.2]
 
 
 class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
@@ -380,6 +381,8 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         # (before its expensive diagnostic init); report what was actually forced off.
         if self.cg_fast_baseline_mode:
             self.log(f"[INIT] CG_FAST_BASELINE mode=1 disabled={','.join(self._cg_fast_disabled)}")
+
+        self.CgCoreRecoveryInit()  # [CORE-D0.2]
 
         self.current_regime    = None
         self.regime_start_date = None
@@ -1061,6 +1064,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
             self.EmitDynAllocD0(combined)  # [DYN_ALLOC_D0]
             self.SPYGSatTrade(combined)    # [SPYG_SAT]
+            self.CgCoreRecoveryUpdate(combined)  # [CORE-D0.2] after final targets, before orders
 
             _no_state = self.live_mode and not getattr(self,"_live_state_loaded",True)
             _save_err = self.live_mode and not getattr(self,"_state_save_ok",True)  # [LSS2]
@@ -1132,6 +1136,8 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
     def OnOrderEvent(self, order_event):
         if order_event is None: return
+        try: self.CgCoreRecoveryOnOrder(order_event)  # [CORE-D0.2]
+        except Exception: pass
         try:
             _t=getattr(order_event.symbol,"Value","")
             _rs={getattr(s,"Value","") for s in getattr(self,"_rrx_symbols",[])}
@@ -1205,6 +1211,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
     def OnEndOfAlgorithm(self):
         self._SaveState()
         self.RRXEmitFinalSummary()                        # [RRX]
+        self.CgCoreRecoveryEmitFinal()                    # [CORE-D0.2]
         self.log("[EOA] final snapshot saved")
         if self.live_mode: self._EmitWorstDays(label="FINAL")
         getattr(self, "EmitXRegimeFinalDist", lambda: None)()  # [XRD]
@@ -1216,6 +1223,6 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
 from sh_hedge import _SH_IDLE, _SH_HEDGED, _SH_ENTRY_PENDING, _SH_EXIT_PENDING  # noqa: F401
 
-for _cls in (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin):
+for _cls in (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin):
     for _name, _fn in inspect.getmembers(_cls, predicate=inspect.isfunction):
         setattr(CoreGrowthPlusConditionalTrendSleeve, _name, _fn)
