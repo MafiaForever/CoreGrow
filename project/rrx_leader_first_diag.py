@@ -107,14 +107,6 @@ def RRXD6LeaderFirstInitialize(self) -> None:
         return bool(int(v)) if v is not None else bool(d)
     self.rrx_d6_log_monthly      = _gb("rrx_d6_log_monthly",      0)
     self.rrx_d6_log_daily        = _gb("rrx_d6_log_daily",        0)
-    if getattr(self, "cg_fast_baseline_mode", False):  # [E0.5.1] logs only
-        _fd = getattr(self, "_cg_fast_disabled", None)
-        if self.rrx_d6_log_monthly:
-            self.rrx_d6_log_monthly = False
-            if _fd is not None: _fd.append("rrx_d6_log_monthly")
-        if self.rrx_d6_log_daily:
-            self.rrx_d6_log_daily = False
-            if _fd is not None: _fd.append("rrx_d6_log_daily")
     self.rrx_d6_risk_enable      = _gb("rrx_d6_risk_enable",      0)
     self.rrx_d6_bucket_regime_en = _gb("rrx_d6_bucket_regime_enable", 0)
     # --- D6 shadow NAVs ---
