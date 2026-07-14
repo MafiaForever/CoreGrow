@@ -98,14 +98,18 @@ class CoreGrowthSubscriptionMixin:
                 tm.append(rep)
                 if nmin == 0:
                     vio.append(f"{tkr}:NO_MINUTE")
+                if nday > 0:
+                    vio.append(f"{tkr}:TRADABLE_HAS_DAILY")
                 if nmin > 0 and nday > 0:
                     vio.append(f"{tkr}:MIXED_DAILY_MINUTE")
-                if nmin > 1:
-                    vio.append(f"{tkr}:DUPLICATE_MINUTE")
             else:
                 sd.append(rep)
                 if nmin > 0 and nday > 0:
                     vio.append(f"{tkr}:MIXED_DAILY_MINUTE")
+                if nmin > 0:
+                    vio.append(f"{tkr}:SIGNAL_HAS_MINUTE")
+                if nday == 0:
+                    vio.append(f"{tkr}:NO_DAILY")
         v = "NONE" if not vio else "; ".join(vio)
         self.log("[INIT] CG_SUBSCRIPTION_AUDIT | "
                  f"tradable minute: {', '.join(tm)} | signal daily: {', '.join(sd)} | "
