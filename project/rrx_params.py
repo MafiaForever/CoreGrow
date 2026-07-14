@@ -5,7 +5,7 @@ from AlgorithmImports import *
 # SPYG_SAT_T2: cap=0.20, active-only scale, rate-shock blocker.
 RRX_PARAMS = {
     # SPYG satellite T2
-    "spyg_sat_trade_enable":           "1",
+    "spyg_sat_trade_enable":           "0",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
