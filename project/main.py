@@ -14,6 +14,7 @@ from rr_xsector_diag import RRXSectorDiagMixin          # [RRX]
 from cashflow_live import LiveCashFlowMixin
 from cg_subscriptions import CoreGrowthSubscriptionMixin  # [E0.1]
 from cg_core_recovery_diag import CgCoreRecoveryDiagMixin  # [CORE-D0.2]
+from cg_ids_normal_cap_diag import CgIdsNormalCapDiagMixin  # [IDS-CAP-D0]
 
 
 class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
@@ -383,6 +384,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             self.log(f"[INIT] CG_FAST_BASELINE mode=1 disabled={','.join(self._cg_fast_disabled)}")
 
         self.CgCoreRecoveryInit()  # [CORE-D0.2]
+        self.CgIdsNormalCapInit()  # [IDS-CAP-D0]
 
         self.current_regime    = None
         self.regime_start_date = None
@@ -1065,6 +1067,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             self.EmitDynAllocD0(combined)  # [DYN_ALLOC_D0]
             self.SPYGSatTrade(combined)    # [SPYG_SAT]
             self.CgCoreRecoveryUpdate(combined)  # [CORE-D0.2] after final targets, before orders
+            self.CgIdsNormalCapUpdate(combined)  # [IDS-CAP-D0] shadow only
 
             _no_state = self.live_mode and not getattr(self,"_live_state_loaded",True)
             _save_err = self.live_mode and not getattr(self,"_state_save_ok",True)  # [LSS2]
@@ -1092,6 +1095,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
                     getattr(self, "_last_core_targets", {}) or {},
                     getattr(self, "_last_overlay_targets", {}) or {})
                 self.CgCoreRecoveryUpdate(_crd_c)
+                self.CgIdsNormalCapUpdate(_crd_c)  # [IDS-CAP-D0]
             except Exception:
                 pass
 
@@ -1224,6 +1228,10 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             self.CgCoreRecoveryEmitFinal()                # [CORE-D0.4]
         except Exception as exc:
             self.log(f"[EOA] CG_CORE_RECOVERY_ERROR,stage=final,type={type(exc).__name__}")
+        try:
+            self.CgIdsNormalCapEmitFinal()                # [IDS-CAP-D0]
+        except Exception as exc:
+            self.log(f"[EOA] CG_IDS_CAP_ERROR,stage=final,type={type(exc).__name__}")
         self.log("[EOA] final snapshot saved")
         if self.live_mode: self._EmitWorstDays(label="FINAL")
         getattr(self, "EmitXRegimeFinalDist", lambda: None)()  # [XRD]
@@ -1235,6 +1243,6 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
 from sh_hedge import _SH_IDLE, _SH_HEDGED, _SH_ENTRY_PENDING, _SH_EXIT_PENDING  # noqa: F401
 
-for _cls in (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin):
+for _cls in (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin):
     for _name, _fn in inspect.getmembers(_cls, predicate=inspect.isfunction):
         setattr(CoreGrowthPlusConditionalTrendSleeve, _name, _fn)
