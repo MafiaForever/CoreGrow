@@ -6,6 +6,8 @@ from AlgorithmImports import *
 RRX_PARAMS = {
     # SPYG satellite T2
     "spyg_sat_trade_enable":           "0",
+    "cg_watch_w2_trade_enable":        "0",
+    "cg_transition_e2_trade_enable":   "0",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",

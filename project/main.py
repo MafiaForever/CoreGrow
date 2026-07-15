@@ -15,7 +15,7 @@ from cashflow_live import LiveCashFlowMixin
 from cg_subscriptions import CoreGrowthSubscriptionMixin
 from cg_core_recovery_diag import CgCoreRecoveryDiagMixin
 from cg_ids_normal_cap_diag import CgIdsNormalCapDiagMixin
-from rrx_d8_switch_diag import CgDefGrossDiagMixin
+from cg_defensive_trade import CgDefensiveTradeMixin
 
 
 class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
@@ -391,7 +391,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             self.log(f"[INIT] CG_FAST_BASELINE mode=1 disabled={','.join(self._cg_fast_disabled)}")
         self.CgCoreRecoveryInit()
         self.CgIdsNormalCapInit()
-        self.CgDefGrossInit()
+        self.CgDefensiveTradeInit()
 
         self.current_regime    = None
         self.regime_start_date = None
@@ -784,6 +784,8 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             state.update(self.PanicScoreSaveFields())
             state.update(self._IDSSaveFields())   # [IDS_V2]
             state["lfc"] = self.LiveCashFlowSaveFields()
+            try: self.CgDefensiveTradePersist(state)
+            except Exception: pass
             self.object_store.save(self._STATE_KEY, json.dumps(state))
             self.SHSaveState()
             self._state_save_ok = True    # [LSS2]
@@ -905,6 +907,8 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             self.latent_structure_pending_count = int(state.get("lst_pending_count") or 0)
             self.latent_structure_entry_type    = state.get("lst_entry_type")
             self.latent_structure_mismatch_days = int(state.get("lst_mismatch_days") or 0)
+            try: self.CgDefensiveTradeRestore(state)
+            except Exception: pass
 
             self._last_good_equity=state.get("last_good_equity")  # [LSS1]
             self._snap_anomaly_active=bool(state.get("snap_anomaly_active",False))  # [LSS1]
@@ -1073,9 +1077,9 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
             self.EmitDynAllocD0(combined)
             self.SPYGSatTrade(combined)
+            combined = self.CgDefensiveTradeApply(combined)
             self.CgCoreRecoveryUpdate(combined)
             self.CgIdsNormalCapUpdate(combined)
-            self.CgDefGrossUpdate(combined)
 
             _no_state = self.live_mode and not getattr(self,"_live_state_loaded",True)
             _save_err = self.live_mode and not getattr(self,"_state_save_ok",True)  # [LSS2]
@@ -1099,7 +1103,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         else:
             try:
                 _c=self.MergeSleeves(getattr(self,"_last_core_targets",{})or{},getattr(self,"_last_overlay_targets",{})or{})
-                self.CgCoreRecoveryUpdate(_c); self.CgIdsNormalCapUpdate(_c); self.CgDefGrossUpdate(_c)
+                self.CgCoreRecoveryUpdate(_c); self.CgIdsNormalCapUpdate(_c)
             except Exception: pass
 
         self._EmitDiagLog()
@@ -1231,8 +1235,6 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         except Exception as exc: self.log(f"[EOA] CG_CORE_RECOVERY_ERROR,stage=final,type={type(exc).__name__}")
         try: self.CgIdsNormalCapEmitFinal()
         except Exception as exc: self.log(f"[EOA] CG_IDS_CAP_ERROR,stage=final,type={type(exc).__name__}")
-        try: self.CgDefGrossEmitFinal()
-        except Exception as exc: self.log(f"[EOA] CG_DEF_GROSS_ERROR,stage=final,type={type(exc).__name__}")
         self.log("[EOA] final snapshot saved")
         if self.live_mode: self._EmitWorstDays(label="FINAL")
         getattr(self, "EmitXRegimeFinalDist", lambda: None)()
@@ -1244,6 +1246,6 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
 from sh_hedge import _SH_IDLE, _SH_HEDGED, _SH_ENTRY_PENDING, _SH_EXIT_PENDING  # noqa: F401
 
-for _cls in (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgDefGrossDiagMixin):
+for _cls in (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgDefensiveTradeMixin):
     for _name, _fn in inspect.getmembers(_cls, predicate=inspect.isfunction):
         setattr(CoreGrowthPlusConditionalTrendSleeve, _name, _fn)
