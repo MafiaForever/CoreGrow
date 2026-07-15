@@ -15,6 +15,7 @@ RRX_PARAMS = {
     "cg_rt_ron":                       "15",
     "cg_rt_neu":                       "15",
     "cg_rt_roff":                      "15",
+    "cg_rt_t3_variant":                "0",
     "cg_rt_shadow":                    "0",
     "cg_rt_sh_log":                    "0",
     "cg_rt_sh_reg":                    "0",
