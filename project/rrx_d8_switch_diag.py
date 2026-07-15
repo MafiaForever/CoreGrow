@@ -825,7 +825,7 @@ def D8SwitchDiagEmitFinal(self, start, today) -> None:
         )
 
 # ---------------------------------------------------------------------------
-# CG-DEF-GROSS-D1: selective duration veto + toxic-IDS / transition equity caps.
+# CG-DEF-GROSS-D2: WATCH-only equity defense + partial duration cut + E2 control.
 # Diagnostic-only. Zero trading impact. Never mutates real targets.
 # Shadow convention: weights at T applied to T close → T+1 close (no look-ahead).
 # BASE is target-shadow accounting, not QC portfolio NAV.
@@ -833,8 +833,8 @@ def D8SwitchDiagEmitFinal(self, start, today) -> None:
 from datetime import date as _dg_date
 from collections import deque as _dg_deque
 
-_DG_V = ("BASE", "D1", "E1", "E2")
-_DG_NV = ("D1", "E1", "E2")
+_DG_V = ("BASE", "W1", "W2", "D2", "E2")
+_DG_NV = ("W1", "W2", "D2", "E2")
 _DG_W = (
     ("TRAIN", _dg_date(2012,1,1), _dg_date(2018,12,31)),
     ("OOS", _dg_date(2019,1,1), _dg_date(2021,12,31)),
@@ -861,7 +861,7 @@ def _dg_blank():
             "act": 0, "rets": _dg_deque(maxlen=4096)}
 
 
-def _dg_upd(st, r, tg, eg, dg, gg, c, act=0):
+def _dg_upd(st, r, tg=0.0, eg=0.0, dg=0.0, gg=0.0, c=0.0, act=0):
     st["n"] += 1
     st["sum_r"] += r; st["sum_r2"] += r * r
     st["nav"] = max(0.01, st["nav"] * (1.0 + r))
@@ -910,14 +910,12 @@ def _dg_tk(s):
 
 
 def _dg_act_blank():
-    return {"n": 0, "sum_br": 0.0, "sum_vr": 0.0, "pos_b": 0, "neg_b": 0,
-            "nav_b": 1.0, "nav_v": 1.0,
-            "sum_eb": 0.0, "sum_ea": 0.0, "sum_db": 0.0, "sum_da": 0.0,
-            "sum_cb": 0.0, "sum_ca": 0.0}
+    return {"n": 0, "sum_br": 0.0, "sum_vr": 0.0, "neg_b": 0,
+            "nav_b": 1.0, "nav_v": 1.0}
 
 
 class CgDefGrossDiagMixin:
-    """DEF-GROSS-D1 shadow matrix. Diagnostic-only."""
+    """DEF-GROSS-D2 shadow matrix. Diagnostic-only."""
 
     def CgDefGrossInit(self) -> None:
         try:
@@ -929,22 +927,26 @@ class CgDefGrossDiagMixin:
             en = str(_p("cg_def_gross_diag_enable", "1") or "1").strip().lower()
             self.cg_def_gross_diag_enable = en in ("1", "true", "yes", "on")
             lp = list(getattr(self, "log_only_prefixes", None) or [])
-            for pref in ("CG_DEF_D1_", "CG_DEF_GROSS_"):
+            for pref in ("CG_DEF_D2_", "CG_DEF_D1_", "CG_DEF_GROSS_"):
                 if pref not in lp: lp.append(pref)
             self.log_only_prefixes = lp
-            self.log("[INIT] CG_DEF_D1_DIAG enable="
-                     f"{int(self.cg_def_gross_diag_enable)} variants=BASE,D1,E1,E2 trade=0 "
+            self.log("[INIT] CG_DEF_D2_DIAG enable="
+                     f"{int(self.cg_def_gross_diag_enable)} variants=BASE,W1,W2,D2,E2 trade=0 "
                      f"conv=T_close_to_T1_close shadow=target_not_qc_nav")
             if not self.cg_def_gross_diag_enable: return
             self._dg_run = {v: _dg_blank() for v in _DG_V}
             self._dg_win = {(v, w[0]): _dg_blank() for v in _DG_V for w in _DG_W}
             self._dg_act = {v: _dg_act_blank() for v in _DG_NV}
-            self._dg_ids = {k: _dg_blank() for k in ("WATCH_BASE", "WATCH_E1", "STRESS_BASE", "STRESS_E1")}
+            self._dg_watch = {v: {"st": _dg_blank(), "sum_eb": 0.0, "sum_ea": 0.0}
+                             for v in ("BASE", "W1", "W2")}
+            self._dg_dur = {"base": _dg_blank(), "d2": _dg_blank(),
+                            "sum_db": 0.0, "sum_da": 0.0, "sum_cb": 0.0, "sum_ca": 0.0, "n": 0}
             self._dg_prev_w = {v: None for v in _DG_V}
             self._dg_prev_px = None
             self._dg_prev_act = {}
-            self._dg_prev_ids = None
-            self._dg_prev_ps = None
+            self._dg_prev_watch_ok = False
+            self._dg_prev_d2_ok = False
+            self._dg_stress_act = 0
             self._dg_last = None
             self._dg_n = 0
             self._dg_bytes = 0
@@ -953,7 +955,7 @@ class CgDefGrossDiagMixin:
             self._dg_e2_left = 0
             self._dg_err = False
         except Exception as e:
-            try: self.log(f"[INIT] CG_DEF_D1_ERROR,stage=init,type={type(e).__name__}")
+            try: self.log(f"[INIT] CG_DEF_D2_ERROR,stage=init,type={type(e).__name__}")
             except Exception: pass
 
     def _DgEqSet(self):
@@ -1011,10 +1013,12 @@ class CgDefGrossDiagMixin:
                 except Exception: pass
         return self._DgPark(w, out)
 
-    def _DgZeroGroup(self, w, eq, grp):
+    def _DgScaleTickers(self, w, ticks, scale):
         out = dict(w)
-        for t in list(out.keys()):
-            if self._DgGrp(t, eq) == grp: out[t] = 0.0
+        for t in ticks:
+            if t in out:
+                try: out[t] = float(out[t] or 0.0) * scale
+                except Exception: pass
         return self._DgPark(w, out)
 
     def _DgBaseW(self, combined):
@@ -1064,29 +1068,36 @@ class CgDefGrossDiagMixin:
             return float(ind.Current.Value)
         except Exception: return None
 
+    def _DgWatchOn(self, ps, ids, spy_px, ema75, spy20):
+        return (str(ps) == "NORMAL" and str(ids) == "WATCH"
+                and spy_px is not None and ema75 is not None and spy_px < ema75
+                and spy20 < 0)
+
     def _DgBuildVariants(self, base, eq, spy_px, ema75, ema9, ema120, spy20, bnd20, tip20,
                          regime, prev_reg, ps, ids, dd):
         out = {"BASE": dict(base)}
-        # D1 selective rate-shock duration veto
-        a_d1 = (str(regime) in ("NEUTRAL", "RISK_OFF")
+        # W1/W2: WATCH-only (never STRESS/PANIC_SHORT; never panic!=NORMAL)
+        a_w = self._DgWatchOn(ps, ids, spy_px, ema75, spy20)
+        w = dict(base)
+        if a_w:
+            eg = self._DgGross(w, eq, "E")
+            if eg > 1.00 and eg > 1e-12:
+                w = self._DgScaleGroup(w, eq, "E", 1.00 / eg)
+        out["W1"] = w
+        w = dict(base)
+        if a_w:
+            w = self._DgScaleGroup(w, eq, "E", 0.80)
+        out["W2"] = w
+        # D2: partial duration reduction (retain 50%)
+        a_d2 = (str(regime) in ("NEUTRAL", "RISK_OFF")
                 and spy_px is not None and ema75 is not None and spy_px < ema75
                 and ema9 is not None and ema120 is not None and ema9 < ema120
                 and spy20 < 0 and bnd20 < 0 and tip20 < 0)
         w = dict(base)
-        if a_d1: w = self._DgZeroGroup(w, eq, "D")
-        out["D1"] = w
-        # E1 toxic IDS equity cap
-        a_e1 = (str(ps) == "NORMAL"
-                and str(ids) in ("WATCH", "STRESS")
-                and spy_px is not None and ema75 is not None and spy_px < ema75
-                and spy20 < 0)
-        w = dict(base)
-        if a_e1:
-            eg = self._DgGross(w, eq, "E")
-            if eg > 0.90 and eg > 1e-12:
-                w = self._DgScaleGroup(w, eq, "E", 0.90 / eg)
-        out["E1"] = w
-        # E2 damaged transition equity cap (diag-only hold state; no prod mutation)
+        if a_d2:
+            w = self._DgScaleTickers(w, ("BND", "TIP"), 0.50)
+        out["D2"] = w
+        # E2 control — unchanged from D1
         start_e2 = (str(regime) in ("NEUTRAL", "RISK_OFF")
                     and str(prev_reg) == "RISK_ON"
                     and spy_px is not None and ema75 is not None and spy_px < ema75
@@ -1110,7 +1121,9 @@ class CgDefGrossDiagMixin:
             if eg > 1.00 and eg > 1e-12:
                 w = self._DgScaleGroup(w, eq, "E", 1.00 / eg)
         out["E2"] = w
-        return out, {"D1": a_d1, "E1": a_e1, "E2": a_e2}
+        if a_w and str(ids) == "STRESS":
+            self._dg_stress_act += 1
+        return out, {"W1": a_w, "W2": a_w, "D2": a_d2, "E2": a_e2}
 
     def CgDefGrossUpdate(self, combined) -> None:
         if not getattr(self, "cg_def_gross_diag_enable", False): return
@@ -1138,6 +1151,8 @@ class CgDefGrossDiagMixin:
             variants, active = self._DgBuildVariants(
                 base, eq, spy_px, ema75, ema9, ema120, spy20, bnd20, tip20,
                 regime, prev_reg, ps, ids, dd)
+            watch_ok = self._DgWatchOn(ps, ids, spy_px, ema75, spy20)
+            d2_ok = bool(active.get("D2"))
             if self._dg_prev_px is not None:
                 for v in _DG_V:
                     pw = self._dg_prev_w.get(v)
@@ -1158,37 +1173,47 @@ class CgDefGrossDiagMixin:
                         a["n"] += 1
                         br = self._DgRet(self._dg_prev_w.get("BASE") or {}, self._dg_prev_px, px)
                         a["sum_br"] += br; a["sum_vr"] += r
-                        if br > 0: a["pos_b"] += 1
                         if br < 0: a["neg_b"] += 1
                         a["nav_b"] *= (1.0 + br); a["nav_v"] *= (1.0 + r)
-                        bw = self._dg_prev_w.get("BASE") or {}
-                        a["sum_eb"] += self._DgGross(bw, eq, "E")
-                        a["sum_ea"] += eg
-                        a["sum_db"] += self._DgGross(bw, eq, "D")
-                        a["sum_da"] += dg
-                        a["sum_cb"] += self._DgCash(bw)
-                        a["sum_ca"] += c
-                # E1 IDS attribution: prior-day NORMAL + WATCH/STRESS only
-                pps = getattr(self, "_dg_prev_ps", None)
-                pids = getattr(self, "_dg_prev_ids", None)
-                if pps == "NORMAL" and pids in ("WATCH", "STRESS"):
-                    for tag, vv in (("BASE", "BASE"), ("E1", "E1")):
-                        pw = self._dg_prev_w.get(vv) or {}
+                # WATCH attribution (prior-day full W1 activation set)
+                if getattr(self, "_dg_prev_watch_ok", False):
+                    bw = self._dg_prev_w.get("BASE") or {}
+                    for v in ("BASE", "W1", "W2"):
+                        pw = self._dg_prev_w.get(v) or {}
                         r = self._DgRet(pw, self._dg_prev_px, px)
-                        key = f"{pids}_{tag}"
-                        _dg_upd(self._dg_ids[key], r, 0, 0, 0, 0, 0, 0)
+                        bucket = self._dg_watch[v]
+                        _dg_upd(bucket["st"], r)
+                        if v == "BASE":
+                            bucket["sum_eb"] += self._DgGross(bw, eq, "E")
+                            bucket["sum_ea"] += self._DgGross(bw, eq, "E")
+                        else:
+                            bucket["sum_eb"] += self._DgGross(bw, eq, "E")
+                            bucket["sum_ea"] += self._DgGross(pw, eq, "E")
+                # D2 duration attribution
+                if getattr(self, "_dg_prev_d2_ok", False):
+                    bw = self._dg_prev_w.get("BASE") or {}
+                    dw = self._dg_prev_w.get("D2") or {}
+                    br = self._DgRet(bw, self._dg_prev_px, px)
+                    dr = self._DgRet(dw, self._dg_prev_px, px)
+                    _dg_upd(self._dg_dur["base"], br)
+                    _dg_upd(self._dg_dur["d2"], dr)
+                    self._dg_dur["n"] += 1
+                    self._dg_dur["sum_db"] += self._DgGross(bw, eq, "D")
+                    self._dg_dur["sum_da"] += self._DgGross(dw, eq, "D")
+                    self._dg_dur["sum_cb"] += self._DgCash(bw)
+                    self._dg_dur["sum_ca"] += self._DgCash(dw)
                 self._dg_n += 1
             for v in _DG_V:
                 self._dg_prev_w[v] = variants[v]
             self._dg_prev_px = px
             self._dg_prev_act = active
-            self._dg_prev_ps = ps
-            self._dg_prev_ids = ids
+            self._dg_prev_watch_ok = watch_ok
+            self._dg_prev_d2_ok = d2_ok
             self._dg_last = today
         except Exception as e:
             if not self._dg_err:
                 self._dg_err = True
-                try: self.log(f"[INIT] CG_DEF_D1_ERROR,stage=update,type={type(e).__name__}")
+                try: self.log(f"[INIT] CG_DEF_D2_ERROR,stage=update,type={type(e).__name__}")
                 except Exception: pass
 
     def _DgEmit(self, lines, line):
@@ -1215,57 +1240,67 @@ class CgDefGrossDiagMixin:
 
     def CgDefGrossEmitFinal(self) -> None:
         if not getattr(self, "cg_def_gross_diag_enable", False): return
-        self.log(f"[EOA] CG_DEF_D1_EMIT_START,n={getattr(self,'_dg_n',0)}")
+        self.log(f"[EOA] CG_DEF_D2_EMIT_START,n={getattr(self,'_dg_n',0)}")
         lines = []; self._dg_bytes = 0
         for v in _DG_V:
             st = self._dg_run[v]
             if st["n"] <= 0:
-                self._DgEmit(lines, f"CG_DEF_D1_FINAL,variant={v},status=NO_DATA")
+                self._DgEmit(lines, f"CG_DEF_D2_FINAL,variant={v},status=NO_DATA")
             else:
-                self._DgEmit(lines, self._DgFmt("CG_DEF_D1_FINAL", f"variant={v}", st))
+                self._DgEmit(lines, self._DgFmt("CG_DEF_D2_FINAL", f"variant={v}", st))
         for v in _DG_V:
             for name, _, _ in _DG_W:
                 st = self._dg_win[(v, name)]
                 if st["n"] <= 0: continue
                 if not self._DgEmit(lines, self._DgFmt(
-                        "CG_DEF_D1_WINDOW_FINAL", f"variant={v},window={name}", st)):
+                        "CG_DEF_D2_WINDOW_FINAL", f"variant={v},window={name}", st)):
                     break
         for v in _DG_NV:
             a = self._dg_act[v]; n = a["n"]
             if n <= 0:
-                self._DgEmit(lines, f"CG_DEF_D1_ACTIVE_FINAL,variant={v},status=NO_DATA")
+                self._DgEmit(lines, f"CG_DEF_D2_ACTIVE_FINAL,variant={v},status=NO_DATA")
                 continue
-            neg_r = a["neg_b"] / n
             self._DgEmit(lines, (
-                f"CG_DEF_D1_ACTIVE_FINAL,variant={v},active_days={n},"
-                f"negative_base_days={a['neg_b']},positive_base_days={a['pos_b']},"
-                f"negative_rate={_dg_f(neg_r,4)},"
+                f"CG_DEF_D2_ACTIVE_FINAL,variant={v},active_days={n},"
+                f"negative_rate={_dg_f(a['neg_b']/n,4)},"
                 f"avg_base_return={_dg_f(a['sum_br']/n,6)},"
                 f"avg_variant_return={_dg_f(a['sum_vr']/n,6)},"
-                f"base_nav_active={_dg_f(a['nav_b'])},variant_nav_active={_dg_f(a['nav_v'])},"
-                f"avg_equity_before={_dg_f(a['sum_eb']/n)},avg_equity_after={_dg_f(a['sum_ea']/n)},"
-                f"avg_duration_before={_dg_f(a['sum_db']/n)},avg_duration_after={_dg_f(a['sum_da']/n)},"
-                f"avg_cash_before={_dg_f(a['sum_cb']/n)},avg_cash_after={_dg_f(a['sum_ca']/n)}"))
-        for ids in ("WATCH", "STRESS"):
-            b = self._dg_ids[f"{ids}_BASE"]; e = self._dg_ids[f"{ids}_E1"]
-            if b["n"] <= 0 and e["n"] <= 0: continue
-            nb = max(1, b["n"]); ne = max(1, e["n"])
+                f"base_nav_active={_dg_f(a['nav_b'])},variant_nav_active={_dg_f(a['nav_v'])}"))
+        wb = self._dg_watch["BASE"]["st"]
+        for v in ("W1", "W2"):
+            ws = self._dg_watch[v]; st = ws["st"]; n = st["n"]
+            nb = max(1, wb["n"]); nv = max(1, n)
             self._DgEmit(lines, (
-                f"CG_DEF_D1_IDS_FINAL,ids={ids},days={b['n']},"
-                f"nav_base={_dg_f(b['nav'])},nav_e1={_dg_f(e['nav'])},"
-                f"mean_base={_dg_f(b['sum_r']/nb,6)},mean_e1={_dg_f(e['sum_r']/ne,6)},"
-                f"maxdd_base={_dg_f(b['maxdd'])},maxdd_e1={_dg_f(e['maxdd'])},"
-                f"worst5_base={_dg_f(_dg_w5(list(b['rets'])),6)},"
-                f"worst5_e1={_dg_f(_dg_w5(list(e['rets'])),6)}"))
+                f"CG_DEF_D2_WATCH_FINAL,variant={v},days={n},"
+                f"nav_base={_dg_f(wb['nav'])},nav_variant={_dg_f(st['nav'])},"
+                f"mean_base={_dg_f(wb['sum_r']/nb,6)},mean_variant={_dg_f(st['sum_r']/nv,6)},"
+                f"maxdd_base={_dg_f(wb['maxdd'])},maxdd_variant={_dg_f(st['maxdd'])},"
+                f"worst5_base={_dg_f(_dg_w5(list(wb['rets'])),6)},"
+                f"worst5_variant={_dg_f(_dg_w5(list(st['rets'])),6)},"
+                f"avg_equity_before={_dg_f(ws['sum_eb']/nv if n else None)},"
+                f"avg_equity_after={_dg_f(ws['sum_ea']/nv if n else None)},"
+                f"stress_active_days={int(getattr(self,'_dg_stress_act',0))}"))
+        dd = self._dg_dur; n = dd["n"]
+        nb = max(1, dd["base"]["n"]); nd = max(1, dd["d2"]["n"])
+        yb = self._dg_win[("BASE", "Y2022")]; yd = self._dg_win[("D2", "Y2022")]
+        self._DgEmit(lines, (
+            f"CG_DEF_D2_DURATION_FINAL,days={n},"
+            f"nav_base={_dg_f(dd['base']['nav'])},nav_d2={_dg_f(dd['d2']['nav'])},"
+            f"mean_base={_dg_f(dd['base']['sum_r']/nb,6)},mean_d2={_dg_f(dd['d2']['sum_r']/nd,6)},"
+            f"maxdd_base={_dg_f(dd['base']['maxdd'])},maxdd_d2={_dg_f(dd['d2']['maxdd'])},"
+            f"avg_duration_before={_dg_f(dd['sum_db']/n if n else None)},"
+            f"avg_duration_after={_dg_f(dd['sum_da']/n if n else None)},"
+            f"avg_cash_before={_dg_f(dd['sum_cb']/n if n else None)},"
+            f"avg_cash_after={_dg_f(dd['sum_ca']/n if n else None)},"
+            f"y2022_nav_base={_dg_f(yb['nav'])},y2022_nav_d2={_dg_f(yd['nav'])},"
+            f"y2022_dd_base={_dg_f(yb['maxdd'])},y2022_dd_d2={_dg_f(yd['maxdd'])}"))
         # selection
         base = self._dg_run["BASE"]
         b_dd = base["maxdd"]; b_w5 = _dg_w5(list(base["rets"])); b_nav = base["nav"]
         b_oos = self._dg_win[("BASE", "OOS")]
         b_oos_sh = _dg_sh(b_oos["sum_r"], b_oos["sum_r2"], b_oos["n"])
         b_y20 = self._dg_win[("BASE", "Y2020")]["maxdd"]
-        b_y22 = self._dg_win[("BASE", "Y2022")]
-        b_y15 = self._dg_win[("BASE", "Y2015")]["maxdd"]
-        eligible = []; reasons = {}
+        eligible = []
         for v in _DG_NV:
             st = self._dg_run[v]
             if st["n"] <= 0 or base["n"] <= 0: continue
@@ -1274,45 +1309,37 @@ class CgDefGrossDiagMixin:
             c_oos_sh = _dg_sh(c_oos["sum_r"], c_oos["sum_r2"], c_oos["n"])
             c_y20 = self._dg_win[(v, "Y2020")]["maxdd"]
             c_y22 = self._dg_win[(v, "Y2022")]
-            c_y15 = self._dg_win[(v, "Y2015")]["maxdd"]
+            b_y22 = self._dg_win[("BASE", "Y2022")]
             ok = True; why_fail = None
-            if st["maxdd"] >= b_dd - 1e-12: ok = False; why_fail = "maxdd"
+            mat = ((b_dd - st["maxdd"]) >= 0.002 - 1e-12) or ((st["nav"] - b_nav) >= 0.005 - 1e-12)
+            if not mat: ok = False; why_fail = "material"
+            elif st["nav"] < 0.98 * b_nav - 1e-12: ok = False; why_fail = "nav"
             elif b_w5 is not None and c_w5 is not None and c_w5 < b_w5 - 1e-12: ok = False; why_fail = "worst5"
-            elif st["nav"] < 0.97 * b_nav - 1e-12: ok = False; why_fail = "nav"
-            elif b_oos_sh is not None and c_oos_sh is not None and c_oos_sh < b_oos_sh * 0.95: ok = False; why_fail = "oos_sharpe"
+            elif b_oos_sh is not None and c_oos_sh is not None and c_oos_sh < b_oos_sh * 0.97: ok = False; why_fail = "oos_sharpe"
             elif c_y20 > b_y20 + 1e-12: ok = False; why_fail = "y2020_dd"
-            elif c_y22["maxdd"] > b_y22["maxdd"] + 1e-12: ok = False; why_fail = "y2022_dd"
-            elif c_y15 > b_y15 + 1e-12: ok = False; why_fail = "y2015_dd"
             elif self._dg_act[v]["n"] < 20: ok = False; why_fail = "active_days"
             else:
-                # variant-specific materiality
-                if v == "D1":
-                    nav_ok = c_y22["nav"] > b_y22["nav"] + 1e-12
-                    dd_ok = c_y22["maxdd"] < b_y22["maxdd"] - 0.005
-                    if not (nav_ok or dd_ok): ok = False; why_fail = "d1_2022"
-                elif v == "E1":
-                    improved = False
-                    for ids in ("WATCH", "STRESS"):
-                        bb = self._dg_ids[f"{ids}_BASE"]; ee = self._dg_ids[f"{ids}_E1"]
-                        if bb["n"] <= 0: continue
-                        if (ee["maxdd"] < bb["maxdd"] - 1e-12
-                                or ee["nav"] > bb["nav"] + 1e-12
-                                or (_dg_w5(list(ee["rets"])) or -9) > (_dg_w5(list(bb["rets"])) or -9)):
-                            improved = True
-                    if not improved: ok = False; why_fail = "e1_ids"
+                if v in ("W1", "W2"):
+                    wb = self._dg_watch["BASE"]["st"]; wv = self._dg_watch[v]["st"]
+                    if getattr(self, "_dg_stress_act", 0) != 0: ok = False; why_fail = "stress"
+                    elif (wb["maxdd"] - wv["maxdd"]) < 0.02 - 1e-12: ok = False; why_fail = "watch_dd"
+                    elif wv["nav"] < 0.995 * wb["nav"] - 1e-12: ok = False; why_fail = "watch_nav"
+                elif v == "D2":
+                    if (b_y22["maxdd"] - c_y22["maxdd"]) < 0.003 - 1e-12: ok = False; why_fail = "d2_2022_dd"
+                    elif c_y22["nav"] < b_y22["nav"] - 1e-12: ok = False; why_fail = "d2_2022_nav"
                 elif v == "E2":
-                    if c_y15 >= b_y15 - 1e-12: ok = False; why_fail = "e2_2015"
-            if ok:
-                eligible.append((v, -st["nav"], st)); reasons[v] = "ok"
-            else:
-                reasons[v] = why_fail or "fail"
+                    a = self._dg_act["E2"]
+                    if st["nav"] <= b_nav + 1e-12: ok = False; why_fail = "e2_nav"
+                    elif a["n"] <= 0 or (a["sum_vr"] / a["n"]) <= (a["sum_br"] / a["n"]) + 1e-12:
+                        ok = False; why_fail = "e2_active"
+            if ok: eligible.append((v, -st["nav"]))
         pick = "NONE"; why = "none_eligible"
         if eligible:
             eligible.sort()
-            pick = eligible[0][0]; why = f"max_nav|{reasons.get(pick,'ok')}"
+            pick = eligible[0][0]; why = "max_nav_among_eligible"
         self._DgEmit(lines, (
-            f"CG_DEF_D1_SELECT_FINAL,pick={pick},"
+            f"CG_DEF_D2_SELECT_FINAL,pick={pick},"
             f"eligible={','.join(e[0] for e in eligible) or 'NONE'},"
             f"why={why},trade=0"))
         for ln in lines: self.log(ln)
-        self.log(f"[EOA] CG_DEF_D1_EMIT_DONE,lines={len(lines)},bytes={self._dg_bytes}")
+        self.log(f"[EOA] CG_DEF_D2_EMIT_DONE,lines={len(lines)},bytes={self._dg_bytes}")
