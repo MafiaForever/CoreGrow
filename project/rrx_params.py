@@ -9,6 +9,7 @@ RRX_PARAMS = {
     "cg_watch_w2_trade_enable":        "1",
     "cg_transition_e2_trade_enable":   "0",
     "cg_regime_rebal_time_diag_enable": "1",
+    "cg_regime_rebal_time_d1_enable":   "0",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
