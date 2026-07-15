@@ -8,8 +8,13 @@ RRX_PARAMS = {
     "spyg_sat_trade_enable":           "0",
     "cg_watch_w2_trade_enable":        "1",
     "cg_transition_e2_trade_enable":   "0",
-    "cg_regime_rebal_time_diag_enable": "1",
+    "cg_regime_rebal_time_diag_enable": "0",
     "cg_regime_rebal_time_d1_enable":   "0",
+    "cg_regime_rebal_time_trade_enable": "0",
+    "cg_rebal_time_fixed_minutes":       "-1",
+    "cg_rebal_time_risk_on_minutes":     "15",
+    "cg_rebal_time_neutral_minutes":     "15",
+    "cg_rebal_time_risk_off_minutes":    "15",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
@@ -120,5 +125,5 @@ RRX_PARAMS = {
     "dyn_rr_add_exp":                  "0.00",
     "dyn_rr_max_exp":                  "0.25",
     # Log filter
-    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_,CG_REGIME_TIME_",
+    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_,CG_REGIME_TIME_,CG_REGIME_TIME_TRADE,CG_REGIME_TIME_PENDING,CG_REGIME_TIME_EXEC",
 }

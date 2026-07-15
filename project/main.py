@@ -1086,16 +1086,11 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             _lfc_clear_ok = False                                                   # [LFC-FIX]
             if _no_state:
                 self.log("[LSS1] no state -- skipping ExecuteTargets")
-            elif _save_err:
-                self.log("[LSS2] save failed -- reduce-only")
-                self.ExecuteTargets(combined, reduce_only=True)
-                _lfc_clear_ok = True
-            elif _lfc_reduce:
-                self.log("[CASHFLOW] withdrawal reduce-only")
-                self.ExecuteTargets(combined, reduce_only=True)
-                _lfc_clear_ok = True
             else:
-                self.ExecuteTargets(combined)
+                _ro = bool(_save_err or _lfc_reduce)
+                if _save_err: self.log("[LSS2] save failed -- reduce-only")
+                elif _lfc_reduce: self.log("[CASHFLOW] withdrawal reduce-only")
+                self.CgRegimeRebalTimeTradeMaybeRun(combined, reduce_only=_ro, force_immediate=_ro)
                 _lfc_clear_ok = True
             if _lfc_clear_ok:
                 self._lfc_force_rebalance = False
@@ -1236,6 +1231,8 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         try: self.CgIdsNormalCapEmitFinal()
         except Exception as exc: self.log(f"[EOA] CG_IDS_CAP_ERROR,stage=final,type={type(exc).__name__}")
         try: self.CgRegimeRebalTimeDiagEmitFinal()
+        except Exception: pass
+        try: self.CgRegimeRebalTimeTradeEmitFinal()
         except Exception: pass
         self.log("[EOA] final snapshot saved")
         if self.live_mode: self._EmitWorstDays(label="FINAL")

@@ -4,6 +4,7 @@
 
 from AlgorithmImports import *
 from cg_regime_rebal_time_diag import CgRegimeRebalTimeDiagMixin
+from cg_regime_rebal_time_trade import CgRegimeRebalTimeTradeMixin
 
 
 _DFT_DEF = frozenset(("TIP", "BND", "GLD", "GLDM", "BIL", "SGOV", "USFR", "SH"))
@@ -19,7 +20,7 @@ def _dft_tk(s):
             return str(s)
 
 
-class CgDefensiveTradeMixin(CgRegimeRebalTimeDiagMixin):
+class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin, CgRegimeRebalTimeDiagMixin):
     """W2 / E2 production overlays. No order calls."""
 
     def CgDefensiveTradeInit(self) -> None:
@@ -48,6 +49,10 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeDiagMixin):
             self.CgRegimeRebalTimeDiagInitialize()
         except Exception:
             pass
+        try:
+            self.CgRegimeRebalTimeTradeInitialize()
+        except Exception as exc:
+            raise Exception(f"CG_REGIME_TIME_TRADE_T1 init failed: {exc}")
 
     def _DftCashSym(self):
         return getattr(self, "sym_cash", None)
