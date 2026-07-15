@@ -250,34 +250,9 @@ class CgRegimeRebalTimeDiagMixin:
         m = self._rt_sym_map
         if tk in m:
             return m[tk]
-        # attrs sym_*
-        for attr, val in list(self.__dict__.items()):
-            if not attr.startswith("sym_"):
-                continue
-            try:
-                if val is not None and _tk(val) == tk:
-                    m[tk] = val
-                    return val
-            except Exception:
-                continue
-        for s in getattr(self, "panic_tactical_universe", []) or []:
-            try:
-                if _tk(s) == tk:
-                    m[tk] = s
-                    return s
-            except Exception:
-                continue
-        for s in getattr(self, "active_symbols", []) or []:
-            try:
-                if _tk(s) == tk:
-                    m[tk] = s
-                    return s
-            except Exception:
-                continue
-        # securities scan
+
         try:
-            secs = self.securities
-            for kv in secs:
+            for kv in self.securities:
                 try:
                     sym = kv.Key if hasattr(kv, "Key") else kv
                     if _tk(sym) == tk:
@@ -287,6 +262,7 @@ class CgRegimeRebalTimeDiagMixin:
                     continue
         except Exception:
             pass
+
         m[tk] = None
         return None
 
@@ -412,9 +388,15 @@ class CgRegimeRebalTimeDiagMixin:
                     wf = float(v or 0.0)
                 except Exception:
                     continue
+
                 if abs(wf) < 1e-12:
                     continue
-                w[_tk(k)] = wf
+
+                tk = _tk(k)
+                w[tk] = wf
+
+                if tk not in self._rt_sym_map:
+                    self._rt_sym_map[tk] = k
             shell = self._RtNewShell(w, rg, d)
             self._rt_pend = shell
             # snap T00 at capture (prod time)
