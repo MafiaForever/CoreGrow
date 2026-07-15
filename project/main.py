@@ -19,6 +19,11 @@ from cg_main_runtime_utils import CgMainRuntimeUtilsMixin, AttachCgMixins
 
 
 class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
+    def log(self, message) -> None:
+        CgMainRuntimeUtilsMixin.log(self, message)
+
+    def debug(self, message) -> None:
+        CgMainRuntimeUtilsMixin.debug(self, message)
 
     def Initialize(self):
         if not self.live_mode:

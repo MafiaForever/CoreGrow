@@ -74,7 +74,15 @@ class CgMainRuntimeUtilsMixin:
 
 
 def AttachCgMixins(target_cls, mixins):
+    # LEAN/Python.NET: never setattr managed read-only members (e.g. log/debug).
+    # Those overrides must be declared on the algorithm class body instead.
     import inspect
+    _skip = frozenset(("log", "debug", "Log", "Debug"))
     for _cls in mixins:
         for _name, _fn in inspect.getmembers(_cls, predicate=inspect.isfunction):
-            setattr(target_cls, _name, _fn)
+            if _name in _skip:
+                continue
+            try:
+                setattr(target_cls, _name, _fn)
+            except (AttributeError, TypeError):
+                continue
