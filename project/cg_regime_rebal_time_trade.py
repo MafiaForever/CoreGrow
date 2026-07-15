@@ -8,15 +8,6 @@ from AlgorithmImports import *
 
 _ALLOWED_SLOTS = frozenset((15, 45, 75, 105, 135, 165, 195, 225, 255, 285, 315, 345, 375))
 _SIGNAL_SLOT = 15  # 09:45 ET
-# T3 optimization router: values 1..6 only; 0 = use direct cg_rt_ron/neu/roff.
-_T3_VARIANTS = {
-    1: (165, 15, 15),
-    2: (15, 165, 15),
-    3: (15, 195, 15),
-    4: (15, 15, 165),
-    5: (165, 165, 165),
-    6: (165, 195, 165),
-}
 
 
 def _rtt_tk(sym):
@@ -81,27 +72,12 @@ class CgRegimeRebalTimeTradeMixin:
             "cg_rt_roff",
             15,
         )
-        try:
-            self.cg_rt_t3_variant = int(float(_p("cg_rt_t3_variant") or 0))
-        except Exception:
-            self.cg_rt_t3_variant = 0
         if fixed != -1:
             if fixed not in _ALLOWED_SLOTS:
                 raise Exception(
                     f"CG_REGIME_TIME_TRADE_T1 invalid cg_rt_fixed={fixed}"
                 )
             ron = neu = roff = fixed
-        variant = int(self.cg_rt_t3_variant)
-        if variant != 0:
-            if variant not in _T3_VARIANTS:
-                raise ValueError(
-                    f"Invalid cg_rt_t3_variant={variant}; allowed=0..6"
-                )
-            if int(fixed) >= 0:
-                raise ValueError(
-                    "cg_rt_t3_variant requires cg_rt_fixed=-1"
-                )
-            ron, neu, roff = _T3_VARIANTS[variant]
         for name, val in (
             ("cg_rt_ron", ron),
             ("cg_rt_neu", neu),
@@ -130,21 +106,10 @@ class CgRegimeRebalTimeTradeMixin:
         self._cg_rt_last_regime_log = None
         self._cg_rt_trade_emitted = False
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in (
-            "CG_REGIME_TIME_TRADE",
-            "CG_REGIME_TIME_PENDING",
-            "CG_REGIME_TIME_EXEC",
-            "[INIT] CG_REGIME_TIME_TRADE",
-            "[INIT] CG_RT_T3_VARIANT",
-        ):
+        for pref in ("CG_REGIME_TIME_TRADE", "CG_REGIME_TIME_PENDING", "CG_REGIME_TIME_EXEC", "[INIT] CG_REGIME_TIME_TRADE"):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
-        self.log(
-            f"[INIT] CG_RT_T3_VARIANT,variant={variant},"
-            f"ron={ron},neutral={neu},roff={roff},"
-            f"fixed={fixed},trade={int(self.cg_regime_rebal_time_trade_enable)}"
-        )
         self.log(
             f"[INIT] CG_REGIME_TIME_TRADE_T1,"
             f"enable={int(self.cg_regime_rebal_time_trade_enable)},"
