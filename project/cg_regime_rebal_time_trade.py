@@ -52,21 +52,36 @@ class CgRegimeRebalTimeTradeMixin:
             except Exception:
                 raise Exception(f"CG_REGIME_TIME_TRADE_T1 invalid int param {k}={raw}")
 
-        self.cg_regime_rebal_time_trade_enable = _bool("cg_regime_rebal_time_trade_enable", "0")
-        fixed = _int("cg_rebal_time_fixed_minutes", -1)
-        ron = _int("cg_rebal_time_risk_on_minutes", 15)
-        neu = _int("cg_rebal_time_neutral_minutes", 15)
-        roff = _int("cg_rebal_time_risk_off_minutes", 15)
+        self.cg_regime_rebal_time_trade_enable = _bool(
+            "cg_rt_trade",
+            "0",
+        )
+        fixed = _int(
+            "cg_rt_fixed",
+            -1,
+        )
+        ron = _int(
+            "cg_rt_ron",
+            15,
+        )
+        neu = _int(
+            "cg_rt_neu",
+            15,
+        )
+        roff = _int(
+            "cg_rt_roff",
+            15,
+        )
         if fixed != -1:
             if fixed not in _ALLOWED_SLOTS:
                 raise Exception(
-                    f"CG_REGIME_TIME_TRADE_T1 invalid cg_rebal_time_fixed_minutes={fixed}"
+                    f"CG_REGIME_TIME_TRADE_T1 invalid cg_rt_fixed={fixed}"
                 )
             ron = neu = roff = fixed
         for name, val in (
-            ("cg_rebal_time_risk_on_minutes", ron),
-            ("cg_rebal_time_neutral_minutes", neu),
-            ("cg_rebal_time_risk_off_minutes", roff),
+            ("cg_rt_ron", ron),
+            ("cg_rt_neu", neu),
+            ("cg_rt_roff", roff),
         ):
             if val not in _ALLOWED_SLOTS:
                 raise Exception(f"CG_REGIME_TIME_TRADE_T1 invalid {name}={val}")

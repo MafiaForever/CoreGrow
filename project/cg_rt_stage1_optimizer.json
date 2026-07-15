@@ -1,0 +1,39 @@
+{
+  "optimization-strategy": "QuantConnect.Optimizer.Strategies.GridSearchOptimizationStrategy",
+  "optimization-strategy-settings": {
+    "$type": "QuantConnect.Optimizer.Strategies.StepBaseOptimizationStrategySettings, QuantConnect.Optimizer",
+    "default-segment-amount": 10
+  },
+  "optimization-criterion": {
+    "target": "TotalPerformance.PortfolioStatistics.CompoundingAnnualReturn",
+    "extremum": "max"
+  },
+  "parameters": [
+    {
+      "name": "cg_rt_fixed",
+      "min": 15.0,
+      "max": 375.0,
+      "step": 30.0
+    }
+  ],
+  "constraints": [],
+  "maximum-concurrent-backtests": 4,
+  "stage1_notes": {
+    "period": "2012-01-01 to 2026-07-01",
+    "optimize": "cg_rt_fixed only (13 values: 15..375 step 30)",
+    "set_on_project_before_run": {
+      "cg_rt_trade": "1",
+      "cg_rt_ron": "15",
+      "cg_rt_neu": "15",
+      "cg_rt_roff": "15",
+      "cg_watch_w2_trade_enable": "1",
+      "cg_transition_e2_trade_enable": "0",
+      "cg_regime_rebal_time_diag_enable": "0",
+      "cg_regime_rebal_time_d1_enable": "0",
+      "spyg_sat_trade_enable": "0",
+      "rrx_trade_bridge_enable": "0",
+      "dyn_alloc_c2n_trade_enable": "0",
+      "cg_fast_baseline_mode": "1"
+    }
+  }
+}
