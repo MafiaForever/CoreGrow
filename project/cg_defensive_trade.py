@@ -3,9 +3,7 @@
 # Trading: W2 ON, E2 OFF. LEAN v17921 compatible.
 
 from AlgorithmImports import *
-from cg_regime_rebal_time_diag import CgRegimeRebalTimeDiagMixin
 from cg_regime_rebal_time_trade import CgRegimeRebalTimeTradeMixin
-from cg_regime_time_shadow_s1 import CgRegimeTimeShadowS1Mixin
 
 
 _DFT_DEF = frozenset(("TIP", "BND", "GLD", "GLDM", "BIL", "SGOV", "USFR", "SH"))
@@ -21,7 +19,7 @@ def _dft_tk(s):
             return str(s)
 
 
-class CgDefensiveTradeMixin(CgRegimeTimeShadowS1Mixin, CgRegimeRebalTimeTradeMixin, CgRegimeRebalTimeDiagMixin):
+class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
     """W2 / E2 production overlays. No order calls."""
 
     def CgDefensiveTradeInit(self) -> None:
@@ -47,17 +45,9 @@ class CgDefensiveTradeMixin(CgRegimeTimeShadowS1Mixin, CgRegimeRebalTimeTradeMix
             f"w2_scale=0.80,e2_equity_cap=1.00,e2_max_days=20,trade=1"
         )
         try:
-            self.CgRegimeRebalTimeDiagInitialize()
-        except Exception:
-            pass
-        try:
             self.CgRegimeRebalTimeTradeInitialize()
         except Exception as exc:
             raise Exception(f"CG_REGIME_TIME_TRADE_T1 init failed: {exc}")
-        try:
-            self.CgRegimeTimeShadowS1Initialize()
-        except Exception:
-            pass
 
     def _DftCashSym(self):
         return getattr(self, "sym_cash", None)
@@ -225,14 +215,6 @@ class CgDefensiveTradeMixin(CgRegimeTimeShadowS1Mixin, CgRegimeRebalTimeTradeMix
         w2_on = bool(getattr(self, "cg_watch_w2_trade_enable", False))
         e2_on = bool(getattr(self, "cg_transition_e2_trade_enable", False))
         if not w2_on and not e2_on:
-            try:
-                self.CgRegimeRebalTimeDiagCaptureTargets(combined, getattr(self, "current_regime", None))
-            except Exception:
-                pass
-            try:
-                self.CgRegimeTimeShadowS1Capture(combined, getattr(self, "current_regime", None))
-            except Exception:
-                pass
             return combined
 
         today = self.time.date()
@@ -287,14 +269,6 @@ class CgDefensiveTradeMixin(CgRegimeTimeShadowS1Mixin, CgRegimeRebalTimeTradeMix
                         f"dd={dd:.4f},equity_before={eq_b:.4f},equity_after={eq_a:.4f}"
                     )
 
-        try:
-            self.CgRegimeRebalTimeDiagCaptureTargets(out, getattr(self, "current_regime", None))
-        except Exception:
-            pass
-        try:
-            self.CgRegimeTimeShadowS1Capture(out, getattr(self, "current_regime", None))
-        except Exception:
-            pass
         return out
 
     def CgDefensiveTradePersist(self, state: dict) -> None:

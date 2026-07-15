@@ -330,7 +330,3 @@ class CgRegimeRebalTimeTradeMixin:
                 )
         except Exception:
             pass
-        try:
-            self.CgRegimeTimeShadowS1EmitFinal()
-        except Exception:
-            pass
