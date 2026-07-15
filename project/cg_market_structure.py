@@ -511,7 +511,7 @@ class CoreGrowthMarketStructureMixin:
         # [BRG-C1/C1B/B2] Block SPY/XLV/XLU increases in bear-rally or rate-shock conditions.
         # [C1R-S3OFF] Duration veto runs independently before BRG gate
         self._UpdateC1RGe4State()
-        if (self.get_parameter("c1r_ge4_enable") or "0") == "1":
+        if bool(getattr(self, "c1r_ge4_enable", False)) or (self.get_parameter("c1r_ge4_enable") or "0") == "1":
             w = self._ApplyDurC1RVeto(w)
         if not bool(getattr(self, "bear_rally_gate_enable", False)):
             return w

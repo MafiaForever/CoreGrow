@@ -1,3 +1,6 @@
+# region imports
+from AlgorithmImports import *
+# endregion
 # cg_core_recovery_diag.py
 # CORE-D0.2/D0.4: compact CoreGrowth recovery diagnostics. Diagnostic-only. Zero trading impact.
 from datetime import date as _date

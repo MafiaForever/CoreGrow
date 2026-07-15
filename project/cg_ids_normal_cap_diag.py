@@ -1,3 +1,6 @@
+# region imports
+from AlgorithmImports import *
+# endregion
 # cg_ids_normal_cap_diag.py
 # IDS-NORMAL-CAP-D0: one-run shadow matrix for IDS transition gross caps.
 # Diagnostic-only. Zero trading impact. Never mutates real targets.

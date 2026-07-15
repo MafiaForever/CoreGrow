@@ -1029,7 +1029,7 @@ class CoreGrowthRiskTacticalMixin:
     def TacticalExitDropConfirmed(self, sym, lookback_days: int = 10, min_drop: float = 0.04, use_sharp: bool = True,) -> bool:
         # [H16] slow (use_sharp=False) / sharp collapse (use_sharp=True)
         try:
-            atr_len = int(getattr(self, "tactical_atr_len", 14))
+            atr_len = int(getattr(self, "tactical_atr_len", 18))
             hist_len = max(lookback_days + 1, atr_len + 3)
             hist = self.history(sym, hist_len, Resolution.DAILY)
             needed = {"open", "high", "low", "close"}
@@ -1075,7 +1075,7 @@ class CoreGrowthRiskTacticalMixin:
             if o1 > 0 and (o1 - c1) / o1 >= 0.003: weak_score += 1
             if h1 > l1 and (c1 - l1) / (h1 - l1) <= 0.30: weak_score += 1
             if l1 < l2: weak_score += 1
-            sharp_mult = float(getattr(self, "tactical_sharp_atr_mult", 1.1))
+            sharp_mult = float(getattr(self, "tactical_sharp_atr_mult", 1.30))
             weak_min = int(getattr(self, "tactical_sharp_weak_score_min", 3))
             return (  # [H16] sharp_ok only
                 np.isfinite(drop_1d)
