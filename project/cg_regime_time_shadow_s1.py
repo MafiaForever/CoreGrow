@@ -10,7 +10,7 @@ import math
 _SH_SLOTS = (15, 45, 75, 105, 135, 165, 195, 225, 255, 285, 315, 345, 375)
 _SH_N = 13
 _SH_REGS = ("RISK_ON", "NEUTRAL", "RISK_OFF")
-_SH_CASH = frozenset(("BIL", "SGOV", "USFR", "TFLO", "__CASH__"))
+_SH_CASH = frozenset(("__CASH__",))
 _SH_PARK = {"SGOV": "BIL", "USFR": "BIL", "TFLO": "BIL", "GLDM": "GLD"}
 _SH_STALE = 5.0
 _SH_WMIN = 1e-6
@@ -198,8 +198,8 @@ class CgRegimeTimeShadowS1Mixin:
         return out
 
     def _ShPx(self, tk):
-        if tk in _SH_CASH:
-            return 1.0  # cash/parking unit price for synthetic cash leg
+        if tk == "__CASH__":
+            return 1.0  # synthetic cash only; BIL/SGOV/USFR/TFLO use market prices
         sym = self._ShMap(tk)
         if sym is None:
             return None
