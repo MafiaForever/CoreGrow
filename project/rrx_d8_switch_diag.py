@@ -825,97 +825,113 @@ def D8SwitchDiagEmitFinal(self, start, today) -> None:
         )
 
 # ---------------------------------------------------------------------------
-# CG-DEF-GROSS-D2: WATCH-only equity defense + partial duration cut + E2 control.
-# Diagnostic-only. Zero trading impact. Never mutates real targets.
-# Shadow convention: weights at T applied to T close → T+1 close (no look-ahead).
-# BASE is target-shadow accounting, not QC portfolio NAV.
+# CG-CRISIS-CORE-D0: crisis-type-aware defensive core shadow (diag-only).
+# Uses existing GetPanicStructureDiag ptype. Never mutates targets/orders.
+# Shadow: T close → T+1 close. BASE = target-shadow, not QC NAV.
 # ---------------------------------------------------------------------------
-from datetime import date as _dg_date
-from collections import deque as _dg_deque
+from datetime import date as _cc_date
+from collections import deque as _cc_deque
 
-_DG_V = ("BASE", "W1", "W2", "D2", "E2")
-_DG_NV = ("W1", "W2", "D2", "E2")
-_DG_W = (
-    ("TRAIN", _dg_date(2012,1,1), _dg_date(2018,12,31)),
-    ("OOS", _dg_date(2019,1,1), _dg_date(2021,12,31)),
-    ("CRISIS", _dg_date(2022,1,1), _dg_date(2025,12,31)),
-    ("Y2012", _dg_date(2012,1,1), _dg_date(2012,12,31)),
-    ("Y2015", _dg_date(2015,1,1), _dg_date(2015,12,31)),
-    ("Y2020", _dg_date(2020,1,1), _dg_date(2020,12,31)),
-    ("Y2022", _dg_date(2022,1,1), _dg_date(2022,12,31)),
-    ("Y2023", _dg_date(2023,1,1), _dg_date(2023,12,31)),
-    ("Y2024", _dg_date(2024,1,1), _dg_date(2024,12,31)),
-    ("Y2025", _dg_date(2025,1,1), _dg_date(2025,12,31)),
-    ("LIVE_RECENT", _dg_date(2026,1,1), None),
+_CC_V = ("BASE", "TYPE_GROUPED", "TYPE_VETO", "TYPE_VETO_PERSIST")
+_CC_NV = ("TYPE_GROUPED", "TYPE_VETO", "TYPE_VETO_PERSIST")
+_CC_W = (
+    ("TRAIN", _cc_date(2012,1,1), _cc_date(2018,12,31)),
+    ("OOS", _cc_date(2019,1,1), _cc_date(2021,12,31)),
+    ("CRISIS", _cc_date(2022,1,1), _cc_date(2025,12,31)),
+    ("Y2012", _cc_date(2012,1,1), _cc_date(2012,12,31)),
+    ("Y2015", _cc_date(2015,1,1), _cc_date(2015,12,31)),
+    ("Y2020", _cc_date(2020,1,1), _cc_date(2020,12,31)),
+    ("Y2022", _cc_date(2022,1,1), _cc_date(2022,12,31)),
+    ("Y2023", _cc_date(2023,1,1), _cc_date(2023,12,31)),
+    ("Y2024", _cc_date(2024,1,1), _cc_date(2024,12,31)),
+    ("Y2025", _cc_date(2025,1,1), _cc_date(2025,12,31)),
+    ("LIVE_RECENT", _cc_date(2026,1,1), None),
 )
-_DG_CASH = frozenset(("BIL", "SGOV", "USFR"))
-_DG_DUR = frozenset(("BND", "TIP"))
-_DG_GOLD = frozenset(("GLD", "GLDM"))
-_DG_HEDGE = frozenset(("SH",))
-_DG_BUDGET = 90000
+_CC_GMAP = {
+    "COMMODITY_INFL": "INFLATION", "COMMODITY_LEAD": "INFLATION", "STAGFLATION_SAFE": "INFLATION",
+    "BOND_HEDGED_RISK_OFF": "DEFLATION", "DEFL_RECESSION": "DEFLATION",
+    "RATE_SHOCK_UNKNOWN": "RATE_SHOCK",
+    "FISCAL_USD": "UNCERTAIN", "UNKNOWN": "UNCERTAIN", "NA": "UNCERTAIN",
+}
+_CC_GRP = ("INFLATION", "DEFLATION", "RATE_SHOCK", "UNCERTAIN")
+_CC_REC = {
+    "INFLATION": {"TIP": 0.35, "GLD": 0.30, "BND": 0.05, "CASH": 0.30},
+    "DEFLATION": {"TIP": 0.15, "GLD": 0.15, "BND": 0.40, "CASH": 0.30},
+    "RATE_SHOCK": {"TIP": 0.05, "GLD": 0.20, "BND": 0.05, "CASH": 0.70},
+    "UNCERTAIN": {"TIP": 0.20, "GLD": 0.25, "BND": 0.15, "CASH": 0.40},
+}
+_CC_CORE = frozenset(("TIP", "GLD", "BND", "BIL", "SGOV", "USFR"))
+_CC_CASH = frozenset(("BIL", "SGOV", "USFR"))
+_CC_H = (1, 3, 5, 10, 20)
+_CC_ASSETS = ("BND", "TIP", "GLD", "CASH", "STATIC_CORE", "SPY")
+_CC_BUDGET = 90000
 
 
-def _dg_blank():
+def _cc_blank():
     return {"n": 0, "sum_r": 0.0, "sum_r2": 0.0, "nav": 1.0, "peak": 1.0, "maxdd": 0.0,
-            "sum_tg": 0.0, "sum_eg": 0.0, "sum_dg": 0.0, "sum_gg": 0.0, "sum_c": 0.0,
-            "act": 0, "rets": _dg_deque(maxlen=4096)}
+            "sum_bnd": 0.0, "sum_tip": 0.0, "sum_gld": 0.0, "sum_cash": 0.0,
+            "sw": 0, "turn": 0.0, "rets": _cc_deque(maxlen=4096)}
 
 
-def _dg_upd(st, r, tg=0.0, eg=0.0, dg=0.0, gg=0.0, c=0.0, act=0):
+def _cc_upd(st, r, bnd=0.0, tip=0.0, gld=0.0, cash=0.0, sw=0, turn=0.0):
     st["n"] += 1
     st["sum_r"] += r; st["sum_r2"] += r * r
     st["nav"] = max(0.01, st["nav"] * (1.0 + r))
     if st["nav"] > st["peak"]: st["peak"] = st["nav"]
     dd = 1.0 - st["nav"] / max(st["peak"], 1e-9)
     if dd > st["maxdd"]: st["maxdd"] = dd
-    st["sum_tg"] += tg; st["sum_eg"] += eg; st["sum_dg"] += dg
-    st["sum_gg"] += gg; st["sum_c"] += c
-    st["act"] += act
+    st["sum_bnd"] += bnd; st["sum_tip"] += tip; st["sum_gld"] += gld; st["sum_cash"] += cash
+    st["sw"] += sw; st["turn"] += turn
     st["rets"].append(r)
 
 
-def _dg_w5(rets):
+def _cc_w5(rets):
     if not rets: return None
     a = sorted(rets); k = max(1, int(0.05 * len(a) + 0.999))
     return sum(a[:k]) / k
 
 
-def _dg_ann(s, n):
+def _cc_ann(s, n):
     return None if n < 20 else (1.0 + s / n) ** 252 - 1.0
 
 
-def _dg_vol(s, s2, n):
+def _cc_vol(s, s2, n):
     if n < 5: return None
     m = s / n; v = max(0.0, s2 / n - m * m)
     return (v ** 0.5) * (252 ** 0.5)
 
 
-def _dg_sh(s, s2, n):
-    v = _dg_vol(s, s2, n); a = _dg_ann(s, n)
+def _cc_sh(s, s2, n):
+    v = _cc_vol(s, s2, n); a = _cc_ann(s, n)
     if v is None or a is None or v < 1e-12: return None
     return a / v
 
 
-def _dg_f(x, d=4):
+def _cc_f(x, d=4):
     if x is None: return "NA"
     try: return f"{float(x):.{d}f}"
     except Exception: return "NA"
 
 
-def _dg_tk(s):
+def _cc_tk(s):
     try: return str(s.Value)
     except Exception:
         try: return str(s.value)
         except Exception: return str(s)
 
 
-def _dg_act_blank():
-    return {"n": 0, "sum_br": 0.0, "sum_vr": 0.0, "neg_b": 0,
-            "nav_b": 1.0, "nav_v": 1.0}
+def _cc_med(xs):
+    if not xs: return None
+    a = sorted(xs); n = len(a); m = n // 2
+    return a[m] if n % 2 else 0.5 * (a[m - 1] + a[m])
+
+
+def _cc_ep_blank():
+    return {"days": 0, "eps": [], "cur": 0, "switches": 0, "prev": None}
 
 
 class CgDefGrossDiagMixin:
-    """DEF-GROSS-D2 shadow matrix. Diagnostic-only."""
+    """CRISIS-CORE-D0 via existing diag hooks. Diagnostic-only."""
 
     def CgDefGrossInit(self) -> None:
         try:
@@ -924,422 +940,432 @@ class CgDefGrossDiagMixin:
                 v = self.get_parameter(k)
                 if v is None or str(v).strip() == "": v = ov.get(k, d)
                 return v
-            en = str(_p("cg_def_gross_diag_enable", "1") or "1").strip().lower()
+            en = str(_p("cg_crisis_core_diag_enable", "1") or "1").strip().lower()
             self.cg_def_gross_diag_enable = en in ("1", "true", "yes", "on")
             lp = list(getattr(self, "log_only_prefixes", None) or [])
-            for pref in ("CG_DEF_D2_", "CG_DEF_D1_", "CG_DEF_GROSS_"):
+            for pref in ("CG_CRISIS_", "CG_DEF_D2_", "CG_DEF_D1_", "CG_DEF_GROSS_"):
                 if pref not in lp: lp.append(pref)
             self.log_only_prefixes = lp
-            self.log("[INIT] CG_DEF_D2_DIAG enable="
-                     f"{int(self.cg_def_gross_diag_enable)} variants=BASE,W1,W2,D2,E2 trade=0 "
-                     f"conv=T_close_to_T1_close shadow=target_not_qc_nav")
+            self.log("[INIT] CG_CRISIS_CORE_DIAG enable="
+                     f"{int(self.cg_def_gross_diag_enable)} variants=BASE,TYPE_GROUPED,TYPE_VETO,"
+                     f"TYPE_VETO_PERSIST trade=0 conv=T_close_to_T1_close shadow=target_not_qc_nav")
             if not self.cg_def_gross_diag_enable: return
-            self._dg_run = {v: _dg_blank() for v in _DG_V}
-            self._dg_win = {(v, w[0]): _dg_blank() for v in _DG_V for w in _DG_W}
-            self._dg_act = {v: _dg_act_blank() for v in _DG_NV}
-            self._dg_watch = {v: {"st": _dg_blank(), "sum_eb": 0.0, "sum_ea": 0.0}
-                             for v in ("BASE", "W1", "W2")}
-            self._dg_dur = {"base": _dg_blank(), "d2": _dg_blank(),
-                            "sum_db": 0.0, "sum_da": 0.0, "sum_cb": 0.0, "sum_ca": 0.0, "n": 0}
-            self._dg_prev_w = {v: None for v in _DG_V}
-            self._dg_prev_px = None
-            self._dg_prev_act = {}
-            self._dg_prev_watch_ok = False
-            self._dg_prev_d2_ok = False
-            self._dg_stress_act = 0
-            self._dg_last = None
-            self._dg_n = 0
-            self._dg_bytes = 0
-            self._dg_pxbuf = {}
-            self._dg_e2_on = False
-            self._dg_e2_left = 0
-            self._dg_err = False
+            self._cc_run = {v: _cc_blank() for v in _CC_V}
+            self._cc_win = {(v, w[0]): _cc_blank() for v in _CC_V for w in _CC_W}
+            self._cc_type = {(v, g): _cc_blank() for v in _CC_V for g in _CC_GRP}
+            self._cc_swinfo = {v: {"sw": 0, "gaps": [], "last_sw": None, "one_day": 0,
+                                   "post1": [], "post3": [], "post5": [], "turn": 0.0}
+                               for v in _CC_NV}
+            self._cc_raw_ep = {}
+            self._cc_grp_ep = {}
+            self._cc_fwd = {}
+            self._cc_prev_w = {v: None for v in _CC_V}
+            self._cc_prev_px = None
+            self._cc_prev_grp = {v: None for v in _CC_V}
+            self._cc_prev_raw = None
+            self._cc_prev_g = None
+            self._cc_pxbuf = {k: _cc_deque(maxlen=30) for k in ("SPY","BND","TIP","GLD","CASH")}
+            self._cc_hist = []  # (raw, grp, pxdict, core_w)
+            self._cc_conf = "UNCERTAIN"
+            self._cc_pend = None
+            self._cc_pn = 0
+            self._cc_last_raw = None
+            self._cc_last_grp = None
+            self._cc_last = None
+            self._cc_n = 0
+            self._cc_bytes = 0
+            self._cc_err = False
+            self._cc_start = None
+            self._cc_prev_core = {}
+            self._cc_sw_mark = {v: [] for v in _CC_NV}  # (age_left3, age_left5, acc3, acc5)
         except Exception as e:
-            try: self.log(f"[INIT] CG_DEF_D2_ERROR,stage=init,type={type(e).__name__}")
+            try: self.log(f"[INIT] CG_CRISIS_CORE_ERROR,stage=init,type={type(e).__name__}")
             except Exception: pass
 
-    def _DgEqSet(self):
-        eq = {"SPY"}
-        for s in getattr(self, "panic_tactical_universe", []) or []:
-            eq.add(_dg_tk(s))
-        return eq
-
-    def _DgGrp(self, tk, eq):
-        if tk in _DG_DUR: return "D"
-        if tk in _DG_GOLD: return "G"
-        if tk in _DG_CASH: return "C"
-        if tk in _DG_HEDGE: return "H"
-        if tk in eq: return "E"
-        return "O"
-
-    def _DgGross(self, w, eq, which=None):
-        g = 0.0
-        for t, wt in (w or {}).items():
-            try: wf = abs(float(wt or 0.0))
-            except Exception: continue
-            gr = self._DgGrp(t, eq)
-            if which is None:
-                if gr != "C": g += wf
-            elif gr == which:
-                g += wf
-        return g
-
-    def _DgCash(self, w):
-        c = 0.0
-        for t, wt in (w or {}).items():
-            if t in _DG_CASH:
-                try: c += abs(float(wt or 0.0))
-                except Exception: pass
-        return c
-
-    def _DgCashTk(self):
+    def _CcCashTk(self):
         s = getattr(self, "sym_cash", None)
-        return _dg_tk(s) if s is not None else "BIL"
+        return _cc_tk(s) if s is not None else "BIL"
 
-    def _DgPark(self, before, after):
-        def nc(w):
-            return sum(abs(float(x or 0.0)) for t, x in (w or {}).items() if t not in _DG_CASH)
-        freed = nc(before) - nc(after)
-        if freed <= 1e-12: return after
-        out = dict(after); ct = self._DgCashTk()
-        out[ct] = float(out.get(ct, 0.0) or 0.0) + freed
-        return out
+    def _CcMap(self, raw):
+        return _CC_GMAP.get(str(raw or "UNKNOWN"), "UNCERTAIN")
 
-    def _DgScaleGroup(self, w, eq, grp, scale):
-        out = dict(w)
-        for t in list(out.keys()):
-            if self._DgGrp(t, eq) == grp:
-                try: out[t] = float(out[t] or 0.0) * scale
-                except Exception: pass
-        return self._DgPark(w, out)
+    def _CcEp(self, store, name):
+        if name not in store:
+            store[name] = _cc_ep_blank()
+        return store[name]
 
-    def _DgScaleTickers(self, w, ticks, scale):
-        out = dict(w)
-        for t in ticks:
-            if t in out:
-                try: out[t] = float(out[t] or 0.0) * scale
-                except Exception: pass
-        return self._DgPark(w, out)
+    def _CcEpUp(self, store, name, last_attr):
+        cur = getattr(self, last_attr, None)
+        if cur != name:
+            if cur is not None and cur in store:
+                st = store[cur]
+                if st["cur"] > 0: st["eps"].append(st["cur"]); st["switches"] += 1
+                st["cur"] = 0
+            st = self._CcEp(store, name)
+            st["cur"] = 1; st["days"] += 1
+            setattr(self, last_attr, name)
+        else:
+            st = self._CcEp(store, name); st["cur"] += 1; st["days"] += 1
 
-    def _DgBaseW(self, combined):
-        w = {}
-        for s, wt in (combined or {}).items():
-            try: w[_dg_tk(s)] = float(wt or 0.0)
+    def _CcCloseEps(self, store):
+        for st in store.values():
+            if st["cur"] > 0: st["eps"].append(st["cur"]); st["cur"] = 0
+
+    def _CcCoreW(self, targets):
+        w = {"TIP": 0.0, "GLD": 0.0, "BND": 0.0, "CASH": 0.0}
+        ct = self._CcCashTk()
+        for s, wt in (targets or {}).items():
+            try: wf = float(wt or 0.0)
             except Exception: continue
+            t = _cc_tk(s)
+            if t == "TIP": w["TIP"] += wf
+            elif t == "GLD": w["GLD"] += wf
+            elif t == "BND": w["BND"] += wf
+            elif t in _CC_CASH or t == ct: w["CASH"] += wf
         return w
 
-    def _DgPx(self, combined):
+    def _CcGross(self, cw):
+        return abs(cw["TIP"]) + abs(cw["GLD"]) + abs(cw["BND"]) + abs(cw["CASH"])
+
+    def _CcRecipe(self, grp, gross, bnd20, tip20, gld20, veto=False):
+        rec = dict(_CC_REC.get(grp, _CC_REC["UNCERTAIN"]))
+        if veto:
+            if bnd20 < 0: rec["CASH"] += rec["BND"]; rec["BND"] = 0.0
+            if tip20 < 0: rec["CASH"] += rec["TIP"]; rec["TIP"] = 0.0
+            if gld20 < 0: rec["CASH"] += rec["GLD"]; rec["GLD"] = 0.0
+        s = rec["TIP"] + rec["GLD"] + rec["BND"] + rec["CASH"]
+        if s <= 1e-12: rec = {"TIP": 0.0, "GLD": 0.0, "BND": 0.0, "CASH": 1.0}; s = 1.0
+        g = max(0.0, float(gross))
+        return {k: g * (rec[k] / s) for k in ("TIP", "GLD", "BND", "CASH")}
+
+    def _CcMerge(self, combined, core_new, core_old):
+        out = {}
+        for s, wt in (combined or {}).items():
+            try: out[_cc_tk(s)] = float(wt or 0.0)
+            except Exception: continue
+        ct = self._CcCashTk()
+        for k, tk in (("TIP", "TIP"), ("GLD", "GLD"), ("BND", "BND"), ("CASH", ct)):
+            out[tk] = float(out.get(tk, 0.0) or 0.0) - float(core_old.get(k, 0.0) or 0.0)
+            out[tk] = float(out.get(tk, 0.0) or 0.0) + float(core_new.get(k, 0.0) or 0.0)
+        return out
+
+    def _CcPx(self):
         px = {}
-        syms = list(combined or {})
-        for s in getattr(self, "panic_tactical_universe", []) or []:
-            if s not in syms: syms.append(s)
-        for attr in ("sym_spy","sym_bnd","sym_tip","sym_gld","sym_cash","sym_crash","sym_sh"):
+        for attr, tk in (("sym_spy","SPY"),("sym_bnd","BND"),("sym_tip","TIP"),
+                         ("sym_gld","GLD"),("sym_cash","CASH")):
             s = getattr(self, attr, None)
-            if s is not None and s not in syms: syms.append(s)
-        for s in syms:
-            t = _dg_tk(s)
+            if s is None: continue
             try:
                 p = float(self.securities[s].price)
-                if p > 0: px[t] = p
+                if p > 0: px[tk] = p
             except Exception: pass
         return px
 
-    def _DgRet(self, w, p0, p1):
+    def _CcRetMap(self, w, p0, p1):
         r = 0.0
+        ct = self._CcCashTk()
         for t, wt in (w or {}).items():
-            if t in _DG_CASH: continue
-            a = p0.get(t) if p0 else None; b = p1.get(t) if p1 else None
+            if t == "CASH" or t in _CC_CASH or t == ct: continue
+            a = (p0 or {}).get(t); b = (p1 or {}).get(t)
             if not a or not b or a <= 0: continue
             try: r += float(wt or 0.0) * (b / a - 1.0)
             except Exception: pass
         return r
 
-    def _DgBufRet(self, tk, n):
-        buf = self._dg_pxbuf.get(tk)
-        if not buf or len(buf) <= n: return 0.0
-        p0 = buf[-1 - n]; p1 = buf[-1]
-        if p0 <= 0: return 0.0
-        return p1 / p0 - 1.0
+    def _CcPersist(self, g):
+        if g == self._cc_conf:
+            self._cc_pend = None; self._cc_pn = 0
+            return self._cc_conf
+        if g == self._cc_pend: self._cc_pn += 1
+        else: self._cc_pend = g; self._cc_pn = 1
+        need = 3 if self._cc_conf == "UNCERTAIN" else 2
+        if self._cc_pn >= need:
+            self._cc_conf = self._cc_pend
+            self._cc_pend = None; self._cc_pn = 0
+        return self._cc_conf
 
-    def _DgInd(self, attr):
-        try:
-            ind = getattr(self, attr, None)
-            if ind is None or not ind.IsReady: return None
-            return float(ind.Current.Value)
-        except Exception: return None
+    def _CcTurn(self, a, b):
+        return 0.5 * sum(abs(float((a or {}).get(k, 0.0) or 0.0) - float((b or {}).get(k, 0.0) or 0.0))
+                         for k in ("TIP", "GLD", "BND", "CASH"))
 
-    def _DgWatchOn(self, ps, ids, spy_px, ema75, spy20):
-        return (str(ps) == "NORMAL" and str(ids) == "WATCH"
-                and spy_px is not None and ema75 is not None and spy_px < ema75
-                and spy20 < 0)
-
-    def _DgBuildVariants(self, base, eq, spy_px, ema75, ema9, ema120, spy20, bnd20, tip20,
-                         regime, prev_reg, ps, ids, dd):
-        out = {"BASE": dict(base)}
-        # W1/W2: WATCH-only (never STRESS/PANIC_SHORT; never panic!=NORMAL)
-        a_w = self._DgWatchOn(ps, ids, spy_px, ema75, spy20)
-        w = dict(base)
-        if a_w:
-            eg = self._DgGross(w, eq, "E")
-            if eg > 1.00 and eg > 1e-12:
-                w = self._DgScaleGroup(w, eq, "E", 1.00 / eg)
-        out["W1"] = w
-        w = dict(base)
-        if a_w:
-            w = self._DgScaleGroup(w, eq, "E", 0.80)
-        out["W2"] = w
-        # D2: partial duration reduction (retain 50%)
-        a_d2 = (str(regime) in ("NEUTRAL", "RISK_OFF")
-                and spy_px is not None and ema75 is not None and spy_px < ema75
-                and ema9 is not None and ema120 is not None and ema9 < ema120
-                and spy20 < 0 and bnd20 < 0 and tip20 < 0)
-        w = dict(base)
-        if a_d2:
-            w = self._DgScaleTickers(w, ("BND", "TIP"), 0.50)
-        out["D2"] = w
-        # E2 control — unchanged from D1
-        start_e2 = (str(regime) in ("NEUTRAL", "RISK_OFF")
-                    and str(prev_reg) == "RISK_ON"
-                    and spy_px is not None and ema75 is not None and spy_px < ema75
-                    and ema9 is not None and ema120 is not None and ema9 < ema120
-                    and dd >= 0.05)
-        if self._dg_e2_on:
-            stop = ((ema9 is not None and ema120 is not None and ema9 >= ema120)
-                    or dd < 0.03 or self._dg_e2_left <= 0)
-            if stop:
-                self._dg_e2_on = False
-                self._dg_e2_left = 0
-        if (not self._dg_e2_on) and start_e2:
-            self._dg_e2_on = True
-            self._dg_e2_left = 20
-        a_e2 = bool(self._dg_e2_on)
-        if a_e2:
-            self._dg_e2_left -= 1
-        w = dict(base)
-        if a_e2:
-            eg = self._DgGross(w, eq, "E")
-            if eg > 1.00 and eg > 1e-12:
-                w = self._DgScaleGroup(w, eq, "E", 1.00 / eg)
-        out["E2"] = w
-        if a_w and str(ids) == "STRESS":
-            self._dg_stress_act += 1
-        return out, {"W1": a_w, "W2": a_w, "D2": a_d2, "E2": a_e2}
+    def _CcFwdAdd(self, level, typ, asset, h, ret):
+        k = (level, typ, asset)
+        if k not in self._cc_fwd: self._cc_fwd[k] = {hh: [] for hh in _CC_H}
+        self._cc_fwd[k][h].append(ret)
 
     def CgDefGrossUpdate(self, combined) -> None:
         if not getattr(self, "cg_def_gross_diag_enable", False): return
         try:
             today = self.time.date()
-            if self._dg_last == today: return
-            base = self._DgBaseW(combined)
-            px = self._DgPx(combined)
-            eq = self._DgEqSet()
-            for t, p in px.items():
-                if t not in self._dg_pxbuf:
-                    self._dg_pxbuf[t] = _dg_deque(maxlen=25)
-                self._dg_pxbuf[t].append(p)
-            spy20 = self._DgBufRet("SPY", 20)
-            bnd20 = self._DgBufRet("BND", 20); tip20 = self._DgBufRet("TIP", 20)
-            spy_px = px.get("SPY")
-            ema75 = self._DgInd("spy_ema_75")
-            ema9 = self._DgInd("spy_ema_9")
-            ema120 = self._DgInd("spy_ema_120")
-            regime = str(getattr(self, "current_regime", None) or "UNKNOWN")
-            prev_reg = str(getattr(self, "prev_regime", None) or "")
-            ps = str(getattr(self, "_panic_state", "NORMAL") or "NORMAL")
-            ids = str(getattr(self, "_ids_state", "NORMAL") or "NORMAL")
-            dd = float(self.CurrentDrawdown())
-            variants, active = self._DgBuildVariants(
-                base, eq, spy_px, ema75, ema9, ema120, spy20, bnd20, tip20,
-                regime, prev_reg, ps, ids, dd)
-            watch_ok = self._DgWatchOn(ps, ids, spy_px, ema75, spy20)
-            d2_ok = bool(active.get("D2"))
-            if self._dg_prev_px is not None:
-                for v in _DG_V:
-                    pw = self._dg_prev_w.get(v)
+            if self._cc_last == today: return
+            if self._cc_start is None: self._cc_start = today
+            # existing classifier — read only
+            try:
+                ps = self.GetPanicStructureDiag()
+                raw = str((ps or {}).get("ptype") or "UNKNOWN")
+            except Exception:
+                raw = "UNKNOWN"
+            if raw in ("", "None"): raw = "UNKNOWN"
+            grp = self._CcMap(raw)
+            core_t = getattr(self, "_last_core_targets", None) or {}
+            core_old = self._CcCoreW(core_t)
+            gross = self._CcGross(core_old)
+            px = self._CcPx()
+            for k in self._cc_pxbuf:
+                if k in px: self._cc_pxbuf[k].append(px[k])
+            # 20d returns known at T
+            def _r20(tk):
+                b = self._cc_pxbuf.get(tk)
+                if not b or len(b) <= 20 or b[-21] <= 0: return 0.0
+                return b[-1] / b[-21] - 1.0
+            bnd20 = _r20("BND"); tip20 = _r20("TIP"); gld20 = _r20("GLD")
+            # persistence shadow state
+            g_persist = self._CcPersist(grp)
+            # build variant cores
+            cores = {
+                "BASE": dict(core_old),
+                "TYPE_GROUPED": self._CcRecipe(grp, gross, bnd20, tip20, gld20, False),
+                "TYPE_VETO": self._CcRecipe(grp, gross, bnd20, tip20, gld20, True),
+                "TYPE_VETO_PERSIST": self._CcRecipe(g_persist, gross, bnd20, tip20, gld20, True),
+            }
+            groups_used = {
+                "BASE": grp,
+                "TYPE_GROUPED": grp,
+                "TYPE_VETO": grp,
+                "TYPE_VETO_PERSIST": g_persist,
+            }
+            variants = {}
+            for v in _CC_V:
+                if v == "BASE":
+                    # exact combined targets (ticker map)
+                    w = {}
+                    for s, wt in (combined or {}).items():
+                        try: w[_cc_tk(s)] = float(wt or 0.0)
+                        except Exception: continue
+                    variants[v] = w
+                else:
+                    variants[v] = self._CcMerge(combined, cores[v], core_old)
+            # episode tracking raw/group
+            self._CcEpUp(self._cc_raw_ep, raw, "_cc_last_raw")
+            self._CcEpUp(self._cc_grp_ep, grp, "_cc_last_grp")
+            # hist for forward returns
+            self._cc_hist.append((raw, grp, dict(px), dict(core_old)))
+            if len(self._cc_hist) > 40: self._cc_hist = self._cc_hist[-40:]
+            i = len(self._cc_hist) - 1
+            for h in _CC_H:
+                j = i - h
+                if j < 0: continue
+                raw0, grp0, px0, core0 = self._cc_hist[j]
+                px1 = self._cc_hist[i][2]
+                for level, typ in (("RAW", raw0), ("GROUP", grp0)):
+                    for asset in _CC_ASSETS:
+                        if asset == "STATIC_CORE":
+                            rr = 0.0; den = 0.0
+                            for kk, pk in (("TIP","TIP"),("GLD","GLD"),("BND","BND")):
+                                a = px0.get(pk); b = px1.get(pk); w = float(core0.get(kk, 0.0) or 0.0)
+                                if a and b and a > 0 and abs(w) > 0:
+                                    rr += w * (b / a - 1.0); den += abs(w)
+                            ret = (rr / den) if den > 1e-12 else 0.0
+                        elif asset == "CASH":
+                            ret = 0.0
+                        else:
+                            a = px0.get(asset); b = px1.get(asset)
+                            if not a or not b or a <= 0: continue
+                            ret = b / a - 1.0
+                        self._CcFwdAdd(level, typ, asset, h, ret)
+            # realize prior day shadow returns
+            if self._cc_prev_px is not None:
+                for v in _CC_V:
+                    pw = self._cc_prev_w.get(v)
                     if pw is None: continue
-                    r = self._DgRet(pw, self._dg_prev_px, px)
-                    tg = self._DgGross(pw, eq); eg = self._DgGross(pw, eq, "E")
-                    dg = self._DgGross(pw, eq, "D"); gg = self._DgGross(pw, eq, "G")
-                    c = self._DgCash(pw)
-                    act = int(bool(getattr(self, "_dg_prev_act", {}).get(v)))
-                    _dg_upd(self._dg_run[v], r, tg, eg, dg, gg, c, act)
-                    pd = self._dg_last
-                    for name, s, e in _DG_W:
+                    r = self._CcRetMap(pw, self._cc_prev_px, px)
+                    cw = self._cc_prev_core.get(v) or core_old
+                    bnd=float(cw.get("BND",0)); tip=float(cw.get("TIP",0))
+                    gld=float(cw.get("GLD",0)); cash=float(cw.get("CASH",0))
+                    prev_g = self._cc_prev_grp.get(v); cur_g = groups_used[v]
+                    sw = 1 if (prev_g is not None and prev_g != cur_g) else 0
+                    turn = self._CcTurn(getattr(self, "_cc_prev_core2", {}).get(v), cw)
+                    _cc_upd(self._cc_run[v], r, bnd, tip, gld, cash, sw, turn)
+                    pd = self._cc_last
+                    for name, s, e in _CC_W:
                         ee = e if e is not None else today
                         if pd is not None and s <= pd <= ee:
-                            _dg_upd(self._dg_win[(v, name)], r, tg, eg, dg, gg, c, act)
-                    if v != "BASE" and act:
-                        a = self._dg_act[v]
-                        a["n"] += 1
-                        br = self._DgRet(self._dg_prev_w.get("BASE") or {}, self._dg_prev_px, px)
-                        a["sum_br"] += br; a["sum_vr"] += r
-                        if br < 0: a["neg_b"] += 1
-                        a["nav_b"] *= (1.0 + br); a["nav_v"] *= (1.0 + r)
-                # WATCH attribution (prior-day full W1 activation set)
-                if getattr(self, "_dg_prev_watch_ok", False):
-                    bw = self._dg_prev_w.get("BASE") or {}
-                    for v in ("BASE", "W1", "W2"):
-                        pw = self._dg_prev_w.get(v) or {}
-                        r = self._DgRet(pw, self._dg_prev_px, px)
-                        bucket = self._dg_watch[v]
-                        _dg_upd(bucket["st"], r)
-                        if v == "BASE":
-                            bucket["sum_eb"] += self._DgGross(bw, eq, "E")
-                            bucket["sum_ea"] += self._DgGross(bw, eq, "E")
-                        else:
-                            bucket["sum_eb"] += self._DgGross(bw, eq, "E")
-                            bucket["sum_ea"] += self._DgGross(pw, eq, "E")
-                # D2 duration attribution
-                if getattr(self, "_dg_prev_d2_ok", False):
-                    bw = self._dg_prev_w.get("BASE") or {}
-                    dw = self._dg_prev_w.get("D2") or {}
-                    br = self._DgRet(bw, self._dg_prev_px, px)
-                    dr = self._DgRet(dw, self._dg_prev_px, px)
-                    _dg_upd(self._dg_dur["base"], br)
-                    _dg_upd(self._dg_dur["d2"], dr)
-                    self._dg_dur["n"] += 1
-                    self._dg_dur["sum_db"] += self._DgGross(bw, eq, "D")
-                    self._dg_dur["sum_da"] += self._DgGross(dw, eq, "D")
-                    self._dg_dur["sum_cb"] += self._DgCash(bw)
-                    self._dg_dur["sum_ca"] += self._DgCash(dw)
-                self._dg_n += 1
-            for v in _DG_V:
-                self._dg_prev_w[v] = variants[v]
-            self._dg_prev_px = px
-            self._dg_prev_act = active
-            self._dg_prev_watch_ok = watch_ok
-            self._dg_prev_d2_ok = d2_ok
-            self._dg_last = today
+                            _cc_upd(self._cc_win[(v, name)], r, bnd, tip, gld, cash, sw, turn)
+                    tg = getattr(self, "_cc_prev_g", grp)
+                    if tg in _CC_GRP: _cc_upd(self._cc_type[(v, tg)], r, bnd, tip, gld, cash)
+                    if v in _CC_NV:
+                        marks = []
+                        for left3, left5, acc3, acc5 in self._cc_sw_mark[v]:
+                            acc3 = (1+acc3)*(1+r)-1; acc5 = (1+acc5)*(1+r)-1
+                            left3 -= 1; left5 -= 1
+                            si = self._cc_swinfo[v]
+                            if left3 == 0: si.setdefault("post3", []).append(acc3)
+                            if left5 == 0: si.setdefault("post5", []).append(acc5)
+                            if left5 > 0: marks.append((left3, left5, acc3, acc5))
+                        if sw:
+                            si = self._cc_swinfo[v]; si["sw"] += 1
+                            if si["last_sw"] is not None:
+                                try: gap = (pd - si["last_sw"]).days
+                                except Exception: gap = 1
+                                si["gaps"].append(max(1, int(gap)))
+                                if gap <= 1: si["one_day"] += 1
+                            si["last_sw"] = pd; si["turn"] += turn; si["post1"].append(r)
+                            marks.append((2, 4, r, r))
+                        self._cc_sw_mark[v] = marks
+                self._cc_n += 1
+            self._cc_prev_core2 = {k: dict(v) for k, v in self._cc_prev_core.items()}
+            for v in _CC_V:
+                self._cc_prev_w[v] = variants[v]
+                self._cc_prev_grp[v] = groups_used[v]
+                self._cc_prev_core[v] = dict(cores[v] if v != "BASE" else core_old)
+            self._cc_prev_px = px; self._cc_prev_raw = raw; self._cc_prev_g = grp
+            self._cc_last = today
         except Exception as e:
-            if not self._dg_err:
-                self._dg_err = True
-                try: self.log(f"[INIT] CG_DEF_D2_ERROR,stage=update,type={type(e).__name__}")
+            if not self._cc_err:
+                self._cc_err = True
+                try: self.log(f"[INIT] CG_CRISIS_CORE_ERROR,stage=update,type={type(e).__name__}")
                 except Exception: pass
 
-    def _DgEmit(self, lines, line):
+    def _CcEmit(self, lines, line):
         b = len(line.encode("utf-8"))
         if b > 1800:
             line = line[:1780] + "...TRUNC"; b = len(line.encode("utf-8"))
-        if self._dg_bytes + b > _DG_BUDGET: return False
-        lines.append(line); self._dg_bytes += b
+        if self._cc_bytes + b > _CC_BUDGET: return False
+        lines.append(line); self._cc_bytes += b
         return True
 
-    def _DgFmt(self, prefix, name, st):
-        n = st["n"]
-        return (f"{prefix},{name},days={n},nav={_dg_f(st['nav'])},"
-                f"cagr={_dg_f(_dg_ann(st['sum_r'], n))},maxdd={_dg_f(st['maxdd'])},"
-                f"worst5={_dg_f(_dg_w5(list(st['rets'])),6)},"
-                f"vol={_dg_f(_dg_vol(st['sum_r'], st['sum_r2'], n))},"
-                f"sharpe={_dg_f(_dg_sh(st['sum_r'], st['sum_r2'], n))},"
-                f"avg_total_gross={_dg_f(st['sum_tg']/n if n else None)},"
-                f"avg_equity_gross={_dg_f(st['sum_eg']/n if n else None)},"
-                f"avg_duration_gross={_dg_f(st['sum_dg']/n if n else None)},"
-                f"avg_gold_gross={_dg_f(st['sum_gg']/n if n else None)},"
-                f"avg_cash={_dg_f(st['sum_c']/n if n else None)},"
-                f"active_days={st['act']}")
+    def _CcStat3(self, xs):
+        if not xs: return "NA/NA/NA"
+        m = sum(xs) / len(xs); med = _cc_med(xs); pr = sum(1 for x in xs if x > 0) / len(xs)
+        return f"{_cc_f(m,6)}/{_cc_f(med,6)}/{_cc_f(pr,3)}"
+
+    def _CcFmt(self, prefix, name, st, extra=""):
+        n = max(1, st["n"])
+        yrs = max(1e-9, st["n"] / 252.0)
+        return (f"{prefix},{name},days={st['n']},nav={_cc_f(st['nav'])},"
+                f"cagr={_cc_f(_cc_ann(st['sum_r'], st['n']))},maxdd={_cc_f(st['maxdd'])},"
+                f"worst5={_cc_f(_cc_w5(list(st['rets'])),6)},"
+                f"vol={_cc_f(_cc_vol(st['sum_r'], st['sum_r2'], st['n']))},"
+                f"sharpe={_cc_f(_cc_sh(st['sum_r'], st['sum_r2'], st['n']))},"
+                f"avg_bnd={_cc_f(st['sum_bnd']/n)},avg_tip={_cc_f(st['sum_tip']/n)},"
+                f"avg_gld={_cc_f(st['sum_gld']/n)},avg_cash={_cc_f(st['sum_cash']/n)},"
+                f"switches={st['sw']},turnover_proxy={_cc_f(st['turn']/yrs)}{extra}")
 
     def CgDefGrossEmitFinal(self) -> None:
         if not getattr(self, "cg_def_gross_diag_enable", False): return
-        self.log(f"[EOA] CG_DEF_D2_EMIT_START,n={getattr(self,'_dg_n',0)}")
-        lines = []; self._dg_bytes = 0
-        for v in _DG_V:
-            st = self._dg_run[v]
-            if st["n"] <= 0:
-                self._DgEmit(lines, f"CG_DEF_D2_FINAL,variant={v},status=NO_DATA")
-            else:
-                self._DgEmit(lines, self._DgFmt("CG_DEF_D2_FINAL", f"variant={v}", st))
-        for v in _DG_V:
-            for name, _, _ in _DG_W:
-                st = self._dg_win[(v, name)]
-                if st["n"] <= 0: continue
-                if not self._DgEmit(lines, self._DgFmt(
-                        "CG_DEF_D2_WINDOW_FINAL", f"variant={v},window={name}", st)):
+        self.log(f"[EOA] CG_CRISIS_CORE_EMIT_START,n={getattr(self,'_cc_n',0)}")
+        lines = []; self._cc_bytes = 0
+        self._CcCloseEps(self._cc_raw_ep); self._CcCloseEps(self._cc_grp_ep)
+        # persistence / classifier quality
+        for level, store in (("RAW", self._cc_raw_ep), ("GROUP", self._cc_grp_ep)):
+            for name, st in store.items():
+                eps = st["eps"] or ([st["cur"]] if st["cur"] else [])
+                if not eps and st["days"] <= 0: continue
+                avg = sum(eps) / len(eps) if eps else 0.0
+                med = _cc_med(eps) or 0.0
+                one = sum(1 for x in eps if x == 1)
+                short = sum(1 for x in eps if x <= 3)
+                if not self._CcEmit(lines, (
+                    f"CG_CRISIS_TYPE_PERSIST_FINAL,level={level},type={name},"
+                    f"days={st['days']},episodes={len(eps)},avg_days={_cc_f(avg,2)},"
+                    f"median_days={_cc_f(med,2)},max_days={max(eps) if eps else 0},"
+                    f"one_day={one},short_le3={short},switches={st['switches']}")):
                     break
-        for v in _DG_NV:
-            a = self._dg_act[v]; n = a["n"]
-            if n <= 0:
-                self._DgEmit(lines, f"CG_DEF_D2_ACTIVE_FINAL,variant={v},status=NO_DATA")
-                continue
-            self._DgEmit(lines, (
-                f"CG_DEF_D2_ACTIVE_FINAL,variant={v},active_days={n},"
-                f"negative_rate={_dg_f(a['neg_b']/n,4)},"
-                f"avg_base_return={_dg_f(a['sum_br']/n,6)},"
-                f"avg_variant_return={_dg_f(a['sum_vr']/n,6)},"
-                f"base_nav_active={_dg_f(a['nav_b'])},variant_nav_active={_dg_f(a['nav_v'])}"))
-        wb = self._dg_watch["BASE"]["st"]
-        for v in ("W1", "W2"):
-            ws = self._dg_watch[v]; st = ws["st"]; n = st["n"]
-            nb = max(1, wb["n"]); nv = max(1, n)
-            self._DgEmit(lines, (
-                f"CG_DEF_D2_WATCH_FINAL,variant={v},days={n},"
-                f"nav_base={_dg_f(wb['nav'])},nav_variant={_dg_f(st['nav'])},"
-                f"mean_base={_dg_f(wb['sum_r']/nb,6)},mean_variant={_dg_f(st['sum_r']/nv,6)},"
-                f"maxdd_base={_dg_f(wb['maxdd'])},maxdd_variant={_dg_f(st['maxdd'])},"
-                f"worst5_base={_dg_f(_dg_w5(list(wb['rets'])),6)},"
-                f"worst5_variant={_dg_f(_dg_w5(list(st['rets'])),6)},"
-                f"avg_equity_before={_dg_f(ws['sum_eb']/nv if n else None)},"
-                f"avg_equity_after={_dg_f(ws['sum_ea']/nv if n else None)},"
-                f"stress_active_days={int(getattr(self,'_dg_stress_act',0))}"))
-        dd = self._dg_dur; n = dd["n"]
-        nb = max(1, dd["base"]["n"]); nd = max(1, dd["d2"]["n"])
-        yb = self._dg_win[("BASE", "Y2022")]; yd = self._dg_win[("D2", "Y2022")]
-        self._DgEmit(lines, (
-            f"CG_DEF_D2_DURATION_FINAL,days={n},"
-            f"nav_base={_dg_f(dd['base']['nav'])},nav_d2={_dg_f(dd['d2']['nav'])},"
-            f"mean_base={_dg_f(dd['base']['sum_r']/nb,6)},mean_d2={_dg_f(dd['d2']['sum_r']/nd,6)},"
-            f"maxdd_base={_dg_f(dd['base']['maxdd'])},maxdd_d2={_dg_f(dd['d2']['maxdd'])},"
-            f"avg_duration_before={_dg_f(dd['sum_db']/n if n else None)},"
-            f"avg_duration_after={_dg_f(dd['sum_da']/n if n else None)},"
-            f"avg_cash_before={_dg_f(dd['sum_cb']/n if n else None)},"
-            f"avg_cash_after={_dg_f(dd['sum_ca']/n if n else None)},"
-            f"y2022_nav_base={_dg_f(yb['nav'])},y2022_nav_d2={_dg_f(yd['nav'])},"
-            f"y2022_dd_base={_dg_f(yb['maxdd'])},y2022_dd_d2={_dg_f(yd['maxdd'])}"))
-        # selection
-        base = self._dg_run["BASE"]
-        b_dd = base["maxdd"]; b_w5 = _dg_w5(list(base["rets"])); b_nav = base["nav"]
-        b_oos = self._dg_win[("BASE", "OOS")]
-        b_oos_sh = _dg_sh(b_oos["sum_r"], b_oos["sum_r2"], b_oos["n"])
-        b_y20 = self._dg_win[("BASE", "Y2020")]["maxdd"]
-        eligible = []
-        for v in _DG_NV:
-            st = self._dg_run[v]
-            if st["n"] <= 0 or base["n"] <= 0: continue
-            c_w5 = _dg_w5(list(st["rets"]))
-            c_oos = self._dg_win[(v, "OOS")]
-            c_oos_sh = _dg_sh(c_oos["sum_r"], c_oos["sum_r2"], c_oos["n"])
-            c_y20 = self._dg_win[(v, "Y2020")]["maxdd"]
-            c_y22 = self._dg_win[(v, "Y2022")]
-            b_y22 = self._dg_win[("BASE", "Y2022")]
-            ok = True; why_fail = None
-            mat = ((b_dd - st["maxdd"]) >= 0.002 - 1e-12) or ((st["nav"] - b_nav) >= 0.005 - 1e-12)
-            if not mat: ok = False; why_fail = "material"
-            elif st["nav"] < 0.98 * b_nav - 1e-12: ok = False; why_fail = "nav"
-            elif b_w5 is not None and c_w5 is not None and c_w5 < b_w5 - 1e-12: ok = False; why_fail = "worst5"
-            elif b_oos_sh is not None and c_oos_sh is not None and c_oos_sh < b_oos_sh * 0.97: ok = False; why_fail = "oos_sharpe"
-            elif c_y20 > b_y20 + 1e-12: ok = False; why_fail = "y2020_dd"
-            elif self._dg_act[v]["n"] < 20: ok = False; why_fail = "active_days"
+        # forward asset returns
+        for (level, typ, asset), hs in self._cc_fwd.items():
+            parts = [f"CG_CRISIS_TYPE_FWD_FINAL,level={level},type={typ},asset={asset},n={len(hs.get(1) or [])}"]
+            for h, lab in ((1,"d1"),(3,"d3"),(5,"d5"),(10,"d10"),(20,"d20")):
+                parts.append(f"{lab}={self._CcStat3(hs.get(h) or [])}")
+            if not self._CcEmit(lines, ",".join(parts)): break
+        # finals
+        for v in _CC_V:
+            st = self._cc_run[v]
+            if st["n"] <= 0:
+                self._CcEmit(lines, f"CG_CRISIS_CORE_FINAL,variant={v},status=NO_DATA")
             else:
-                if v in ("W1", "W2"):
-                    wb = self._dg_watch["BASE"]["st"]; wv = self._dg_watch[v]["st"]
-                    if getattr(self, "_dg_stress_act", 0) != 0: ok = False; why_fail = "stress"
-                    elif (wb["maxdd"] - wv["maxdd"]) < 0.02 - 1e-12: ok = False; why_fail = "watch_dd"
-                    elif wv["nav"] < 0.995 * wb["nav"] - 1e-12: ok = False; why_fail = "watch_nav"
-                elif v == "D2":
-                    if (b_y22["maxdd"] - c_y22["maxdd"]) < 0.003 - 1e-12: ok = False; why_fail = "d2_2022_dd"
-                    elif c_y22["nav"] < b_y22["nav"] - 1e-12: ok = False; why_fail = "d2_2022_nav"
-                elif v == "E2":
-                    a = self._dg_act["E2"]
-                    if st["nav"] <= b_nav + 1e-12: ok = False; why_fail = "e2_nav"
-                    elif a["n"] <= 0 or (a["sum_vr"] / a["n"]) <= (a["sum_br"] / a["n"]) + 1e-12:
-                        ok = False; why_fail = "e2_active"
+                self._CcEmit(lines, self._CcFmt("CG_CRISIS_CORE_FINAL", f"variant={v}", st))
+        for v in _CC_V:
+            for name, _, _ in _CC_W:
+                st = self._cc_win[(v, name)]
+                if st["n"] <= 0: continue
+                if not self._CcEmit(lines, self._CcFmt(
+                        "CG_CRISIS_CORE_WINDOW_FINAL", f"variant={v},window={name}", st)):
+                    break
+        for v in _CC_V:
+            for g in _CC_GRP:
+                st = self._cc_type[(v, g)]
+                if st["n"] <= 0: continue
+                n = st["n"]
+                if not self._CcEmit(lines, (
+                    f"CG_CRISIS_CORE_TYPE_FINAL,variant={v},type={g},days={n},"
+                    f"nav={_cc_f(st['nav'])},mean={_cc_f(st['sum_r']/n,6)},"
+                    f"maxdd={_cc_f(st['maxdd'])},worst5={_cc_f(_cc_w5(list(st['rets'])),6)},"
+                    f"avg_bnd={_cc_f(st['sum_bnd']/n)},avg_tip={_cc_f(st['sum_tip']/n)},"
+                    f"avg_gld={_cc_f(st['sum_gld']/n)},avg_cash={_cc_f(st['sum_cash']/n)}")):
+                    break
+        for v in _CC_NV:
+            si = self._cc_swinfo[v];             n = max(1, si["sw"])
+            avg_gap = (sum(si["gaps"]) / len(si["gaps"])) if si["gaps"] else None
+            yrs = max(1e-9, self._cc_run[v]["n"] / 252.0)
+            p3 = si.get("post3") or []; p5 = si.get("post5") or []
+            self._CcEmit(lines, (
+                f"CG_CRISIS_CORE_SWITCH_FINAL,variant={v},switches={si['sw']},"
+                f"avg_days_between={_cc_f(avg_gap,2)},one_day_switches={si['one_day']},"
+                f"turnover_proxy={_cc_f(si['turn']/yrs)},"
+                f"return_1d_after_switch={_cc_f((sum(si['post1'])/len(si['post1'])) if si['post1'] else None,6)},"
+                f"return_3d_after_switch={_cc_f((sum(p3)/len(p3)) if p3 else None,6)},"
+                f"return_5d_after_switch={_cc_f((sum(p5)/len(p5)) if p5 else None,6)}"))
+        # selection
+        base = self._cc_run["BASE"]
+        b_nav, b_dd = base["nav"], base["maxdd"]
+        b_w5 = _cc_w5(list(base["rets"]))
+        b_oos = self._cc_win[("BASE", "OOS")]
+        b_oos_sh = _cc_sh(b_oos["sum_r"], b_oos["sum_r2"], b_oos["n"])
+        b_y20 = self._cc_win[("BASE", "Y2020")]["maxdd"]
+        b_y22 = self._cc_win[("BASE", "Y2022")]["maxdd"]
+        b_y15 = self._cc_win[("BASE", "Y2015")]["maxdd"]
+        eligible = []
+        for v in _CC_NV:
+            st = self._cc_run[v]
+            if st["n"] <= 0 or base["n"] <= 0: continue
+            c_w5 = _cc_w5(list(st["rets"]))
+            c_oos = self._cc_win[(v, "OOS")]
+            c_oos_sh = _cc_sh(c_oos["sum_r"], c_oos["sum_r2"], c_oos["n"])
+            yrs = max(1e-9, st["n"] / 252.0)
+            tpy = st["turn"] / yrs
+            ok = True
+            if st["nav"] < 0.98 * b_nav - 1e-12: ok = False
+            elif st["maxdd"] > b_dd + 1e-12: ok = False
+            elif b_w5 is not None and c_w5 is not None and c_w5 < b_w5 - 1e-12: ok = False
+            elif b_oos_sh is not None and c_oos_sh is not None and c_oos_sh < b_oos_sh * 0.97: ok = False
+            elif self._cc_win[(v, "Y2020")]["maxdd"] > b_y20 + 1e-12: ok = False
+            elif self._cc_win[(v, "Y2022")]["maxdd"] >= b_y22 - 1e-12: ok = False
+            elif self._cc_win[(v, "Y2015")]["maxdd"] > b_y15 + 1e-12: ok = False
+            elif st["sw"] > 250: ok = False
+            elif tpy > 0.50 + 1e-12: ok = False
+            else:
+                if v == "TYPE_GROUPED":
+                    improved = False
+                    for g in _CC_GRP:
+                        bb = self._cc_type[("BASE", g)]; vv = self._cc_type[(v, g)]
+                        if bb["n"] <= 0 or vv["n"] <= 0: continue
+                        if (vv["maxdd"] < bb["maxdd"] - 0.002) or (vv["nav"] > bb["nav"] + 0.005):
+                            improved = True
+                    if not improved: ok = False
+                elif v == "TYPE_VETO":
+                    bb = self._cc_type[("BASE", "RATE_SHOCK")]; vv = self._cc_type[(v, "RATE_SHOCK")]
+                    if bb["n"] <= 0 or not ((vv["maxdd"] < bb["maxdd"] - 1e-12) or (vv["nav"] > bb["nav"] + 1e-12)):
+                        ok = False
+                elif v == "TYPE_VETO_PERSIST":
+                    sw_v = self._cc_swinfo["TYPE_VETO"]["sw"]
+                    sw_p = self._cc_swinfo["TYPE_VETO_PERSIST"]["sw"]
+                    if sw_v <= 0 or sw_p > sw_v * 0.75 + 1e-12: ok = False
             if ok: eligible.append((v, -st["nav"]))
         pick = "NONE"; why = "none_eligible"
         if eligible:
-            eligible.sort()
-            pick = eligible[0][0]; why = "max_nav_among_eligible"
-        self._DgEmit(lines, (
-            f"CG_DEF_D2_SELECT_FINAL,pick={pick},"
-            f"eligible={','.join(e[0] for e in eligible) or 'NONE'},"
-            f"why={why},trade=0"))
+            eligible.sort(); pick = eligible[0][0]; why = "max_nav_among_eligible"
+        self._CcEmit(lines, (
+            f"CG_CRISIS_CORE_SELECT_FINAL,pick={pick},"
+            f"eligible={','.join(e[0] for e in eligible) or 'NONE'},why={why},trade=0"))
         for ln in lines: self.log(ln)
-        self.log(f"[EOA] CG_DEF_D2_EMIT_DONE,lines={len(lines)},bytes={self._dg_bytes}")
+        self.log(f"[EOA] CG_CRISIS_CORE_EMIT_DONE,lines={len(lines)},bytes={self._cc_bytes}")
