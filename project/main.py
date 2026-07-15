@@ -18,7 +18,7 @@ from cg_defensive_trade import CgDefensiveTradeMixin
 from cg_main_runtime_utils import CgMainRuntimeUtilsMixin, AttachCgMixins
 
 
-class CoreGrowthPlusConditionalTrendSleeve(CgMainRuntimeUtilsMixin, QCAlgorithm):
+class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
     def Initialize(self):
         if not self.live_mode:
@@ -1188,4 +1188,4 @@ class CoreGrowthPlusConditionalTrendSleeve(CgMainRuntimeUtilsMixin, QCAlgorithm)
 
 from sh_hedge import _SH_IDLE, _SH_HEDGED, _SH_ENTRY_PENDING, _SH_EXIT_PENDING  # noqa: F401
 
-AttachCgMixins(CoreGrowthPlusConditionalTrendSleeve, (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgDefensiveTradeMixin))
+AttachCgMixins(CoreGrowthPlusConditionalTrendSleeve, (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgDefensiveTradeMixin, CgMainRuntimeUtilsMixin))

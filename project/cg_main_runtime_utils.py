@@ -43,7 +43,7 @@ class CgMainRuntimeUtilsMixin:
             m = getattr(self, "log_mute_prefixes", ())
             if m and any(s.startswith(p) for p in m):
                 return
-        super().log(message)
+        QCAlgorithm.log(self, message)
 
     def debug(self, message) -> None:  # type: ignore[override]
         if not self._LogAllowedAt():
@@ -55,7 +55,7 @@ class CgMainRuntimeUtilsMixin:
         m = getattr(self, "log_mute_prefixes", ())
         if m and any(s.startswith(p) for p in m):
             return
-        super().debug(message)
+        QCAlgorithm.debug(self, message)
 
     def _EmitWorstDays(self, label="FINAL", top_n=None):
         if not getattr(self, "_daily_returns", None):
@@ -66,11 +66,11 @@ class CgMainRuntimeUtilsMixin:
         if top_n is not None:
             rows = rows[:top_n]
         sep = "=" * 48
-        super().log(f"{sep}")
-        super().log(f"WORST_5PCT,{label},{n5}_of_{len(sr)}_days")
+        QCAlgorithm.log(self, f"{sep}")
+        QCAlgorithm.log(self, f"WORST_5PCT,{label},{n5}_of_{len(sr)}_days")
         for i, (day, ret) in enumerate(rows, 1):
-            super().log(f"W5,{i},{day},{ret*100:+.2f}%")
-        super().log(f"{sep}")
+            QCAlgorithm.log(self, f"W5,{i},{day},{ret*100:+.2f}%")
+        QCAlgorithm.log(self, f"{sep}")
 
 
 def AttachCgMixins(target_cls, mixins):
