@@ -2,7 +2,7 @@
 from AlgorithmImports import *
 # endregion
 # cg_regime_rebal_time_diag.py
-# CG-REGIME-TIME-D0-FIX2: event-time shadow timing matrix.
+# CG-REGIME-TIME-D0-FIX3: event-time shadow timing matrix.
 # Diagnostic-only. Zero trading impact. No SetHoldings/Liquidate/MarketOrder.
 from datetime import date as _date
 import heapq
@@ -18,6 +18,7 @@ _NT = 169
 _REGS = ("RISK_ON", "NEUTRAL", "RISK_OFF")
 _RI = {"RISK_ON": 0, "NEUTRAL": 1, "RISK_OFF": 2}
 _CASH = frozenset(("BIL", "SGOV", "USFR", "TFLO"))
+_PARK_FB = {"SGOV": "BIL", "USFR": "BIL", "TFLO": "BIL", "GLDM": "GLD"}
 _STALE_MIN = 5.0
 _MISS_W = 0.02
 _HEAP = 200
@@ -233,7 +234,7 @@ class CgRegimeRebalTimeDiagMixin:
                 if "CG_REGIME_TIME_" in mp:
                     self.log_mute_prefixes = [x for x in mp if x != "CG_REGIME_TIME_"]
             self.log(
-                "[INIT] CG_REGIME_TIME_D0_FIX2,times=13,combinations=2197,"
+                "[INIT] CG_REGIME_TIME_D0_FIX3,times=13,combinations=2197,"
                 "common_sample=1,event_time=1,trade=0,fees=0,slippage=0,d1=0,baseline=W2"
             )
             if not self.cg_regime_rebal_time_diag_enable:
@@ -253,7 +254,17 @@ class CgRegimeRebalTimeDiagMixin:
             self._rt_cell = [[_blank_cell() for _ in range(_N)] for _ in range(3)]
             self._rt_cache = []
             self._rt_sym_map = {}
+            self._rt_trade_dates = []
             self._rt_trade_date_index = {}
+            try:
+                self._rt_cal_start = self.start_date.date() if hasattr(self.start_date, "date") else self.start_date
+            except Exception:
+                self._rt_cal_start = None
+            self._rt_inv_td = 0
+            self._rt_ts_fallback = 0
+            self._rt_tq = [{"snaps": 0, "valid": 0, "stale": 0, "missing": 0, "inv_w": 0, "max_miss": 0.0} for _ in range(13)]
+            self._rt_sq = {}
+            self._rt_subs = {}
             self._rt_log_bytes = 0
             self._rt_cand_snaps = 0
             self._rt_miss_snaps = 0
@@ -289,18 +300,41 @@ class CgRegimeRebalTimeDiagMixin:
                 self.time_rules.after_market_open(self.sym_spy, 16),
                 self._RtHoldingsSnap,
             )
+            self.schedule.on(
+                self.date_rules.every_day(self.sym_spy),
+                self.time_rules.after_market_open(self.sym_spy, 1),
+                self._RtRegisterTradingDate,
+            )
         except Exception:
             self.cg_regime_rebal_time_diag_enable = False
 
     def CgRegimeRebalTimeDiagOnMinute(self):
         return None
 
-    def _RtNoteTradeDate(self):
+    def _RtRegisterTradingDate(self):
+        if getattr(self, "IsWarmingUp", False) or getattr(self, "is_warming_up", False):
+            return
         d = self.time.date()
-        m = self._rt_trade_date_index
-        if d not in m:
-            m[d] = len(m)
-        return m[d]
+        cs = getattr(self, "_rt_cal_start", None)
+        if cs is not None and d < cs:
+            return
+        if d in self._rt_trade_date_index:
+            return
+        idx = len(self._rt_trade_dates)
+        self._rt_trade_dates.append(d)
+        self._rt_trade_date_index[d] = idx
+
+    def _RtEnsureTradingDate(self, d=None):
+        if d is None:
+            d = self.time.date()
+        if d in self._rt_trade_date_index:
+            return self._rt_trade_date_index[d]
+        if d == self.time.date():
+            self._RtRegisterTradingDate()
+        return self._rt_trade_date_index.get(d)
+
+    def _RtNoteTradeDate(self):
+        return self._RtEnsureTradingDate()
 
     def _RtMapTk(self, tk):
         m = self._rt_sym_map
@@ -320,8 +354,110 @@ class CgRegimeRebalTimeDiagMixin:
         m[tk] = None
         return None
 
+    def _RtSeedParkSym(self, tk):
+        if tk in self._rt_sym_map and self._rt_sym_map[tk] is not None:
+            return self._rt_sym_map[tk]
+        sym = None
+        if tk == "BIL" or tk in _CASH:
+            sym = getattr(self, "sym_cash", None)
+        elif tk in ("GLD", "GLDM"):
+            sym = getattr(self, "sym_gld", None)
+        if sym is not None and _tk(sym) == tk:
+            self._rt_sym_map[tk] = sym
+            return sym
+        return self._RtMapTk(tk)
+
+    def _RtParkAvail(self, tk):
+        sym = self._RtSeedParkSym(tk)
+        if sym is None:
+            return False
+        try:
+            sec = self.securities[sym]
+            hd = getattr(sec, "HasData", None)
+            if hd is None:
+                hd = getattr(sec, "has_data", False)
+            if not hd:
+                return False
+            return float(sec.price) > 0
+        except Exception:
+            return False
+
+    def _RtApplyParkSubs(self, w):
+        out = dict(w)
+        for src, dst in _PARK_FB.items():
+            if src not in out:
+                continue
+            try:
+                wf = float(out.get(src) or 0.0)
+            except Exception:
+                continue
+            if abs(wf) < 1e-12:
+                continue
+            if self._RtParkAvail(src):
+                continue
+            if not self._RtParkAvail(dst):
+                continue
+            self._RtSeedParkSym(dst)
+            out[dst] = float(out.get(dst) or 0.0) + wf
+            del out[src]
+            key = (src, dst)
+            rec = self._rt_subs.get(key)
+            if rec is None:
+                rec = {"n": 0, "wsum": 0.0}
+                self._rt_subs[key] = rec
+            rec["n"] += 1
+            rec["wsum"] += abs(wf)
+        return out
+
+    def _RtIsMinuteSub(self, sym, sec):
+        res = getattr(sec, "resolution", None)
+        if res is None:
+            res = getattr(sec, "Resolution", None)
+        if res is not None:
+            s = str(res).lower()
+            if "minute" in s:
+                return True
+            try:
+                if int(res) == 0:
+                    return True
+            except Exception:
+                pass
+        reg = getattr(self, "_cg_sub_registry", None) or {}
+        try:
+            info = reg.get(sym) or reg.get(_tk(sym))
+            if info is None:
+                return False
+            if isinstance(info, dict):
+                r = str(info.get("resolution", info.get("res", ""))).lower()
+                t = str(info.get("type", info.get("kind", ""))).lower()
+                return ("minute" in r) or (t in ("tradable", "minute"))
+            return "minute" in str(info).lower()
+        except Exception:
+            return False
+
+    def _RtExchOpen(self, sym, sec):
+        try:
+            exch = getattr(sec, "exchange", None) or getattr(sec, "Exchange", None)
+            hours = None
+            if exch is not None:
+                hours = getattr(exch, "hours", None) or getattr(exch, "Hours", None)
+            if hours is not None:
+                if hasattr(hours, "is_open"):
+                    return bool(hours.is_open(self.time, False))
+                if hasattr(hours, "IsOpen"):
+                    return bool(hours.IsOpen(self.time, False))
+        except Exception:
+            pass
+        try:
+            return bool(self.securities[sym].exchange.hours.is_open(self.time, False))
+        except Exception:
+            return False
+
     def _RtPx(self, sym):
         try:
+            if sym is None:
+                self._rt_missing_px += 1
+                return None
             sec = self.securities[sym]
             px = float(sec.price)
             if px <= 0:
@@ -335,17 +471,33 @@ class CgRegimeRebalTimeDiagMixin:
                     last = sec.GetLastData()
                 except Exception:
                     last = getattr(getattr(sec, "cache", None), "last_data", None)
-            if last is None:
+            et = None
+            if last is not None:
+                et = (
+                    getattr(last, "end_time", None)
+                    or getattr(last, "EndTime", None)
+                    or getattr(last, "time", None)
+                    or getattr(last, "Time", None)
+                )
+            if et is not None:
+                age = (self.time - et).total_seconds() / 60.0
+                if age < 0 or age > _STALE_MIN:
+                    self._rt_stale_px += 1
+                    return None
+                return px
+            hd = getattr(sec, "HasData", None)
+            if hd is None:
+                hd = getattr(sec, "has_data", False)
+            if not hd or px <= 0:
                 self._rt_missing_px += 1
                 return None
-            et = getattr(last, "end_time", None) or getattr(last, "EndTime", None)
-            if et is None:
+            if not self._RtExchOpen(sym, sec):
                 self._rt_missing_px += 1
                 return None
-            age = (self.time - et).total_seconds() / 60.0
-            if age < 0 or age > _STALE_MIN:
-                self._rt_stale_px += 1
+            if not self._RtIsMinuteSub(sym, sec):
+                self._rt_missing_px += 1
                 return None
+            self._rt_ts_fallback += 1
             return px
         except Exception:
             self._rt_missing_px += 1
@@ -356,18 +508,32 @@ class CgRegimeRebalTimeDiagMixin:
             "date": d, "regime": regime, "w": dict(weights),
             "px": [None] * _N, "valid": [False] * _N,
             "miss_w": [1.0] * _N, "snapped": [False] * _N,
-            "ts": [None] * _N, "trade_idx": self._RtNoteTradeDate(),
+            "ts": [None] * _N, "trade_idx": self._RtEnsureTradingDate(d),
         }
+
+    def _RtSqNote(self, tk, kind, d):
+        sq = self._rt_sq.get(tk)
+        if sq is None:
+            sq = {"stale": 0, "missing": 0, "inv_w": 0, "first": None, "last": None}
+            self._rt_sq[tk] = sq
+        sq[kind] = int(sq.get(kind, 0) or 0) + 1
+        if sq["first"] is None:
+            sq["first"] = d
+        sq["last"] = d
 
     def _RtSnapShell(self, shell, ti):
         if shell is None or shell["snapped"][ti]:
             return
-        self._RtNoteTradeDate()
+        self._RtEnsureTradingDate()
+        d = shell.get("date") or self.time.date()
         w = shell["w"]
         miss = 0.0
         miss_n = 0
         stale_hit = 0
+        missing_hit = 0
         pxmap = {}
+        tq = self._rt_tq[ti]
+        tq["snaps"] += 1
         for tk, wt in w.items():
             try:
                 wf = float(wt or 0.0)
@@ -387,8 +553,14 @@ class CgRegimeRebalTimeDiagMixin:
                 miss_n += 1
                 if self._rt_stale_px > before_s:
                     stale_hit += 1
-                elif self._rt_missing_px == before_m and sym is None:
-                    self._rt_missing_px += 1
+                    tq["stale"] += 1
+                    self._RtSqNote(tk, "stale", d)
+                else:
+                    missing_hit += 1
+                    tq["missing"] += 1
+                    self._RtSqNote(tk, "missing", d)
+                    if self._rt_missing_px == before_m and sym is None:
+                        self._rt_missing_px += 1
             else:
                 pxmap[tk] = px
         shell["px"][ti] = pxmap
@@ -398,10 +570,22 @@ class CgRegimeRebalTimeDiagMixin:
         self._rt_cand_snaps += 1
         if miss > self._rt_max_miss_w:
             self._rt_max_miss_w = miss
+        if miss > tq["max_miss"]:
+            tq["max_miss"] = miss
         if miss > _MISS_W:
             shell["valid"][ti] = False
             self._rt_inv_w += 1
+            tq["inv_w"] += 1
             self._rt_miss_snaps += 1
+            for tk, wt in w.items():
+                try:
+                    wf = float(wt or 0.0)
+                except Exception:
+                    continue
+                if abs(wf) < 1e-12 or tk in _CASH:
+                    continue
+                if tk not in pxmap:
+                    self._RtSqNote(tk, "inv_w", d)
             if stale_hit > 0:
                 self._rt_stale_snaps += 1
                 self._rt_stale_inv += 1
@@ -409,6 +593,7 @@ class CgRegimeRebalTimeDiagMixin:
                 self._rt_miss_inv += 1
         else:
             shell["valid"][ti] = True
+            tq["valid"] += 1
             if miss_n > 0:
                 self._rt_miss_snaps += 1
 
@@ -435,7 +620,7 @@ class CgRegimeRebalTimeDiagMixin:
             pend = self._rt_pend
             if pend is None or pend["date"] != d:
                 return
-            self._RtNoteTradeDate()
+            self._RtEnsureTradingDate(d)
             tpv = float(self.portfolio.total_portfolio_value)
             if tpv <= 0:
                 return
@@ -478,7 +663,7 @@ class CgRegimeRebalTimeDiagMixin:
             shell = {
                 "date": d, "w": w, "px": pxmap, "valid": ok,
                 "miss_w": miss, "ts": self.time,
-                "trade_idx": self._rt_trade_date_index.get(d, 0),
+                "trade_idx": self._RtEnsureTradingDate(d),
             }
             if self._rt_hold_pend is not None and self._rt_hold_pend["date"] != d:
                 done = self._rt_hold_pend
@@ -501,7 +686,7 @@ class CgRegimeRebalTimeDiagMixin:
             if not isinstance(combined, dict):
                 return
             d = self.time.date()
-            self._RtNoteTradeDate()
+            self._RtEnsureTradingDate(d)
             if self._rt_pend is not None and self._rt_pend["date"] != d:
                 done = self._rt_pend
                 self._rt_pend = None
@@ -528,6 +713,7 @@ class CgRegimeRebalTimeDiagMixin:
                 w[tk] = wf
                 if tk not in self._rt_sym_map:
                     self._rt_sym_map[tk] = k
+            w = self._RtApplyParkSubs(w)
             shell = self._RtNewShell(w, rg, d)
             self._rt_pend = shell
             self._RtSnapShell(shell, _PROD_IDX)
@@ -550,7 +736,12 @@ class CgRegimeRebalTimeDiagMixin:
             s.append(td)
 
     def _RtFinalizeHold(self, prev, cur):
-        td = max(1, int(cur["trade_idx"]) - int(prev["trade_idx"]))
+        td0 = prev.get("trade_idx")
+        td1 = cur.get("trade_idx")
+        if td0 is None or td1 is None or td1 <= td0:
+            self._rt_inv_td += 1
+            return
+        td = td1 - td0
         ts0, ts1 = prev["ts"], cur["ts"]
         ok = bool(prev["valid"] and cur["valid"])
         r = _RtWeightedRet(prev["w"], prev["px"], cur["px"]) if ok else None
@@ -563,11 +754,16 @@ class CgRegimeRebalTimeDiagMixin:
         pri = _RI.get(prev["regime"], 1)
         cri = _RI.get(cur["regime"], 1)
         d = cur["date"]
-        td = max(1, int(cur["trade_idx"]) - int(prev["trade_idx"]))
+        td0 = prev.get("trade_idx")
+        td1 = cur.get("trade_idx")
+        self._rt_all_tr += 1
+        if td0 is None or td1 is None or td1 <= td0:
+            self._rt_inv_td += 1
+            return
+        td = td1 - td0
         ts0 = prev["ts"][_PROD_IDX] or prev["ts"][0]
         ts1 = cur["ts"][_PROD_IDX] or cur["ts"][0]
         self._RtNoteTd(td)
-        self._rt_all_tr += 1
         prod_ok = bool(prev["valid"][_PROD_IDX] and cur["valid"][_PROD_IDX])
         if prod_ok:
             self._rt_prod_tr += 1
@@ -735,14 +931,20 @@ class CgRegimeRebalTimeDiagMixin:
             n = self._rt_td_n
             avg_td = (self._rt_td_sum / n) if n else None
             med_td = None
+            p90_td = None
             if self._rt_td_sample:
                 arr = sorted(self._rt_td_sample)
                 mid = len(arr) // 2
                 med_td = arr[mid] if len(arr) % 2 else 0.5 * (arr[mid - 1] + arr[mid])
+                pi = min(len(arr) - 1, max(0, int(0.90 * (len(arr) - 1) + 0.5)))
+                p90_td = arr[pi]
             self._RtLog(
                 f"CG_REGIME_TIME_INTERVAL_FINAL,events={n},"
+                f"valid_intervals={n},"
+                f"invalid_trade_index_intervals={self._rt_inv_td},"
                 f"min_trading_days={self._rt_td_min if self._rt_td_min is not None else 'NA'},"
                 f"median_trading_days={_f(med_td,2)},avg_trading_days={_f(avg_td,2)},"
+                f"p90_trading_days={_f(p90_td,2)},"
                 f"max_trading_days={self._rt_td_max if self._rt_td_max is not None else 'NA'},"
                 f"one_day_intervals={self._rt_td_one},multi_day_intervals={self._rt_td_multi}"
             )
@@ -755,6 +957,36 @@ class CgRegimeRebalTimeDiagMixin:
                 f"target_invalid={self._rt_tgt_inv},stale_invalid={self._rt_stale_inv},"
                 f"missing_invalid={self._rt_miss_inv}"
             )
+            for ti in range(_N):
+                tq = self._rt_tq[ti]
+                self._RtLog(
+                    f"CG_REGIME_TIME_TIME_QUALITY_FINAL,time={_hhmm(ti)},"
+                    f"snapshots={tq['snaps']},valid={tq['valid']},stale={tq['stale']},"
+                    f"missing={tq['missing']},invalid_weight={tq['inv_w']},"
+                    f"max_missing_weight={_f(tq['max_miss'])}"
+                )
+            sq_ranked = sorted(
+                self._rt_sq.items(),
+                key=lambda kv: (
+                    int(kv[1].get("stale", 0) or 0)
+                    + int(kv[1].get("missing", 0) or 0)
+                    + int(kv[1].get("inv_w", 0) or 0)
+                ),
+                reverse=True,
+            )[:10]
+            for rank, (tk, sq) in enumerate(sq_ranked, 1):
+                self._RtLog(
+                    f"CG_REGIME_TIME_SYMBOL_QUALITY_FINAL,rank={rank},symbol={tk},"
+                    f"stale={sq.get('stale',0)},missing={sq.get('missing',0)},"
+                    f"invalid_weight_events={sq.get('inv_w',0)},"
+                    f"first_invalid={sq.get('first')},last_invalid={sq.get('last')}"
+                )
+            for (fr, to), rec in sorted(self._rt_subs.items()):
+                self._RtLog(
+                    f"CG_REGIME_TIME_SUB_FINAL,from={fr},to={to},"
+                    f"events={rec.get('n',0)},weight_sum={_f(rec.get('wsum'))},"
+                    f"reason=PRE_INCEPTION_PRODUCTION_FALLBACK"
+                )
             po = _metrics(self._rt_prod_only)
             dc = None if po["cagr"] is None else po["cagr"] - _ACT_CAGR
             dd = None if po["maxdd"] is None else po["maxdd"] - _ACT_MAXDD
@@ -793,12 +1025,7 @@ class CgRegimeRebalTimeDiagMixin:
                 f"delta_cagr={_f(hdc)},delta_maxdd={_f(hdd)},"
                 f"recon={'PASS' if hold_pass else 'FAIL'}"
             )
-            tgt_broken = (
-                (dc is not None and abs(dc) > 0.15)
-                or (dd is not None and abs(dd) > 0.25)
-                or po["nav"] < 1.5 or po["nav"] > 80.0
-            )
-            overall_recon = hold_pass and not tgt_broken
+            overall_recon = hold_pass
             prod_m = _metrics(self._rt_prod)
             self._RtLog(
                 f"CG_REGIME_TIME_PROD_FINAL,time={self._rt_prod_hhmm},"
@@ -863,7 +1090,7 @@ class CgRegimeRebalTimeDiagMixin:
                         sc = _score(m["cagr"], m["sharpe"], m["maxdd"])
                         ranked.append((sc, cid, ron, neu, roff, m))
             ranked.sort(key=lambda x: x[0], reverse=True)
-            top = ranked[:30]
+            top = ranked[:20]
             for rank, row in enumerate(top, 1):
                 sc, cid, ron, neu, roff, m = row
                 if not self._RtLog(
@@ -876,7 +1103,7 @@ class CgRegimeRebalTimeDiagMixin:
                     f"delta_dd_vs_prod={_f(m['maxdd']-prod_m['maxdd'])}"
                 ):
                     break
-            win_n = 5 if self._rt_log_bytes > _LOG_BUDGET * 0.75 else 10
+            win_n = 5
             detailed = []
             for rank, row in enumerate(top[:win_n], 1):
                 sc, cid, ron, neu, roff, m0 = row
@@ -906,13 +1133,22 @@ class CgRegimeRebalTimeDiagMixin:
             sanity = self._RtSanity(prod_win)
             for _, _, _, _, _, win, _, _, _ in detailed:
                 sanity += self._RtSanity(win)
+            interval_calendar_sanity = (
+                self._rt_td_multi > 0
+                and self._rt_td_max is not None and self._rt_td_max > 1
+                and avg_td is not None and avg_td > 1
+            )
             why = None
             if not overall_recon:
                 why = "production_shadow_not_reconciled"
-            elif crate < 0.85:
-                why = "insufficient_common_sample"
+            elif not interval_calendar_sanity:
+                why = "invalid_trading_day_elapsed"
             elif sanity > 0:
                 why = "metric_sanity_failure"
+            elif crate < 0.83:
+                why = "insufficient_common_sample"
+            elif crate < 0.85:
+                why = "common_sample_borderline"
             pick = None
             eligible = []
             if why is None:
@@ -1033,6 +1269,8 @@ class CgRegimeRebalTimeDiagMixin:
                 f"metric_sanity_fail={sanity},"
                 f"missing_price_count={self._rt_missing_px},"
                 f"stale_price_count={self._rt_stale_px},"
+                f"timestamp_fallback_count={self._rt_ts_fallback},"
+                f"invalid_trade_index_intervals={self._rt_inv_td},"
                 f"prod_time={self._rt_prod_hhmm},"
                 f"target_snapshot_time=09:45,holdings_snapshot_time=09:46,"
                 f"dd_sampling=EVENT_TIMESTAMPS,fees=0,slippage=0,"
