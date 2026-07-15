@@ -99,12 +99,6 @@ RRX_PARAMS = {
     "rrx_sat_sr_context_audit_enable": "0",
     "rrx_sat_sr_context_cap_compare_enable": "0",
     "rrx_sat_sr_entry_locked_cap_enable": "0",
-    "rrx_sat_sr_support_premium_enable": "1",
-    "rrx_sat_sr_lookback":             "120",
-    "rrx_sat_sr_k":                    "5",
-    "rrx_sat_sr_near_sup_atr":         "1.00",
-    "rrx_sat_sr_near_res_atr":         "1.25",
-    "rrx_sat_sr_break_atr":            "0.25",
     "rrx_sat_rate_cd_enable":          "0",
     "rrx_sat_rate_cd_c1":              "10",
     "rrx_sat_rate_cd_c2":              "20",
@@ -122,5 +116,5 @@ RRX_PARAMS = {
     "dyn_rr_add_exp":                  "0.00",
     "dyn_rr_max_exp":                  "0.25",
     # Log filter
-    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,RRX_SAT_SR_SUPPORT_PREMIUM_FINAL,[EOA],CG_CORE_",
+    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_",
 }
