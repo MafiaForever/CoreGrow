@@ -2,13 +2,14 @@
 from AlgorithmImports import *
 # endregion
 # cg_regime_time_shadow_s1.py
-# CG-REGIME-TIME-SHADOW-S1: compact 13-slot fixed-time shadow screen.
+# CG-REGIME-TIME-SHADOW-S1/T2: 13-slot fixed + regime-specific (3x13=39) shadow screen.
 # Diagnostic-only. Shadow portfolios only. Zero trading impact.
 from datetime import date as _date
 import math
 
 _SH_SLOTS = (15, 45, 75, 105, 135, 165, 195, 225, 255, 285, 315, 345, 375)
 _SH_N = 13
+_SH_REGS = ("RISK_ON", "NEUTRAL", "RISK_OFF")
 _SH_CASH = frozenset(("BIL", "SGOV", "USFR", "TFLO", "__CASH__"))
 _SH_PARK = {"SGOV": "BIL", "USFR": "BIL", "TFLO": "BIL", "GLDM": "GLD"}
 _SH_STALE = 5.0
@@ -77,7 +78,7 @@ def _sh_blank_port():
 
 
 class CgRegimeTimeShadowS1Mixin:
-    """13 fixed-slot shadow screen. trade=0."""
+    """13 fixed-slot + optional 3x13 regime-specific shadow screen. trade=0."""
 
     def CgRegimeTimeShadowS1Initialize(self):
         ov = getattr(self, "_rrx_param_overrides", {}) or {}
@@ -93,9 +94,11 @@ class CgRegimeTimeShadowS1Mixin:
 
         self.cg_rt_shadow = _bool("cg_rt_shadow", "0")
         self.cg_rt_shadow_log = _bool("cg_rt_sh_log", "0")
+        self.cg_rt_sh_reg = _bool("cg_rt_sh_reg", "0")
         self.log(
             f"[INIT] CG_RT_SHADOW_S1,enable={int(self.cg_rt_shadow)},"
-            f"slots=13,signal_time=09:45,daily_mtm=1,partial_returns=0,trade=0"
+            f"reg={int(self.cg_rt_sh_reg)},slots=13,regimes=3,candidates=39,"
+            f"signal_time=09:45,daily_mtm=1,partial_returns=0,trade=0"
         )
         if not self.cg_rt_shadow:
             return
@@ -105,6 +108,11 @@ class CgRegimeTimeShadowS1Mixin:
                 lp.append(pref)
         self.log_only_prefixes = lp
         self._sh_ports = [_sh_blank_port() for _ in range(_SH_N)]
+        self._sh_reg_ports = None
+        if self.cg_rt_sh_reg:
+            self._sh_reg_ports = [
+                [_sh_blank_port() for _ in range(_SH_N)] for _ in range(len(_SH_REGS))
+            ]
         self._sh_pend = None
         self._sh_prev_regime = None
         self._sh_sym_map = {}
@@ -264,8 +272,7 @@ class CgRegimeTimeShadowS1Mixin:
             port["maxdd"] = dd
         return ok
 
-    def _ShRebalance(self, si, targets):
-        port = self._sh_ports[si]
+    def _ShRebalance(self, port, targets):
         # mark first
         if not self._ShMark(port):
             port["invalid_exec"] += 1
@@ -342,6 +349,20 @@ class CgRegimeTimeShadowS1Mixin:
         port["prev_nav_exec"] = port["nav"]
         return True
 
+    def _ShRegExecSlot(self, family, day_rg, cand_slot):
+        # Vary only the matched 09:45 regime; other regimes stay at slot 15.
+        return int(cand_slot) if str(day_rg) == str(family) else 15
+
+    def _ShMarkPortDay(self, port, d):
+        ok = self._ShMark(port)
+        if ok:
+            port["valid_day"] += 1
+            port["daily"].append((d, port["nav"]))
+        else:
+            port["invalid_day"] += 1
+            if port["daily"]:
+                port["daily"].append((d, port["nav"]))
+
     def CgRegimeTimeShadowS1Capture(self, combined, regime):
         if not getattr(self, "cg_rt_shadow", False):
             return
@@ -376,7 +397,14 @@ class CgRegimeTimeShadowS1Mixin:
             }
             self._sh_prev_regime = rg
             # slot 15 executes with capture (same 09:45 bar)
-            self._ShRebalance(0, w)
+            self._ShRebalance(self._sh_ports[0], w)
+            # Regime-specific: execute now if effective slot is 15
+            rports = getattr(self, "_sh_reg_ports", None)
+            if rports is not None:
+                for ri, family in enumerate(_SH_REGS):
+                    for si, slot in enumerate(_SH_SLOTS):
+                        if self._ShRegExecSlot(family, rg, slot) == 15:
+                            self._ShRebalance(rports[ri][si], w)
         except Exception:
             pass
 
@@ -395,7 +423,16 @@ class CgRegimeTimeShadowS1Mixin:
                 return
             if si == 0:
                 return  # handled at capture
-            self._ShRebalance(si, pend["w"])
+            self._ShRebalance(self._sh_ports[si], pend["w"])
+            rports = getattr(self, "_sh_reg_ports", None)
+            if rports is not None:
+                m = int(minutes)
+                rg = pend["regime"]
+                w = pend["w"]
+                for ri, family in enumerate(_SH_REGS):
+                    for sj, slot in enumerate(_SH_SLOTS):
+                        if self._ShRegExecSlot(family, rg, slot) == m:
+                            self._ShRebalance(rports[ri][sj], w)
         except Exception:
             pass
 
@@ -407,15 +444,12 @@ class CgRegimeTimeShadowS1Mixin:
                 return
             d = self.time.date()
             for port in self._sh_ports:
-                ok = self._ShMark(port)
-                if ok:
-                    port["valid_day"] += 1
-                    port["daily"].append((d, port["nav"]))
-                else:
-                    port["invalid_day"] += 1
-                    # still record last known nav if any day history exists
-                    if port["daily"]:
-                        port["daily"].append((d, port["nav"]))
+                self._ShMarkPortDay(port, d)
+            rports = getattr(self, "_sh_reg_ports", None)
+            if rports is not None:
+                for row in rports:
+                    for port in row:
+                        self._ShMarkPortDay(port, d)
         except Exception:
             pass
 
@@ -481,6 +515,130 @@ class CgRegimeTimeShadowS1Mixin:
         w5 = 0.0 if m["worst5"] is None else m["worst5"]
         return 2.0 * c + 0.20 * s - 1.50 * dd + 0.25 * w5
 
+    def _ShPortMetrics(self, port):
+        m = self._ShMetricsFromDaily(port["daily"]) or {
+            "nav": port["nav"], "cagr": None, "maxdd": port["maxdd"],
+            "vol": None, "sharpe": None, "worst": None, "worst5": None,
+            "positive": None, "elapsed": None, "days": 0,
+        }
+        vd = port["valid_day"]
+        idd = port["invalid_day"]
+        ve = port["valid_exec"]
+        ie = port["invalid_exec"]
+        tot_e = max(1, ve + ie)
+        cov = ve / tot_e
+        m["coverage"] = cov
+        m["valid_exec"] = ve
+        m["invalid_exec"] = ie
+        m["valid_day"] = vd
+        m["invalid_day"] = idd
+        m["turnover"] = port["turn"]
+        m["rebalances"] = port["trade_n"]
+        m["score"] = self._ShScore(m)
+        return m
+
+    def _ShEligible(self, m, ctrl):
+        if m["coverage"] is None or m["coverage"] < 0.95:
+            return False
+        idr = m["invalid_day"] / max(1, m["valid_day"] + m["invalid_day"])
+        if idr > 0.02:
+            return False
+        if m["cagr"] is None or ctrl["cagr"] is None:
+            return False
+        if m["cagr"] < ctrl["cagr"] - 0.0050:
+            return False
+        if m["maxdd"] is None or ctrl["maxdd"] is None:
+            return False
+        if m["maxdd"] > ctrl["maxdd"] + 0.0100:
+            return False
+        if m["sharpe"] is None or ctrl["sharpe"] is None:
+            return False
+        if m["sharpe"] < ctrl["sharpe"] - 0.05:
+            return False
+        return True
+
+    def _ShBuildShortlist(self, metrics, n_max=5):
+        short = []
+        seen = set()
+
+        def _add(si, reason):
+            if si in seen:
+                return
+            short.append((si, reason))
+            seen.add(si)
+
+        _add(0, "CONTROL")
+        elig = [i for i in range(len(metrics)) if self._ShEligible(metrics[i], metrics[0])]
+        if not elig:
+            elig = list(range(len(metrics)))
+        _add(max(elig, key=lambda i: metrics[i]["cagr"] if metrics[i]["cagr"] is not None else -1e9), "CAGR")
+        _add(max(elig, key=lambda i: metrics[i]["sharpe"] if metrics[i]["sharpe"] is not None else -1e9), "SHARPE")
+        _add(min(elig, key=lambda i: metrics[i]["maxdd"] if metrics[i]["maxdd"] is not None else 1e9), "MAXDD")
+        _add(max(elig, key=lambda i: metrics[i]["score"]), "BALANCED")
+        return short[:n_max]
+
+    def _ShEmitRegFinal(self):
+        rports = getattr(self, "_sh_reg_ports", None)
+        if rports is None:
+            return
+        picks = {}
+        for ri, family in enumerate(_SH_REGS):
+            ports = rports[ri]
+            metrics = [self._ShPortMetrics(p) for p in ports]
+            for si, m in enumerate(metrics):
+                self._ShLog(
+                    f"CG_RT_SHADOW_REG_FINAL,regime={family},"
+                    f"slot={_SH_SLOTS[si]},time={_sh_hhmm(_SH_SLOTS[si])},"
+                    f"nav={_sh_f(m['nav'])},cagr={_sh_f(m['cagr'])},maxdd={_sh_f(m['maxdd'])},"
+                    f"vol={_sh_f(m['vol'])},sharpe={_sh_f(m['sharpe'])},"
+                    f"worst={_sh_f(m['worst'],6)},worst5={_sh_f(m['worst5'],6)},"
+                    f"positive={_sh_f(m['positive'])},turnover={_sh_f(m['turnover'])},"
+                    f"rebalances={m['rebalances']},valid_exec={m['valid_exec']},"
+                    f"invalid_exec={m['invalid_exec']},valid_days={m['valid_day']},"
+                    f"invalid_days={m['invalid_day']},coverage={_sh_f(m['coverage'])}"
+                )
+            # Keep at most 2 unique non-control finalists + control (matches T2 Stage1 cap).
+            short = self._ShBuildShortlist(metrics, n_max=5)
+            finals = []
+            for rank, (si, reason) in enumerate(short, 1):
+                m = metrics[si]
+                self._ShLog(
+                    f"CG_RT_SHADOW_REG_SHORTLIST_FINAL,regime={family},rank={rank},"
+                    f"slot={_SH_SLOTS[si]},time={_sh_hhmm(_SH_SLOTS[si])},"
+                    f"reason={reason},score={_sh_f(m['score'])},requires_real_backtest=1"
+                )
+                if reason != "CONTROL" and len(finals) < 2 and si not in finals:
+                    finals.append(si)
+            # If only control survived, still allow best CAGR as second look
+            if len(finals) < 2:
+                for si, reason in short:
+                    if si == 0 or si in finals:
+                        continue
+                    finals.append(si)
+                    if len(finals) >= 2:
+                        break
+            picks[family] = [_SH_SLOTS[si] for si in finals]
+            for si in finals:
+                port = ports[si]
+                for wn, a, b in _SH_WINDOWS:
+                    wm = self._ShWindowMetrics(port["daily"], a, b)
+                    if wm is None:
+                        continue
+                    self._ShLog(
+                        f"CG_RT_SHADOW_REG_WINDOW_FINAL,regime={family},"
+                        f"slot={_SH_SLOTS[si]},window={wn},"
+                        f"nav={_sh_f(wm['nav'])},cagr={_sh_f(wm['cagr'])},"
+                        f"maxdd={_sh_f(wm['maxdd'])},vol={_sh_f(wm['vol'])},"
+                        f"sharpe={_sh_f(wm['sharpe'])},worst5={_sh_f(wm['worst5'],6)}"
+                    )
+        ron = ",".join(str(x) for x in picks.get("RISK_ON", [])) or "NONE"
+        neu = ",".join(str(x) for x in picks.get("NEUTRAL", [])) or "NONE"
+        roff = ",".join(str(x) for x in picks.get("RISK_OFF", [])) or "NONE"
+        self._ShLog(
+            f"CG_RT_SHADOW_REG_SELECT_FINAL,risk_on={ron},neutral={neu},risk_off={roff},"
+            f"candidates=39,trade=0,next=REAL_BACKTEST"
+        )
+
     def CgRegimeTimeShadowS1EmitFinal(self):
         if not getattr(self, "cg_rt_shadow", False):
             return
@@ -495,26 +653,7 @@ class CgRegimeTimeShadowS1Mixin:
                 pass
             metrics = []
             for si, port in enumerate(self._sh_ports):
-                m = self._ShMetricsFromDaily(port["daily"]) or {
-                    "nav": port["nav"], "cagr": None, "maxdd": port["maxdd"],
-                    "vol": None, "sharpe": None, "worst": None, "worst5": None,
-                    "positive": None, "elapsed": None, "days": 0,
-                }
-                vd = port["valid_day"]
-                idd = port["invalid_day"]
-                tot_d = max(1, vd + idd)
-                ve = port["valid_exec"]
-                ie = port["invalid_exec"]
-                tot_e = max(1, ve + ie)
-                cov = ve / tot_e
-                m["coverage"] = cov
-                m["valid_exec"] = ve
-                m["invalid_exec"] = ie
-                m["valid_day"] = vd
-                m["invalid_day"] = idd
-                m["turnover"] = port["turn"]
-                m["rebalances"] = port["trade_n"]
-                m["score"] = self._ShScore(m)
+                m = self._ShPortMetrics(port)
                 metrics.append(m)
                 self._ShLog(
                     f"CG_RT_SHADOW_FIXED_FINAL,slot={_SH_SLOTS[si]},time={_sh_hhmm(_SH_SLOTS[si])},"
@@ -522,52 +661,11 @@ class CgRegimeTimeShadowS1Mixin:
                     f"vol={_sh_f(m['vol'])},sharpe={_sh_f(m['sharpe'])},"
                     f"worst={_sh_f(m['worst'],6)},worst5={_sh_f(m['worst5'],6)},"
                     f"positive={_sh_f(m['positive'])},turnover={_sh_f(m['turnover'])},"
-                    f"rebalances={m['rebalances']},valid_exec={ve},invalid_exec={ie},"
-                    f"valid_days={vd},invalid_days={idd},coverage={_sh_f(cov)}"
+                    f"rebalances={m['rebalances']},valid_exec={m['valid_exec']},"
+                    f"invalid_exec={m['invalid_exec']},valid_days={m['valid_day']},"
+                    f"invalid_days={m['invalid_day']},coverage={_sh_f(m['coverage'])}"
                 )
-            ctrl = metrics[0]
-            def _eligible(m):
-                if m["coverage"] is None or m["coverage"] < 0.95:
-                    return False
-                idr = m["invalid_day"] / max(1, m["valid_day"] + m["invalid_day"])
-                if idr > 0.02:
-                    return False
-                if m["cagr"] is None or ctrl["cagr"] is None:
-                    return False
-                if m["cagr"] < ctrl["cagr"] - 0.0050:
-                    return False
-                if m["maxdd"] is None or ctrl["maxdd"] is None:
-                    return False
-                if m["maxdd"] > ctrl["maxdd"] + 0.0100:
-                    return False
-                if m["sharpe"] is None or ctrl["sharpe"] is None:
-                    return False
-                if m["sharpe"] < ctrl["sharpe"] - 0.05:
-                    return False
-                return True
-
-            short = []
-            seen = set()
-
-            def _add(si, reason):
-                if si in seen:
-                    return
-                short.append((si, reason))
-                seen.add(si)
-
-            _add(0, "CONTROL")
-            elig = [i for i in range(_SH_N) if _eligible(metrics[i])]
-            if not elig:
-                elig = list(range(_SH_N))
-            best_cagr = max(elig, key=lambda i: metrics[i]["cagr"] if metrics[i]["cagr"] is not None else -1e9)
-            _add(best_cagr, "CAGR")
-            best_sh = max(elig, key=lambda i: metrics[i]["sharpe"] if metrics[i]["sharpe"] is not None else -1e9)
-            _add(best_sh, "SHARPE")
-            best_dd = min(elig, key=lambda i: metrics[i]["maxdd"] if metrics[i]["maxdd"] is not None else 1e9)
-            _add(best_dd, "MAXDD")
-            best_bal = max(elig, key=lambda i: metrics[i]["score"])
-            _add(best_bal, "BALANCED")
-            short = short[:5]
+            short = self._ShBuildShortlist(metrics, n_max=5)
             for rank, (si, reason) in enumerate(short, 1):
                 m = metrics[si]
                 self._ShLog(
@@ -608,6 +706,8 @@ class CgRegimeTimeShadowS1Mixin:
                 f"CG_RT_SHADOW_SELECT_FINAL,control=15,shortlist={slots},"
                 f"candidates=13,trade=0,next=REAL_BACKTEST"
             )
+            if getattr(self, "cg_rt_sh_reg", False):
+                self._ShEmitRegFinal()
         except Exception as exc:
             try:
                 self.log(f"CG_RT_SHADOW_SELECT_FINAL,error={type(exc).__name__},trade=0")
