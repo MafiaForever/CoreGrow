@@ -825,14 +825,16 @@ def D8SwitchDiagEmitFinal(self, start, today) -> None:
         )
 
 # ---------------------------------------------------------------------------
-# CG-DEF-GROSS-D0: defensive routing / falling-SPY gross shadow matrix.
+# CG-DEF-GROSS-D1: selective duration veto + toxic-IDS / transition equity caps.
 # Diagnostic-only. Zero trading impact. Never mutates real targets.
 # Shadow convention: weights at T applied to T close → T+1 close (no look-ahead).
+# BASE is target-shadow accounting, not QC portfolio NAV.
 # ---------------------------------------------------------------------------
 from datetime import date as _dg_date
 from collections import deque as _dg_deque
 
-_DG_V = ("BASE", "G1", "G2", "G3", "G4", "G5")
+_DG_V = ("BASE", "D1", "E1", "E2")
+_DG_NV = ("D1", "E1", "E2")
 _DG_W = (
     ("TRAIN", _dg_date(2012,1,1), _dg_date(2018,12,31)),
     ("OOS", _dg_date(2019,1,1), _dg_date(2021,12,31)),
@@ -851,7 +853,6 @@ _DG_DUR = frozenset(("BND", "TIP"))
 _DG_GOLD = frozenset(("GLD", "GLDM"))
 _DG_HEDGE = frozenset(("SH",))
 _DG_BUDGET = 90000
-_DG_DDMAX = 8
 
 
 def _dg_blank():
@@ -908,8 +909,15 @@ def _dg_tk(s):
         except Exception: return str(s)
 
 
+def _dg_act_blank():
+    return {"n": 0, "sum_br": 0.0, "sum_vr": 0.0, "pos_b": 0, "neg_b": 0,
+            "nav_b": 1.0, "nav_v": 1.0,
+            "sum_eb": 0.0, "sum_ea": 0.0, "sum_db": 0.0, "sum_da": 0.0,
+            "sum_cb": 0.0, "sum_ca": 0.0}
+
+
 class CgDefGrossDiagMixin:
-    """DEF-GROSS-D0 shadow matrix. Diagnostic-only."""
+    """DEF-GROSS-D1 shadow matrix. Diagnostic-only."""
 
     def CgDefGrossInit(self) -> None:
         try:
@@ -921,32 +929,31 @@ class CgDefGrossDiagMixin:
             en = str(_p("cg_def_gross_diag_enable", "1") or "1").strip().lower()
             self.cg_def_gross_diag_enable = en in ("1", "true", "yes", "on")
             lp = list(getattr(self, "log_only_prefixes", None) or [])
-            if "CG_DEF_GROSS_" not in lp: lp.append("CG_DEF_GROSS_")
+            for pref in ("CG_DEF_D1_", "CG_DEF_GROSS_"):
+                if pref not in lp: lp.append(pref)
             self.log_only_prefixes = lp
-            self.log("[INIT] CG_DEF_GROSS_DIAG enable="
-                     f"{int(self.cg_def_gross_diag_enable)} variants=6 trade=0 "
-                     f"conv=T_close_to_T1_close tactical_permission="
-                     f"{int(bool(getattr(self,'tactical_permission_enable',True)))}")
+            self.log("[INIT] CG_DEF_D1_DIAG enable="
+                     f"{int(self.cg_def_gross_diag_enable)} variants=BASE,D1,E1,E2 trade=0 "
+                     f"conv=T_close_to_T1_close shadow=target_not_qc_nav")
             if not self.cg_def_gross_diag_enable: return
             self._dg_run = {v: _dg_blank() for v in _DG_V}
             self._dg_win = {(v, w[0]): _dg_blank() for v in _DG_V for w in _DG_W}
-            self._dg_act = {v: {"n": 0, "sum_br": 0.0, "sum_vr": 0.0, "pos": 0, "neg": 0,
-                                "sum_gb": 0.0, "sum_ga": 0.0, "sum_cb": 0.0, "sum_ca": 0.0}
-                            for v in _DG_V if v != "BASE"}
+            self._dg_act = {v: _dg_act_blank() for v in _DG_NV}
+            self._dg_ids = {k: _dg_blank() for k in ("WATCH_BASE", "WATCH_E1", "STRESS_BASE", "STRESS_E1")}
             self._dg_prev_w = {v: None for v in _DG_V}
             self._dg_prev_px = None
+            self._dg_prev_act = {}
+            self._dg_prev_ids = None
+            self._dg_prev_ps = None
             self._dg_last = None
             self._dg_n = 0
             self._dg_bytes = 0
             self._dg_pxbuf = {}
-            self._dg_dd_list = []
-            self._dg_open_dd = None
-            self._dg_in_dd = False
-            self._dg_peak_nav = None
-            self._dg_peak_date = None
+            self._dg_e2_on = False
+            self._dg_e2_left = 0
             self._dg_err = False
         except Exception as e:
-            try: self.log(f"[INIT] CG_DEF_GROSS_ERROR,stage=init,type={type(e).__name__}")
+            try: self.log(f"[INIT] CG_DEF_D1_ERROR,stage=init,type={type(e).__name__}")
             except Exception: pass
 
     def _DgEqSet(self):
@@ -983,25 +990,18 @@ class CgDefGrossDiagMixin:
                 except Exception: pass
         return c
 
+    def _DgCashTk(self):
+        s = getattr(self, "sym_cash", None)
+        return _dg_tk(s) if s is not None else "BIL"
+
     def _DgPark(self, before, after):
         def nc(w):
             return sum(abs(float(x or 0.0)) for t, x in (w or {}).items() if t not in _DG_CASH)
         freed = nc(before) - nc(after)
         if freed <= 1e-12: return after
-        out = dict(after); ct = None
-        for t in ("BIL", "SGOV", "USFR"):
-            if t in out: ct = t; break
-        if ct is None: ct = "BIL"
+        out = dict(after); ct = self._DgCashTk()
         out[ct] = float(out.get(ct, 0.0) or 0.0) + freed
         return out
-
-    def _DgScaleNonCash(self, w, scale):
-        out = {}
-        for t, wt in w.items():
-            try: wf = float(wt or 0.0)
-            except Exception: continue
-            out[t] = wf if t in _DG_CASH else wf * scale
-        return self._DgPark(w, out)
 
     def _DgScaleGroup(self, w, eq, grp, scale):
         out = dict(w)
@@ -1016,11 +1016,6 @@ class CgDefGrossDiagMixin:
         for t in list(out.keys()):
             if self._DgGrp(t, eq) == grp: out[t] = 0.0
         return self._DgPark(w, out)
-
-    def _DgCapTotal(self, w, cap):
-        g = sum(abs(float(x or 0.0)) for t, x in w.items() if t not in _DG_CASH)
-        if g <= cap + 1e-12 or g <= 1e-12: return w
-        return self._DgScaleNonCash(w, cap / g)
 
     def _DgBaseW(self, combined):
         w = {}
@@ -1069,69 +1064,53 @@ class CgDefGrossDiagMixin:
             return float(ind.Current.Value)
         except Exception: return None
 
-    def _DgBuildVariants(self, base, eq, spy20, bnd20, tip20, gld20, gldm20, regime, ps, ids, dd_clamp, dd_scale):
+    def _DgBuildVariants(self, base, eq, spy_px, ema75, ema9, ema120, spy20, bnd20, tip20,
+                         regime, prev_reg, ps, ids, dd):
         out = {"BASE": dict(base)}
-        falling = spy20 < 0
-        stress = (str(regime) in ("NEUTRAL", "RISK_OFF")
-                  or str(ps) in ("WATCH", "STRESS", "PANIC")
-                  or str(ids) in ("WATCH", "STRESS", "PANIC_SHORT"))
-        dur_broken = (bnd20 < 0 and tip20 < 0)
-        # G1
+        # D1 selective rate-shock duration veto
+        a_d1 = (str(regime) in ("NEUTRAL", "RISK_OFF")
+                and spy_px is not None and ema75 is not None and spy_px < ema75
+                and ema9 is not None and ema120 is not None and ema9 < ema120
+                and spy20 < 0 and bnd20 < 0 and tip20 < 0)
         w = dict(base)
-        a1 = falling and stress
-        if a1:
-            tg = self._DgGross(w, eq)
-            if tg > 1.0: w = self._DgScaleNonCash(w, 1.0 / tg)
-        out["G1"] = w
-        # G2
+        if a_d1: w = self._DgZeroGroup(w, eq, "D")
+        out["D1"] = w
+        # E1 toxic IDS equity cap
+        a_e1 = (str(ps) == "NORMAL"
+                and str(ids) in ("WATCH", "STRESS")
+                and spy_px is not None and ema75 is not None and spy_px < ema75
+                and spy20 < 0)
         w = dict(base)
-        a2 = a1
-        if a2:
+        if a_e1:
             eg = self._DgGross(w, eq, "E")
-            if eg > 0.60 and eg > 1e-12:
-                w = self._DgScaleGroup(w, eq, "E", 0.60 / eg)
-            tg = self._DgGross(w, eq)
-            if tg > 1.20:
-                dg = self._DgGross(w, eq, "D") + self._DgGross(w, eq, "G")
-                need = tg - 1.20
-                if dg > 1e-12 and need > 0:
-                    rem = max(0.0, dg - need); sc = rem / dg
-                    w = self._DgScaleGroup(w, eq, "D", sc)
-                    w = self._DgScaleGroup(w, eq, "G", sc)
-                w = self._DgCapTotal(w, 1.20)
-        out["G2"] = w
-        # G3
+            if eg > 0.90 and eg > 1e-12:
+                w = self._DgScaleGroup(w, eq, "E", 0.90 / eg)
+        out["E1"] = w
+        # E2 damaged transition equity cap (diag-only hold state; no prod mutation)
+        start_e2 = (str(regime) in ("NEUTRAL", "RISK_OFF")
+                    and str(prev_reg) == "RISK_ON"
+                    and spy_px is not None and ema75 is not None and spy_px < ema75
+                    and ema9 is not None and ema120 is not None and ema9 < ema120
+                    and dd >= 0.05)
+        if self._dg_e2_on:
+            stop = ((ema9 is not None and ema120 is not None and ema9 >= ema120)
+                    or dd < 0.03 or self._dg_e2_left <= 0)
+            if stop:
+                self._dg_e2_on = False
+                self._dg_e2_left = 0
+        if (not self._dg_e2_on) and start_e2:
+            self._dg_e2_on = True
+            self._dg_e2_left = 20
+        a_e2 = bool(self._dg_e2_on)
+        if a_e2:
+            self._dg_e2_left -= 1
         w = dict(base)
-        a3 = falling and dur_broken
-        if a3:
-            dg = self._DgGross(w, eq, "D")
-            if dg > 0.25 and dg > 1e-12:
-                w = self._DgScaleGroup(w, eq, "D", 0.25 / dg)
-            w = self._DgCapTotal(w, 1.00)
-        out["G3"] = w
-        # G4
-        w = dict(base)
-        a4 = falling and str(regime) in ("NEUTRAL", "RISK_OFF")
-        if a4:
-            dur_r = 0.5 * (bnd20 + tip20)
-            gvals = [gld20]
-            if gldm20 is not None: gvals.append(gldm20)
-            gold_r = sum(gvals) / len(gvals)
-            if dur_r <= 0: w = self._DgZeroGroup(w, eq, "D")
-            if gold_r <= 0: w = self._DgZeroGroup(w, eq, "G")
-            w = self._DgCapTotal(w, 1.10)
-        out["G4"] = w
-        # G5
-        w = dict(base)
-        a5 = bool(dd_clamp)
-        if a5:
-            sc = float(dd_scale) if dd_scale is not None else 1.0
-            sc = max(0.0, min(1.0, sc))
-            w = self._DgScaleGroup(w, eq, "E", sc)
-            if self._DgGross(w, eq) > 1.20:
-                w = self._DgCapTotal(w, 1.20)
-        out["G5"] = w
-        return out, {"G1": a1, "G2": a2, "G3": a3, "G4": a4, "G5": a5}
+        if a_e2:
+            eg = self._DgGross(w, eq, "E")
+            if eg > 1.00 and eg > 1e-12:
+                w = self._DgScaleGroup(w, eq, "E", 1.00 / eg)
+        out["E2"] = w
+        return out, {"D1": a_d1, "E1": a_e1, "E2": a_e2}
 
     def CgDefGrossUpdate(self, combined) -> None:
         if not getattr(self, "cg_def_gross_diag_enable", False): return
@@ -1141,37 +1120,31 @@ class CgDefGrossDiagMixin:
             base = self._DgBaseW(combined)
             px = self._DgPx(combined)
             eq = self._DgEqSet()
-            # refresh price buffers
             for t, p in px.items():
                 if t not in self._dg_pxbuf:
                     self._dg_pxbuf[t] = _dg_deque(maxlen=25)
                 self._dg_pxbuf[t].append(p)
             spy20 = self._DgBufRet("SPY", 20)
             bnd20 = self._DgBufRet("BND", 20); tip20 = self._DgBufRet("TIP", 20)
-            gld20 = self._DgBufRet("GLD", 20)
-            gldm20 = self._DgBufRet("GLDM", 20) if "GLDM" in self._dg_pxbuf else None
+            spy_px = px.get("SPY")
+            ema75 = self._DgInd("spy_ema_75")
+            ema9 = self._DgInd("spy_ema_9")
+            ema120 = self._DgInd("spy_ema_120")
             regime = str(getattr(self, "current_regime", None) or "UNKNOWN")
+            prev_reg = str(getattr(self, "prev_regime", None) or "")
             ps = str(getattr(self, "_panic_state", "NORMAL") or "NORMAL")
             ids = str(getattr(self, "_ids_state", "NORMAL") or "NORMAL")
             dd = float(self.CurrentDrawdown())
-            try:
-                dds = self.GetDdControlState(dd)
-                dd_clamp = bool(dds.get("clamp_active"))
-                dd_scale = float(dds.get("dd_scale", 1.0))
-            except Exception:
-                dd_clamp = False; dd_scale = 1.0
             variants, active = self._DgBuildVariants(
-                base, eq, spy20, bnd20, tip20, gld20, gldm20, regime, ps, ids, dd_clamp, dd_scale)
-            # realize previous day shadow returns
+                base, eq, spy_px, ema75, ema9, ema120, spy20, bnd20, tip20,
+                regime, prev_reg, ps, ids, dd)
             if self._dg_prev_px is not None:
                 for v in _DG_V:
                     pw = self._dg_prev_w.get(v)
                     if pw is None: continue
                     r = self._DgRet(pw, self._dg_prev_px, px)
-                    tg = self._DgGross(pw, eq)
-                    eg = self._DgGross(pw, eq, "E")
-                    dg = self._DgGross(pw, eq, "D")
-                    gg = self._DgGross(pw, eq, "G")
+                    tg = self._DgGross(pw, eq); eg = self._DgGross(pw, eq, "E")
+                    dg = self._DgGross(pw, eq, "D"); gg = self._DgGross(pw, eq, "G")
                     c = self._DgCash(pw)
                     act = int(bool(getattr(self, "_dg_prev_act", {}).get(v)))
                     _dg_upd(self._dg_run[v], r, tg, eg, dg, gg, c, act)
@@ -1185,63 +1158,37 @@ class CgDefGrossDiagMixin:
                         a["n"] += 1
                         br = self._DgRet(self._dg_prev_w.get("BASE") or {}, self._dg_prev_px, px)
                         a["sum_br"] += br; a["sum_vr"] += r
-                        if r > 0: a["pos"] += 1
-                        if r < 0: a["neg"] += 1
-                        a["sum_gb"] += self._DgGross(self._dg_prev_w.get("BASE") or {}, eq)
-                        a["sum_ga"] += tg
-                        a["sum_cb"] += self._DgCash(self._dg_prev_w.get("BASE") or {})
+                        if br > 0: a["pos_b"] += 1
+                        if br < 0: a["neg_b"] += 1
+                        a["nav_b"] *= (1.0 + br); a["nav_v"] *= (1.0 + r)
+                        bw = self._dg_prev_w.get("BASE") or {}
+                        a["sum_eb"] += self._DgGross(bw, eq, "E")
+                        a["sum_ea"] += eg
+                        a["sum_db"] += self._DgGross(bw, eq, "D")
+                        a["sum_da"] += dg
+                        a["sum_cb"] += self._DgCash(bw)
                         a["sum_ca"] += c
-                # BASE DD episodes
-                bn = self._dg_run["BASE"]["nav"]
-                if self._dg_peak_nav is None or bn >= self._dg_peak_nav:
-                    if self._dg_in_dd and self._dg_open_dd is not None:
-                        ep = self._dg_open_dd
-                        ep["rec"] = today
-                        self._dg_dd_list.append(ep)
-                        self._dg_dd_list = sorted(self._dg_dd_list, key=lambda x: -x["depth"])[:_DG_DDMAX]
-                        self._dg_open_dd = None; self._dg_in_dd = False
-                    self._dg_peak_nav = bn; self._dg_peak_date = today
-                else:
-                    depth = 1.0 - bn / max(self._dg_peak_nav, 1e-9)
-                    if depth > 0.02:
-                        if not self._dg_in_dd:
-                            self._dg_in_dd = True
-                            self._dg_open_dd = {
-                                "peak": self._dg_peak_date, "trough": today, "rec": None,
-                                "depth": depth, "reg_p": getattr(self, "_dg_prev_reg", regime),
-                                "reg_t": regime, "ps_t": ps, "ids_t": ids,
-                                "spy20": spy20, "bnd20": bnd20, "tip20": tip20, "gld20": gld20,
-                                "sum_tg": 0.0, "sum_eg": 0.0, "sum_dg": 0.0, "sum_gg": 0.0,
-                                "sum_c": 0.0, "n": 0, "dur_br": 0, "clamp": 0,
-                            }
-                        ep = self._dg_open_dd
-                        if bn < ep.get("_tnav", bn + 1):
-                            ep["_tnav"] = bn; ep["trough"] = today
-                            ep["depth"] = 1.0 - bn / max(self._dg_peak_nav, 1e-9)
-                            ep["reg_t"] = regime; ep["ps_t"] = ps; ep["ids_t"] = ids
-                            ep["spy20"] = spy20; ep["bnd20"] = bnd20
-                            ep["tip20"] = tip20; ep["gld20"] = gld20
-                        pw = self._dg_prev_w.get("BASE") or {}
-                        ep["sum_tg"] += self._DgGross(pw, eq)
-                        ep["sum_eg"] += self._DgGross(pw, eq, "E")
-                        ep["sum_dg"] += self._DgGross(pw, eq, "D")
-                        ep["sum_gg"] += self._DgGross(pw, eq, "G")
-                        ep["sum_c"] += self._DgCash(pw)
-                        ep["n"] += 1
-                        if bnd20 < 0 and tip20 < 0: ep["dur_br"] += 1
-                        if getattr(self, "_dg_prev_clamp", False): ep["clamp"] += 1
+                # E1 IDS attribution: prior-day NORMAL + WATCH/STRESS only
+                pps = getattr(self, "_dg_prev_ps", None)
+                pids = getattr(self, "_dg_prev_ids", None)
+                if pps == "NORMAL" and pids in ("WATCH", "STRESS"):
+                    for tag, vv in (("BASE", "BASE"), ("E1", "E1")):
+                        pw = self._dg_prev_w.get(vv) or {}
+                        r = self._DgRet(pw, self._dg_prev_px, px)
+                        key = f"{pids}_{tag}"
+                        _dg_upd(self._dg_ids[key], r, 0, 0, 0, 0, 0, 0)
                 self._dg_n += 1
             for v in _DG_V:
                 self._dg_prev_w[v] = variants[v]
             self._dg_prev_px = px
             self._dg_prev_act = active
-            self._dg_prev_reg = regime
-            self._dg_prev_clamp = dd_clamp
+            self._dg_prev_ps = ps
+            self._dg_prev_ids = ids
             self._dg_last = today
         except Exception as e:
             if not self._dg_err:
                 self._dg_err = True
-                try: self.log(f"[INIT] CG_DEF_GROSS_ERROR,stage=update,type={type(e).__name__}")
+                try: self.log(f"[INIT] CG_DEF_D1_ERROR,stage=update,type={type(e).__name__}")
                 except Exception: pass
 
     def _DgEmit(self, lines, line):
@@ -1252,7 +1199,7 @@ class CgDefGrossDiagMixin:
         lines.append(line); self._dg_bytes += b
         return True
 
-    def _DgFmt(self, prefix, name, st, extra=""):
+    def _DgFmt(self, prefix, name, st):
         n = st["n"]
         return (f"{prefix},{name},days={n},nav={_dg_f(st['nav'])},"
                 f"cagr={_dg_f(_dg_ann(st['sum_r'], n))},maxdd={_dg_f(st['maxdd'])},"
@@ -1264,98 +1211,108 @@ class CgDefGrossDiagMixin:
                 f"avg_duration_gross={_dg_f(st['sum_dg']/n if n else None)},"
                 f"avg_gold_gross={_dg_f(st['sum_gg']/n if n else None)},"
                 f"avg_cash={_dg_f(st['sum_c']/n if n else None)},"
-                f"active_days={st['act']}{extra}")
+                f"active_days={st['act']}")
 
     def CgDefGrossEmitFinal(self) -> None:
         if not getattr(self, "cg_def_gross_diag_enable", False): return
-        self.log(f"[EOA] CG_DEF_GROSS_EMIT_START,n={getattr(self,'_dg_n',0)}")
+        self.log(f"[EOA] CG_DEF_D1_EMIT_START,n={getattr(self,'_dg_n',0)}")
         lines = []; self._dg_bytes = 0
-        if self._dg_open_dd is not None:
-            self._dg_dd_list.append(self._dg_open_dd)
-            self._dg_dd_list = sorted(self._dg_dd_list, key=lambda x: -x["depth"])[:_DG_DDMAX]
         for v in _DG_V:
             st = self._dg_run[v]
             if st["n"] <= 0:
-                self._DgEmit(lines, f"CG_DEF_GROSS_FINAL,variant={v},status=NO_DATA")
+                self._DgEmit(lines, f"CG_DEF_D1_FINAL,variant={v},status=NO_DATA")
             else:
-                self._DgEmit(lines, self._DgFmt("CG_DEF_GROSS_FINAL", f"variant={v}", st))
+                self._DgEmit(lines, self._DgFmt("CG_DEF_D1_FINAL", f"variant={v}", st))
         for v in _DG_V:
             for name, _, _ in _DG_W:
                 st = self._dg_win[(v, name)]
                 if st["n"] <= 0: continue
                 if not self._DgEmit(lines, self._DgFmt(
-                        "CG_DEF_GROSS_WINDOW_FINAL", f"variant={v},window={name}", st)):
+                        "CG_DEF_D1_WINDOW_FINAL", f"variant={v},window={name}", st)):
                     break
-        for i, ep in enumerate(self._dg_dd_list[:_DG_DDMAX], 1):
-            nn = max(1, ep.get("n", 1))
-            ln = (f"CG_DEF_GROSS_DD_FINAL,rank={i},peak={ep['peak']},trough={ep['trough']},"
-                  f"recovery={ep['rec'] or 'OPEN'},depth={_dg_f(ep['depth'])},"
-                  f"regime_peak={ep['reg_p']},regime_trough={ep['reg_t']},"
-                  f"panic_trough={ep['ps_t']},ids_trough={ep['ids_t']},"
-                  f"spy20_trough={_dg_f(ep['spy20'],6)},bnd20_trough={_dg_f(ep['bnd20'],6)},"
-                  f"tip20_trough={_dg_f(ep['tip20'],6)},gld20_trough={_dg_f(ep['gld20'],6)},"
-                  f"avg_total_gross={_dg_f(ep['sum_tg']/nn)},avg_equity_gross={_dg_f(ep['sum_eg']/nn)},"
-                  f"avg_duration_gross={_dg_f(ep['sum_dg']/nn)},avg_gold_gross={_dg_f(ep['sum_gg']/nn)},"
-                  f"avg_cash={_dg_f(ep['sum_c']/nn)},duration_broken_days={ep['dur_br']},"
-                  f"dd_clamp_days={ep['clamp']}")
-            if not self._DgEmit(lines, ln): break
-        for v in ("G1", "G2", "G3", "G4", "G5"):
+        for v in _DG_NV:
             a = self._dg_act[v]; n = a["n"]
             if n <= 0:
-                self._DgEmit(lines, f"CG_DEF_GROSS_ACTIVE_FINAL,variant={v},status=NO_DATA")
+                self._DgEmit(lines, f"CG_DEF_D1_ACTIVE_FINAL,variant={v},status=NO_DATA")
                 continue
-            ln = (f"CG_DEF_GROSS_ACTIVE_FINAL,variant={v},active_days={n},"
-                  f"avg_base_return={_dg_f(a['sum_br']/n,6)},"
-                  f"avg_variant_return={_dg_f(a['sum_vr']/n,6)},"
-                  f"positive_days={a['pos']},negative_days={a['neg']},"
-                  f"avg_gross_before={_dg_f(a['sum_gb']/n)},"
-                  f"avg_gross_after={_dg_f(a['sum_ga']/n)},"
-                  f"avg_cash_before={_dg_f(a['sum_cb']/n)},"
-                  f"avg_cash_after={_dg_f(a['sum_ca']/n)}")
-            self._DgEmit(lines, ln)
+            neg_r = a["neg_b"] / n
+            self._DgEmit(lines, (
+                f"CG_DEF_D1_ACTIVE_FINAL,variant={v},active_days={n},"
+                f"negative_base_days={a['neg_b']},positive_base_days={a['pos_b']},"
+                f"negative_rate={_dg_f(neg_r,4)},"
+                f"avg_base_return={_dg_f(a['sum_br']/n,6)},"
+                f"avg_variant_return={_dg_f(a['sum_vr']/n,6)},"
+                f"base_nav_active={_dg_f(a['nav_b'])},variant_nav_active={_dg_f(a['nav_v'])},"
+                f"avg_equity_before={_dg_f(a['sum_eb']/n)},avg_equity_after={_dg_f(a['sum_ea']/n)},"
+                f"avg_duration_before={_dg_f(a['sum_db']/n)},avg_duration_after={_dg_f(a['sum_da']/n)},"
+                f"avg_cash_before={_dg_f(a['sum_cb']/n)},avg_cash_after={_dg_f(a['sum_ca']/n)}"))
+        for ids in ("WATCH", "STRESS"):
+            b = self._dg_ids[f"{ids}_BASE"]; e = self._dg_ids[f"{ids}_E1"]
+            if b["n"] <= 0 and e["n"] <= 0: continue
+            nb = max(1, b["n"]); ne = max(1, e["n"])
+            self._DgEmit(lines, (
+                f"CG_DEF_D1_IDS_FINAL,ids={ids},days={b['n']},"
+                f"nav_base={_dg_f(b['nav'])},nav_e1={_dg_f(e['nav'])},"
+                f"mean_base={_dg_f(b['sum_r']/nb,6)},mean_e1={_dg_f(e['sum_r']/ne,6)},"
+                f"maxdd_base={_dg_f(b['maxdd'])},maxdd_e1={_dg_f(e['maxdd'])},"
+                f"worst5_base={_dg_f(_dg_w5(list(b['rets'])),6)},"
+                f"worst5_e1={_dg_f(_dg_w5(list(e['rets'])),6)}"))
         # selection
         base = self._dg_run["BASE"]
         b_dd = base["maxdd"]; b_w5 = _dg_w5(list(base["rets"])); b_nav = base["nav"]
-        b_vol = _dg_vol(base["sum_r"], base["sum_r2"], base["n"])
         b_oos = self._dg_win[("BASE", "OOS")]
         b_oos_sh = _dg_sh(b_oos["sum_r"], b_oos["sum_r2"], b_oos["n"])
         b_y20 = self._dg_win[("BASE", "Y2020")]["maxdd"]
-        b_y22 = self._dg_win[("BASE", "Y2022")]["maxdd"]
+        b_y22 = self._dg_win[("BASE", "Y2022")]
         b_y15 = self._dg_win[("BASE", "Y2015")]["maxdd"]
-        eligible = []
-        for v in ("G1", "G2", "G3", "G4", "G5"):
+        eligible = []; reasons = {}
+        for v in _DG_NV:
             st = self._dg_run[v]
             if st["n"] <= 0 or base["n"] <= 0: continue
             c_w5 = _dg_w5(list(st["rets"]))
-            c_vol = _dg_vol(st["sum_r"], st["sum_r2"], st["n"])
             c_oos = self._dg_win[(v, "OOS")]
             c_oos_sh = _dg_sh(c_oos["sum_r"], c_oos["sum_r2"], c_oos["n"])
             c_y20 = self._dg_win[(v, "Y2020")]["maxdd"]
-            c_y22 = self._dg_win[(v, "Y2022")]["maxdd"]
+            c_y22 = self._dg_win[(v, "Y2022")]
             c_y15 = self._dg_win[(v, "Y2015")]["maxdd"]
-            ok = True
-            if st["maxdd"] >= b_dd - 1e-12: ok = False
-            if b_w5 is not None and c_w5 is not None and c_w5 < b_w5 - 1e-12: ok = False
-            if b_oos_sh is not None and c_oos_sh is not None and c_oos_sh < b_oos_sh * 0.95: ok = False
-            if c_y20 > b_y20 + 1e-12: ok = False
-            if c_y22 >= b_y22 - 1e-12: ok = False
-            if c_y15 >= b_y15 - 1e-12: ok = False
-            if b_vol is not None and c_vol is not None and c_vol > b_vol + 1e-12: ok = False
-            if self._dg_act[v]["n"] < 40: ok = False
-            if ok: eligible.append((v, -st["nav"], st))
+            ok = True; why_fail = None
+            if st["maxdd"] >= b_dd - 1e-12: ok = False; why_fail = "maxdd"
+            elif b_w5 is not None and c_w5 is not None and c_w5 < b_w5 - 1e-12: ok = False; why_fail = "worst5"
+            elif st["nav"] < 0.97 * b_nav - 1e-12: ok = False; why_fail = "nav"
+            elif b_oos_sh is not None and c_oos_sh is not None and c_oos_sh < b_oos_sh * 0.95: ok = False; why_fail = "oos_sharpe"
+            elif c_y20 > b_y20 + 1e-12: ok = False; why_fail = "y2020_dd"
+            elif c_y22["maxdd"] > b_y22["maxdd"] + 1e-12: ok = False; why_fail = "y2022_dd"
+            elif c_y15 > b_y15 + 1e-12: ok = False; why_fail = "y2015_dd"
+            elif self._dg_act[v]["n"] < 20: ok = False; why_fail = "active_days"
+            else:
+                # variant-specific materiality
+                if v == "D1":
+                    nav_ok = c_y22["nav"] > b_y22["nav"] + 1e-12
+                    dd_ok = c_y22["maxdd"] < b_y22["maxdd"] - 0.005
+                    if not (nav_ok or dd_ok): ok = False; why_fail = "d1_2022"
+                elif v == "E1":
+                    improved = False
+                    for ids in ("WATCH", "STRESS"):
+                        bb = self._dg_ids[f"{ids}_BASE"]; ee = self._dg_ids[f"{ids}_E1"]
+                        if bb["n"] <= 0: continue
+                        if (ee["maxdd"] < bb["maxdd"] - 1e-12
+                                or ee["nav"] > bb["nav"] + 1e-12
+                                or (_dg_w5(list(ee["rets"])) or -9) > (_dg_w5(list(bb["rets"])) or -9)):
+                            improved = True
+                    if not improved: ok = False; why_fail = "e1_ids"
+                elif v == "E2":
+                    if c_y15 >= b_y15 - 1e-12: ok = False; why_fail = "e2_2015"
+            if ok:
+                eligible.append((v, -st["nav"], st)); reasons[v] = "ok"
+            else:
+                reasons[v] = why_fail or "fail"
         pick = "NONE"; why = "none_eligible"
         if eligible:
             eligible.sort()
-            pick = eligible[0][0]; why = "max_nav_among_eligible"
-        pst = self._dg_run.get(pick) if pick != "NONE" else None
+            pick = eligible[0][0]; why = f"max_nav|{reasons.get(pick,'ok')}"
         self._DgEmit(lines, (
-            f"CG_DEF_GROSS_SELECT_FINAL,pick={pick},"
-            f"eligible={','.join(e[0] for e in eligible) or 'NONE'},why={why},"
-            f"base_nav={_dg_f(b_nav)},pick_nav={_dg_f(pst['nav'] if pst else None)},"
-            f"base_dd={_dg_f(b_dd)},pick_dd={_dg_f(pst['maxdd'] if pst else None)},"
-            f"base_w5={_dg_f(b_w5,6)},pick_w5={_dg_f(_dg_w5(list(pst['rets'])) if pst else None,6)},"
-            f"base_2015_dd={_dg_f(b_y15)},pick_2015_dd={_dg_f(self._dg_win[(pick,'Y2015')]['maxdd'] if pick!='NONE' else None)},"
-            f"base_2022_dd={_dg_f(b_y22)},pick_2022_dd={_dg_f(self._dg_win[(pick,'Y2022')]['maxdd'] if pick!='NONE' else None)},"
-            f"trade=0"))
+            f"CG_DEF_D1_SELECT_FINAL,pick={pick},"
+            f"eligible={','.join(e[0] for e in eligible) or 'NONE'},"
+            f"why={why},trade=0"))
         for ln in lines: self.log(ln)
-        self.log(f"[EOA] CG_DEF_GROSS_EMIT_DONE,lines={len(lines)},bytes={self._dg_bytes}")
+        self.log(f"[EOA] CG_DEF_D1_EMIT_DONE,lines={len(lines)},bytes={self._dg_bytes}")
