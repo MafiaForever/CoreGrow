@@ -15,6 +15,8 @@ RRX_PARAMS = {
     "cg_rt_ron":                       "15",
     "cg_rt_neu":                       "15",
     "cg_rt_roff":                      "15",
+    "cg_rt_shadow":                    "0",
+    "cg_rt_sh_log":                    "0",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
@@ -125,5 +127,5 @@ RRX_PARAMS = {
     "dyn_rr_add_exp":                  "0.00",
     "dyn_rr_max_exp":                  "0.25",
     # Log filter
-    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_,CG_REGIME_TIME_,CG_REGIME_TIME_TRADE,CG_REGIME_TIME_PENDING,CG_REGIME_TIME_EXEC",
+    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_,CG_REGIME_TIME_,CG_REGIME_TIME_TRADE,CG_REGIME_TIME_PENDING,CG_REGIME_TIME_EXEC,CG_RT_SHADOW_",
 }

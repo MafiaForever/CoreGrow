@@ -301,34 +301,36 @@ class CgRegimeRebalTimeTradeMixin:
         if getattr(self, "_cg_rt_trade_emitted", False):
             return
         self._cg_rt_trade_emitted = True
-        if not getattr(self, "cg_regime_rebal_time_trade_enable", False):
-            # Still emit a compact disabled summary when init ran.
-            try:
-                self.log(
-                    "CG_REGIME_TIME_TRADE_FINAL,ron=15,neutral=15,roff=15,"
-                    "captured=0,immediate=0,deferred=0,executed=0,missed=0,"
-                    "duplicate_blocked=0,unknown_regime=0,trade=0,enable=0"
-                )
-            except Exception:
-                pass
-            return
         try:
-            # Clear any leftover pending as miss
-            if self._cg_rt_pending is not None and not self._cg_rt_pending_executed:
-                self._cg_rt_n_miss += 1
-                self._RtTradeClearPending()
-            self.log(
-                f"CG_REGIME_TIME_TRADE_FINAL,"
-                f"ron={self.cg_rebal_time_risk_on_minutes},"
-                f"neutral={self.cg_rebal_time_neutral_minutes},"
-                f"roff={self.cg_rebal_time_risk_off_minutes},"
-                f"captured={self._cg_rt_n_cap},"
-                f"immediate={self._cg_rt_n_imm},"
-                f"deferred={self._cg_rt_n_def},"
-                f"executed={self._cg_rt_n_exe},"
-                f"missed={self._cg_rt_n_miss},"
-                f"duplicate_blocked={self._cg_rt_n_dup},"
-                f"unknown_regime={self._cg_rt_n_unk},trade=1"
-            )
+            if not getattr(self, "cg_regime_rebal_time_trade_enable", False):
+                try:
+                    self.log(
+                        "CG_REGIME_TIME_TRADE_FINAL,ron=15,neutral=15,roff=15,"
+                        "captured=0,immediate=0,deferred=0,executed=0,missed=0,"
+                        "duplicate_blocked=0,unknown_regime=0,trade=0,enable=0"
+                    )
+                except Exception:
+                    pass
+            else:
+                if self._cg_rt_pending is not None and not self._cg_rt_pending_executed:
+                    self._cg_rt_n_miss += 1
+                    self._RtTradeClearPending()
+                self.log(
+                    f"CG_REGIME_TIME_TRADE_FINAL,"
+                    f"ron={self.cg_rebal_time_risk_on_minutes},"
+                    f"neutral={self.cg_rebal_time_neutral_minutes},"
+                    f"roff={self.cg_rebal_time_risk_off_minutes},"
+                    f"captured={self._cg_rt_n_cap},"
+                    f"immediate={self._cg_rt_n_imm},"
+                    f"deferred={self._cg_rt_n_def},"
+                    f"executed={self._cg_rt_n_exe},"
+                    f"missed={self._cg_rt_n_miss},"
+                    f"duplicate_blocked={self._cg_rt_n_dup},"
+                    f"unknown_regime={self._cg_rt_n_unk},trade=1"
+                )
+        except Exception:
+            pass
+        try:
+            self.CgRegimeTimeShadowS1EmitFinal()
         except Exception:
             pass

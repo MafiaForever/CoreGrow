@@ -5,6 +5,7 @@
 from AlgorithmImports import *
 from cg_regime_rebal_time_diag import CgRegimeRebalTimeDiagMixin
 from cg_regime_rebal_time_trade import CgRegimeRebalTimeTradeMixin
+from cg_regime_time_shadow_s1 import CgRegimeTimeShadowS1Mixin
 
 
 _DFT_DEF = frozenset(("TIP", "BND", "GLD", "GLDM", "BIL", "SGOV", "USFR", "SH"))
@@ -20,7 +21,7 @@ def _dft_tk(s):
             return str(s)
 
 
-class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin, CgRegimeRebalTimeDiagMixin):
+class CgDefensiveTradeMixin(CgRegimeTimeShadowS1Mixin, CgRegimeRebalTimeTradeMixin, CgRegimeRebalTimeDiagMixin):
     """W2 / E2 production overlays. No order calls."""
 
     def CgDefensiveTradeInit(self) -> None:
@@ -53,6 +54,10 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin, CgRegimeRebalTimeDiagMi
             self.CgRegimeRebalTimeTradeInitialize()
         except Exception as exc:
             raise Exception(f"CG_REGIME_TIME_TRADE_T1 init failed: {exc}")
+        try:
+            self.CgRegimeTimeShadowS1Initialize()
+        except Exception:
+            pass
 
     def _DftCashSym(self):
         return getattr(self, "sym_cash", None)
@@ -224,6 +229,10 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin, CgRegimeRebalTimeDiagMi
                 self.CgRegimeRebalTimeDiagCaptureTargets(combined, getattr(self, "current_regime", None))
             except Exception:
                 pass
+            try:
+                self.CgRegimeTimeShadowS1Capture(combined, getattr(self, "current_regime", None))
+            except Exception:
+                pass
             return combined
 
         today = self.time.date()
@@ -280,6 +289,10 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin, CgRegimeRebalTimeDiagMi
 
         try:
             self.CgRegimeRebalTimeDiagCaptureTargets(out, getattr(self, "current_regime", None))
+        except Exception:
+            pass
+        try:
+            self.CgRegimeTimeShadowS1Capture(out, getattr(self, "current_regime", None))
         except Exception:
             pass
         return out
