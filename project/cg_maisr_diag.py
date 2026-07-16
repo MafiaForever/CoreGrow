@@ -158,7 +158,8 @@ class CgMaisrDiagMixin:
         )
         self.log(
             f"CG_MAISR_D0_SUBSCRIPTION_FINAL,panel_n={len(self._ms_all)},"
-            f"excluded={','.join(sorted(self._ms_excluded)) or 'NONE'}"
+            f"excluded={','.join(sorted(self._ms_excluded)) or 'NONE'},"
+            f"mixed_resolution={','.join(getattr(self,'_ms_mixed',[]) or []) or 'NONE'}"
         )
 
     def _MsAuditSubscriptions(self) -> None:
@@ -178,7 +179,10 @@ class CgMaisrDiagMixin:
                     counts[tk] = counts.get(tk, 0) + 1
         except Exception:
             pass
-        avail = {tk for tk in want if counts.get(tk, 0) == 1}
+        # Production often registers tradable symbols twice (m=2). Require >=1
+        # minute feed; report count!=1 as mixed-resolution violations.
+        avail = {tk for tk in want if counts.get(tk, 0) >= 1}
+        self._ms_mixed = sorted(tk for tk in avail if counts.get(tk, 0) != 1)
         self._ms_gold = "GLD" if "GLD" in avail else ("GLDM" if "GLDM" in avail else "GLD")
         roles = {}
         for name, grp in _ROLES.items():

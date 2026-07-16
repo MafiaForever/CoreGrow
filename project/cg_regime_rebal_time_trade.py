@@ -331,16 +331,17 @@ class CgRegimeRebalTimeTradeMixin:
         self._cg_rt_pending_ts = self.time
         self._cg_rt_n_def += 1
         prev_rg = getattr(self, "_cg_rt_last_regime_log", None)
-        if slot != _SIGNAL_SLOT or rg != prev_rg:
+        # Suppress per-event pending logs when shadow/MAISR diag is active
+        # to preserve QC log budget for final diagnostic lines.
+        if (not getattr(self, "_sr_on", False)
+                and (slot != _SIGNAL_SLOT or rg != prev_rg)):
             self.log(
                 f"CG_REGIME_TIME_PENDING,date={self._cg_rt_pending_date},"
                 f"regime={rg},slot={slot},"
                 f"target_count={len(self._cg_rt_pending)},"
                 f"gross={_rtt_gross(self._cg_rt_pending):.4f}"
             )
-            self._cg_rt_last_regime_log = rg
-        else:
-            self._cg_rt_last_regime_log = rg
+        self._cg_rt_last_regime_log = rg
         try:
             if getattr(self, "_sr_on", False):
                 self.CgShadowReplayCapture(combined, rg, slot, False, False)
@@ -415,12 +416,13 @@ class CgRegimeRebalTimeTradeMixin:
                 self.ExecuteTargets(targets)
             self._cg_rt_pending_executed = True
             self._cg_rt_n_exe += 1
-            self.log(
-                f"CG_REGIME_TIME_EXEC,date={d},"
-                f"regime={self._cg_rt_pending_regime},slot={slot_minutes},"
-                f"captured={captured},executed={self.time},"
-                f"delay_minutes={delay},target_count={len(targets)}"
-            )
+            if not getattr(self, "_sr_on", False):
+                self.log(
+                    f"CG_REGIME_TIME_EXEC,date={d},"
+                    f"regime={self._cg_rt_pending_regime},slot={slot_minutes},"
+                    f"captured={captured},executed={self.time},"
+                    f"delay_minutes={delay},target_count={len(targets)}"
+                )
             self._RtTradeClearPending()
             self._RtTradeSaveLive()
         except Exception as exc:
