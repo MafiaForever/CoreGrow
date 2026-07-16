@@ -123,5 +123,5 @@ RRX_PARAMS = {
     "dyn_rr_add_exp":                  "0.00",
     "dyn_rr_max_exp":                  "0.25",
     # Log filter
-    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_,CG_REGIME_TIME_,CG_REGIME_TIME_TRADE,CG_REGIME_TIME_PENDING,CG_REGIME_TIME_EXEC,CG_RT_SHADOW_",
+    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_,CG_REGIME_TIME_,CG_REGIME_TIME_TRADE,CG_REGIME_TIME_PENDING,CG_REGIME_TIME_EXEC",
 }

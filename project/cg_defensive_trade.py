@@ -23,8 +23,19 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
     """W2 / E2 production overlays. No order calls."""
 
     def CgDefensiveTradeInit(self) -> None:
-        self.cg_watch_w2_trade_enable = True
-        self.cg_transition_e2_trade_enable = False
+        ov = getattr(self, "_rrx_param_overrides", {}) or {}
+
+        def _p(k, d=""):
+            v = self.get_parameter(k)
+            if v is None or str(v).strip() == "":
+                v = ov.get(k, d)
+            return v
+
+        def _bool(k, d="0"):
+            return str(_p(k, d) or d).strip().lower() in ("1", "true", "yes", "on")
+
+        self.cg_watch_w2_trade_enable = _bool("cg_watch_w2_trade_enable", "1")
+        self.cg_transition_e2_trade_enable = _bool("cg_transition_e2_trade_enable", "0")
         self._cg_e2_active = False
         self._cg_e2_start_date = None
         self._cg_e2_days = 0
@@ -276,6 +287,10 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
         sd = getattr(self, "_cg_e2_start_date", None)
         state["cg_e2_start_date"] = sd.isoformat() if sd is not None else None
         state["cg_e2_days"] = int(getattr(self, "_cg_e2_days", 0) or 0)
+        try:
+            self.CgRegimeRebalTimeTradePersist(state)
+        except Exception:
+            pass
 
     def CgDefensiveTradeRestore(self, state: dict) -> None:
         if not state:
@@ -291,3 +306,7 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
         else:
             self._cg_e2_start_date = None
         self._cg_e2_days = int(state.get("cg_e2_days") or 0)
+        try:
+            self.CgRegimeRebalTimeTradeRestore(state)
+        except Exception:
+            pass

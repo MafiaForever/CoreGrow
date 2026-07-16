@@ -1,10 +1,12 @@
 # region imports
 from AlgorithmImports import *
+from datetime import date, datetime, timedelta
 # endregion
 # cg_regime_rebal_time_trade.py
-# CG-REGIME-TIME-T1: defer ExecuteTargets to regime-dependent slots.
-# Signal/targets remain calculated at 09:45. Diagnostics do not place orders here;
-# this module reuses production ExecuteTargets. Emergency/reduce-only stay immediate.
+# CG-REGIME-TIME-T1: defer ExecuteTargets to fixed/deferred slots.
+# Signal/targets remain calculated at 09:45. This module reuses production
+# ExecuteTargets. Emergency/reduce-only stay immediate. Live pending snapshots
+# persist across restarts until the scheduled slot executes.
 
 _ALLOWED_SLOTS = frozenset((15, 45, 75, 105, 135, 165, 195, 225, 255, 285, 315, 345, 375))
 _SIGNAL_SLOT = 15  # 09:45 ET
@@ -106,9 +108,16 @@ class CgRegimeRebalTimeTradeMixin:
         self._cg_rt_last_regime_log = None
         self._cg_rt_trade_emitted = False
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_REGIME_TIME_TRADE", "CG_REGIME_TIME_PENDING", "CG_REGIME_TIME_EXEC", "[INIT] CG_REGIME_TIME_TRADE"):
+        for pref in (
+            "CG_REGIME_TIME_TRADE",
+            "CG_REGIME_TIME_PENDING",
+            "CG_REGIME_TIME_EXEC",
+            "[INIT] CG_REGIME_TIME_TRADE",
+        ):
             if pref not in lp:
                 lp.append(pref)
+        # Drop obsolete shadow filter tokens if present from older deploys.
+        lp = [p for p in lp if "CG_RT_SHADOW" not in str(p)]
         self.log_only_prefixes = lp
         self.log(
             f"[INIT] CG_REGIME_TIME_TRADE_T1,"
@@ -118,10 +127,11 @@ class CgRegimeRebalTimeTradeMixin:
         )
         if not self.cg_regime_rebal_time_trade_enable:
             return
-        # Later slots only; slot 15 is handled inside DAILYCycle.
-        for minutes in sorted(_ALLOWED_SLOTS):
-            if minutes == _SIGNAL_SLOT:
-                continue
+        # Unique late slots only; slot 15 is handled inside DAILYCycle.
+        late_slots = sorted(
+            {int(ron), int(neu), int(roff)} - {_SIGNAL_SLOT}
+        )
+        for minutes in late_slots:
             self.schedule.on(
                 self.date_rules.every_day(self.sym_spy),
                 self.time_rules.after_market_open(self.sym_spy, minutes),
@@ -143,6 +153,142 @@ class CgRegimeRebalTimeTradeMixin:
             self._cg_rt_n_unk += 1
             rg = "NEUTRAL"
         return self.cg_rebal_time_neutral_minutes, rg
+
+    def _RtTradeSaveLive(self):
+        try:
+            if getattr(self, "live_mode", False) and hasattr(self, "_SaveState"):
+                self._SaveState()
+        except Exception:
+            pass
+
+    def _RtTradeSlotPassed(self, slot_minutes, now=None):
+        """True if current clock is at/after after_market_open(slot_minutes)."""
+        now = now or self.time
+        slot_minutes = int(slot_minutes)
+        try:
+            hours = self.securities[self.sym_spy].exchange.hours
+            day0 = datetime(now.year, now.month, now.day)
+            open_dt = hours.get_next_market_open(day0 - timedelta(seconds=1), False)
+            if open_dt.date() != now.date():
+                open_dt = hours.get_next_market_open(day0, False)
+            target = open_dt + timedelta(minutes=slot_minutes)
+            return now >= target
+        except Exception:
+            # US equity fallback: 09:30 + slot minutes.
+            mins = 9 * 60 + 30 + slot_minutes
+            return (now.hour * 60 + now.minute) >= mins
+
+    def _RtTradeResolveTargets(self, ticker_weights):
+        ticker_to_sym = {}
+        for sym in getattr(self, "active_symbols", set()) or []:
+            try:
+                ticker_to_sym[_rtt_tk(sym)] = sym
+            except Exception:
+                continue
+        try:
+            for sym in self.securities.keys():
+                try:
+                    ticker_to_sym.setdefault(_rtt_tk(sym), sym)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        out = {}
+        for tk, w in (ticker_weights or {}).items():
+            sym = ticker_to_sym.get(str(tk))
+            if sym is None:
+                continue
+            try:
+                out[sym] = float(w)
+            except Exception:
+                continue
+        return out
+
+    def CgRegimeRebalTimeTradePersist(self, state: dict) -> None:
+        if self._cg_rt_pending is None or self._cg_rt_pending_executed:
+            state["cg_rt_pending"] = None
+            return
+        targets = {}
+        for sym, w in (self._cg_rt_pending or {}).items():
+            try:
+                targets[_rtt_tk(sym)] = float(w)
+            except Exception:
+                continue
+        if not targets:
+            state["cg_rt_pending"] = None
+            return
+        pd = self._cg_rt_pending_date
+        ts = self._cg_rt_pending_ts
+        state["cg_rt_pending"] = {
+            "targets": targets,
+            "date": pd.isoformat() if pd is not None else None,
+            "regime": self._cg_rt_pending_regime,
+            "slot": int(self._cg_rt_pending_slot) if self._cg_rt_pending_slot is not None else None,
+            "ts": ts.isoformat() if ts is not None else None,
+            "reduce": bool(self._cg_rt_pending_reduce),
+            "executed": bool(self._cg_rt_pending_executed),
+        }
+
+    def CgRegimeRebalTimeTradeRestore(self, state: dict) -> None:
+        if not state:
+            return
+        if getattr(self, "IsWarmingUp", False) or getattr(self, "is_warming_up", False):
+            return
+        if not getattr(self, "cg_regime_rebal_time_trade_enable", False):
+            return
+        raw = state.get("cg_rt_pending")
+        if not raw or not isinstance(raw, dict):
+            return
+        if bool(raw.get("executed")):
+            return
+        try:
+            pd = date.fromisoformat(str(raw.get("date") or "")[:10])
+        except Exception:
+            return
+        today = self.time.date()
+        if pd != today:
+            # Stale prior-day pending — discard silently (miss already counted or EOD).
+            return
+        try:
+            slot = int(raw.get("slot"))
+        except Exception:
+            return
+        if slot not in _ALLOWED_SLOTS or slot == _SIGNAL_SLOT:
+            return
+        fixed = int(getattr(self, "cg_rebal_time_fixed_minutes", -1))
+        if fixed >= 0 and slot != fixed:
+            return
+        if self._RtTradeSlotPassed(slot):
+            self.log(
+                f"CG_REGIME_TIME_TRADE_MISSED,date={pd},"
+                f"regime={raw.get('regime')},slot={slot},"
+                f"reason=restart_after_slot"
+            )
+            self._cg_rt_n_miss += 1
+            self._RtTradeClearPending()
+            self._RtTradeSaveLive()
+            return
+        targets = self._RtTradeResolveTargets(raw.get("targets") or {})
+        if not targets:
+            return
+        self._cg_rt_pending = targets
+        self._cg_rt_pending_date = pd
+        self._cg_rt_pending_regime = raw.get("regime")
+        self._cg_rt_pending_slot = slot
+        self._cg_rt_pending_executed = False
+        self._cg_rt_pending_reduce = bool(raw.get("reduce"))
+        ts_raw = raw.get("ts")
+        try:
+            self._cg_rt_pending_ts = (
+                datetime.fromisoformat(str(ts_raw)) if ts_raw else self.time
+            )
+        except Exception:
+            self._cg_rt_pending_ts = self.time
+        self.log(
+            f"CG_REGIME_TIME_PENDING,date={pd},regime={self._cg_rt_pending_regime},"
+            f"slot={slot},target_count={len(targets)},"
+            f"gross={_rtt_gross(targets):.4f},restored=1"
+        )
 
     def CgRegimeRebalTimeTradeCapture(self, combined, regime, reduce_only=False, force_immediate=False) -> bool:
         """Return True => execute now; False => deferred (do not ExecuteTargets)."""
@@ -179,6 +325,7 @@ class CgRegimeRebalTimeTradeMixin:
                 f"gross={_rtt_gross(self._cg_rt_pending):.4f}"
             )
             self._cg_rt_last_regime_log = rg
+        self._RtTradeSaveLive()
         return False
 
     def CgRegimeRebalTimeTradeMaybeRun(self, combined, reduce_only=False, force_immediate=False) -> None:
@@ -226,6 +373,7 @@ class CgRegimeRebalTimeTradeMixin:
                 )
                 self._cg_rt_n_miss += 1
                 self._RtTradeClearPending()
+                self._RtTradeSaveLive()
                 return
             captured = self._cg_rt_pending_ts
             delay = 0
@@ -248,6 +396,7 @@ class CgRegimeRebalTimeTradeMixin:
                 f"delay_minutes={delay},target_count={len(targets)}"
             )
             self._RtTradeClearPending()
+            self._RtTradeSaveLive()
         except Exception as exc:
             try:
                 self.log(
@@ -279,9 +428,11 @@ class CgRegimeRebalTimeTradeMixin:
             if d is not None and d != self.time.date():
                 # Already stale from prior day — clear without double miss if already logged.
                 self._RtTradeClearPending()
+                self._RtTradeSaveLive()
                 return
             if self._cg_rt_pending_executed:
                 self._RtTradeClearPending()
+                self._RtTradeSaveLive()
                 return
             self.log(
                 f"CG_REGIME_TIME_TRADE_MISSED,date={d},"
@@ -291,6 +442,7 @@ class CgRegimeRebalTimeTradeMixin:
             )
             self._cg_rt_n_miss += 1
             self._RtTradeClearPending()
+            self._RtTradeSaveLive()
         except Exception:
             try:
                 self._RtTradeClearPending()
