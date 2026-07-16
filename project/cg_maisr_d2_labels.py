@@ -324,10 +324,10 @@ class CgMaisrD2LabelMixin:
         dur_ok, gold_ok = bool(dur_vals), bool(gold_vals)
         dur_mae = sum(dur_vals) / len(dur_vals) if dur_ok else 0.0
         gold_mae = sum(gold_vals) / len(gold_vals) if gold_ok else 0.0
-        infl_vals = [stats[t]["raw_ret"] for t in _D2_INFL if t in stats]
-        spy_raw = spy.get("raw_ret", 0.0)
-        infl_rel = (sum(infl_vals) / len(infl_vals) - spy_raw) if infl_vals else 0.0
-        def_vals = [stats[t]["raw_ret"] - spy_raw for t in _D2_DEF if t in stats]
+        # ATR-normalized relative returns (raw 0.15–0.25 in 60m is impossible).
+        infl_vals = [stats[t]["ret"] for t in _D2_INFL if t in stats]
+        infl_rel = (sum(infl_vals) / len(infl_vals) - spy["ret"]) if infl_vals else 0.0
+        def_vals = [stats[t]["ret"] - spy["ret"] for t in _D2_DEF if t in stats]
         def_rel = max(def_vals) if def_vals else 0.0
 
         outcomes = {}
