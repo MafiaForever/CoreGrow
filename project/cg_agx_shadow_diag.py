@@ -876,6 +876,16 @@ class CgAgxShadowDiagMixin:
             elif front:
                 next_dec = "REFINE_AGX"
 
+            try:
+                self.set_runtime_statistic("AGX_PARITY", str(int(parity)))
+                self.set_runtime_statistic("AGX_NEXT", str(next_dec))
+                self.set_runtime_statistic("AGX_D0", str(len(d0s)))
+                self.set_runtime_statistic("AGX_BEST", str((best or {}).get("id", "NONE")))
+                if best:
+                    self.set_runtime_statistic("AGX_BEST_CAGR", _f(best.get("CAGR")))
+                    self.set_runtime_statistic("AGX_BEST_DD", _f(best.get("MaxDD")))
+            except Exception:
+                pass
             self._AgxLog(
                 f"CG_AGX_SHADOW_FINAL,diagnostic_valid={diagnostic_valid},"
                 f"selection_allowed={selection_allowed},policies={len(rows)},"
