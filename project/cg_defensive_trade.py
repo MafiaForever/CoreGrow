@@ -59,6 +59,10 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
             self.CgRegimeRebalTimeTradeInitialize()
         except Exception as exc:
             raise Exception(f"CG_REGIME_TIME_TRADE_T1 init failed: {exc}")
+        try:
+            self.CgAgxShadowInit()
+        except Exception:
+            pass
 
     def _DftCashSym(self):
         return getattr(self, "sym_cash", None)

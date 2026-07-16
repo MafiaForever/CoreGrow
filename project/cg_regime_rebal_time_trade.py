@@ -301,11 +301,25 @@ class CgRegimeRebalTimeTradeMixin:
         if force_immediate or reduce_only:
             self._cg_rt_n_cap += 1
             self._cg_rt_n_imm += 1
+            try:
+                if getattr(self, "cg_agx_shadow_diag_enable", False):
+                    self.CgAgxShadowCapture(
+                        combined, regime, _SIGNAL_SLOT,
+                        reduce_only=bool(reduce_only),
+                        emergency=bool(force_immediate and not reduce_only),
+                    )
+            except Exception:
+                pass
             return True
         slot, rg = self._RtTradeSlotForRegime(regime)
         self._cg_rt_n_cap += 1
         if slot == _SIGNAL_SLOT:
             self._cg_rt_n_imm += 1
+            try:
+                if getattr(self, "cg_agx_shadow_diag_enable", False):
+                    self.CgAgxShadowCapture(combined, rg, slot, False, False)
+            except Exception:
+                pass
             return True
         # Defer
         self._cg_rt_pending = dict(combined)
@@ -325,6 +339,11 @@ class CgRegimeRebalTimeTradeMixin:
                 f"gross={_rtt_gross(self._cg_rt_pending):.4f}"
             )
             self._cg_rt_last_regime_log = rg
+        try:
+            if getattr(self, "cg_agx_shadow_diag_enable", False):
+                self.CgAgxShadowCapture(combined, rg, slot, False, False)
+        except Exception:
+            pass
         self._RtTradeSaveLive()
         return False
 
@@ -383,6 +402,11 @@ class CgRegimeRebalTimeTradeMixin:
             except Exception:
                 delay = int(slot_minutes) - _SIGNAL_SLOT
             reduce_only = bool(self._cg_rt_pending_reduce)
+            try:
+                if getattr(self, "cg_agx_shadow_diag_enable", False):
+                    self.CgAgxShadowExecutePending()
+            except Exception:
+                pass
             if reduce_only:
                 self.ExecuteTargets(targets, reduce_only=True)
             else:
@@ -480,5 +504,9 @@ class CgRegimeRebalTimeTradeMixin:
                     f"duplicate_blocked={self._cg_rt_n_dup},"
                     f"unknown_regime={self._cg_rt_n_unk},trade=1"
                 )
+        except Exception:
+            pass
+        try:
+            self.CgAgxShadowEmitFinal()
         except Exception:
             pass
