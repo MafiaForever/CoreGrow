@@ -414,6 +414,11 @@ class CgRegimeRebalTimeTradeMixin:
                 self.ExecuteTargets(targets, reduce_only=True)
             else:
                 self.ExecuteTargets(targets)
+            try:
+                if getattr(self, "_agx_enabled", False):
+                    self.CgAgxShadowAuditPostExec()
+            except Exception:
+                pass
             self._cg_rt_pending_executed = True
             self._cg_rt_n_exe += 1
             if not getattr(self, "cg_agx_shadow_diag_enable", False):

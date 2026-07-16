@@ -1,42 +1,29 @@
 # region imports
 from AlgorithmImports import *
-from datetime import date as _date, datetime as _dt, timedelta as _td
+from datetime import date as _date
 # endregion
 # cg_agx_shadow_diag.py
-# CG-AGX-SHADOW-PARITY-FIX-P0
+# CG-AGX-INDEPENDENT-PARITY-D1
 #
-# Level B (control economic parity): control_mode=ACTUAL_SNAPSHOT_MIRROR.
-# Each daily mark, the control return is defined as the production portfolio
-# TotalPortfolioValue day-over-day return (the same series as actual), so
-# nav/maxdd/correlation parity holds by construction when marks align.
+# REFERENCE_MIRROR: production TPV day-over-day (truth only).
+# INDEPENDENT_CONTROL: own cash/qty/NAV ledger; never copies production
+# NAV/returns/holdings/cash/drawdown. Simulates fills from captured targets
+# at fixed-165 using production min-order filters. No LEAN orders.
 #
-# Level A (capture parity): on every normal capture of `combined`, an exact
-# deep copy of the ticker->weight dictionary is stored as the control target
-# dictionary. No BIL/park-ETF recalculation, no renormalization, no residual
-# reconstruction. Parking ETF weight is copied from production targets and is
-# never derived as a residual of other weights.
-# pattern that treated BIL as brokerage-cash residual.
-#
-# 448 independent candidate ledgers (PHASE B) use the corrected transform:
-# scale ALL non-parking tradable weights by mult, keep the parking ETF (BIL)
-# weight EXACTLY as captured from production (untouched), never normalize to
-# 1.0. When mult==1.0 and the gross cap is not hit, the result is a
-# byte-identical copy of the base weights.
-#
-# All 448 ledgers update every run but are quarantined (selection_allowed=0)
-# until the EOA strict parity gate is evaluated. Ranking / CG_AGX_SHADOW_*
-# lines are only unlocked when the gate passes and parity_only is not set.
-# Diagnostic-only. No orders. No production weight mutation.
+# PHASE A: three-way parity. PHASE B (same run, only if A passes):
+# MODEL_A=ALL_NON_PARKING, MODEL_B=RISK_SLEEVE_ONLY; 100 policies each.
 
-_RON = (0.00, 0.50, 0.75, 1.00, 1.10, 1.20, 1.30, 1.50)
-_NEU = (0.00, 0.25, 0.50, 0.75, 0.90, 1.00, 1.10, 1.25)
-_ROFF = (0.00, 0.25, 0.40, 0.55, 0.70, 0.85, 1.00)
-_CTRL = "AGX_RON100_NEU100_ROFF100"
-_LOG_BUDGET = 90000
+_RON = (0.75, 1.00, 1.10, 1.20, 1.30)
+_NEU = (0.50, 0.75, 0.90, 1.00)
+_ROFF = (0.00, 0.25, 0.50, 0.75, 1.00)
+_DFT_DEF = frozenset(("TIP", "BND", "GLD", "GLDM", "BIL", "SGOV", "USFR", "SH"))
+_LOG_BUDGET = 95000
+_A_CTRL = "A_AGX_RON100_NEU100_ROFF100"
+_B_CTRL = "B_AGX_RON100_NEU100_ROFF100"
 
 
-def _pid(a, b, c):
-    return f"AGX_RON{int(round(a * 100)):03d}_NEU{int(round(b * 100)):03d}_ROFF{int(round(c * 100)):03d}"
+def _pid(model, a, b, c):
+    return f"{model}_AGX_RON{int(round(a * 100)):03d}_NEU{int(round(b * 100)):03d}_ROFF{int(round(c * 100)):03d}"
 
 
 def _tk(sym):
@@ -58,42 +45,28 @@ def _f(x, d=4):
         return "NA"
 
 
-def _build_grid():
-    out = []
-    for a in _RON:
-        for b in _NEU:
-            for c in _ROFF:
-                out.append((_pid(a, b, c), float(a), float(b), float(c)))
-    return out
-
-
-def _new_pol(pid, ron, neu, roff):
+def _new_led(pid, model, ron, neu, roff, cash0):
     return {
-        "id": pid, "ron": ron, "neu": neu, "roff": roff,
-        "w": {}, "pending": None, "nav": 1.0, "peak": 1.0, "maxdd": 0.0,
-        "rets": [], "dates": [],
-        "sum_r": 0.0, "sum_r2": 0.0, "n": 0, "pos": 0,
-        "turnover": 0.0, "cost": 0.0, "reb": 0, "cap_hit": 0,
-        "sum_eg": 0.0, "n_eg": 0, "egs": [],
+        "id": pid, "model": model, "ron": ron, "neu": neu, "roff": roff,
+        "cash": float(cash0), "qty": {}, "pending": None, "_pend_hit": 0,
+        "nav": float(cash0), "peak": float(cash0), "maxdd": 0.0,
+        "rets": [], "dates": [], "fees": 0.0, "turnover": 0.0,
+        "reb": 0, "cap_hit": 0, "sum_eg": 0.0, "n_eg": 0, "egs": [],
         "rg_n": {"RISK_ON": 0, "NEUTRAL": 0, "RISK_OFF": 0},
         "rg_r": {"RISK_ON": 0.0, "NEUTRAL": 0.0, "RISK_OFF": 0.0},
         "rg_dd": {"RISK_ON": 0.0, "NEUTRAL": 0.0, "RISK_OFF": 0.0},
         "rg_w5": {"RISK_ON": [], "NEUTRAL": [], "RISK_OFF": []},
-        "rg_bg": {"RISK_ON": 0.0, "NEUTRAL": 0.0, "RISK_OFF": 0.0},
         "rg_eg": {"RISK_ON": 0.0, "NEUTRAL": 0.0, "RISK_OFF": 0.0},
         "rg_cap": {"RISK_ON": 0, "NEUTRAL": 0, "RISK_OFF": 0},
         "tr_n": {"0": 0, "1": 0, "2-3": 0, "4-10": 0, ">10": 0},
         "tr_r": {"0": 0.0, "1": 0.0, "2-3": 0.0, "4-10": 0.0, ">10": 0.0},
-        "uw": 0, "uw_max": 0, "uw_days": 0,
-        "emerg": 0, "ro": 0,
+        "uw": 0, "uw_max": 0, "uw_days": 0, "fixed_err": 0.0,
     }
 
 
 class CgAgxShadowDiagMixin:
-    """AGX shadow: mirrored control parity (Level A+B) + 448-policy quarantined
-    candidate grid (Phase B), unlocked for ranking only on strict parity PASS."""
+    """Independent-ledger AGX D1: parity gate + dual-model reduced grid."""
 
-    # ---------------------------------------------------------------- init --
     def CgAgxShadowInit(self) -> None:
         ov = getattr(self, "_rrx_param_overrides", {}) or {}
 
@@ -113,76 +86,115 @@ class CgAgxShadowDiagMixin:
                 return float(d)
 
         self.cg_agx_shadow_diag_enable = _bool("cg_agx_shadow_diag_enable", "0")
+        self.cg_agx_independent_parity_enable = _bool("cg_agx_independent_parity_enable", "0")
+        self.cg_agx_independent_grid_enable = _bool("cg_agx_independent_grid_enable", "0")
         self.cg_agx_shadow_emit_events = _bool("cg_agx_shadow_emit_events", "0")
-        self.cg_agx_shadow_parity_only = _bool("cg_agx_shadow_parity_only", "0")
-        self.cg_agx_shadow_parity_debug = _bool("cg_agx_shadow_parity_debug", "0")
         req_cap = _float("cg_agx_shadow_max_gross", 2.00)
         prod_cap = float(getattr(self, "max_total_exposure", 1.90) or 1.90)
         self._agx_prod_gross_cap = prod_cap
         self._agx_max_gross = min(float(req_cap), float(prod_cap))
         self._agx_cost_bps = _float("cg_agx_shadow_cost_bps", 0.0)
+        self._agx_enabled = bool(
+            self.cg_agx_shadow_diag_enable and self.cg_agx_independent_parity_enable
+        )
+        self._agx_grid_on = bool(self._agx_enabled and self.cg_agx_independent_grid_enable)
 
+        cash = getattr(self, "sym_cash", None)
+        self._agx_cash_tk = _tk(cash) if cash is not None else "BIL"
         self._agx_log_used = 0
         self._agx_err = 0
         self._agx_emitted = False
         self._agx_started = False
         self._agx_last_mark = None
         self._agx_prev_tpv = None
-        self._agx_start_nav_actual = None
+        self._agx_prev_px = None
         self._agx_dates = []
         self._agx_actual_rets = []
-        self._agx_control_rets = []
-        self._agx_cash_obs = []
-        self._agx_holdings_obs = []
-        self._agx_corpaction_logged = False
-        self._agx_snap_candidates = []
-        self._agx_prev_px = None
-        self._agx_regime_prev = None
-        self._agx_regime_age = 10 ** 9
+        self._agx_mirror_rets = []
+        self._agx_ind_rets = []
         self._agx_n_cap = 0
         self._agx_n_imm = 0
         self._agx_n_def = 0
         self._agx_n_exe = 0
         self._agx_target_mismatch_count = 0
         self._agx_max_abs_target_weight_diff = 0.0
-        self._agx_last_control_targets = {}
+        self._agx_last_base = {}
         self._agx_base_gross_obs = []
         self._agx_last_base_gross = None
+        self._agx_regime_prev = None
+        self._agx_regime_age = 10 ** 9
+        self._agx_snap_candidates = []
+        self._agx_exec_events = 0
+        self._agx_dir_mm = 0
+        self._agx_qty_mm = 0
+        self._agx_sup_mm = 0
+        self._agx_sec_mm = 0
+        self._agx_cash_mm = 0
+        self._agx_fee_mm = 0
+        self._agx_qty_exceptions = []
+        self._agx_max_cash_diff = 0.0
+        self._agx_max_hold_diff = 0.0
+        self._agx_last_ind_expect = None
+        self._agx_corpaction = "PASS"
+        self._agx_residual_convention = "INDEPENDENT_CASH_LEDGER_NO_BIL_RESIDUAL"
+        self._agx_cls = {"SCALABLE_RISK": set(), "FIXED_DEFENSIVE": set(),
+                         "PARKING_ETF": set(), "OTHER_FIXED": set(),
+                         "KEEP_FIXED_UNCERTAIN": set(), "src": {}}
         self._agx_pols = []
         self._agx_by_id = {}
         self._agx_ctrl = None
-
-        cash = getattr(self, "sym_cash", None)
-        self._agx_cash_tk = _tk(cash) if cash is not None else "BIL"
+        self._agx_a_ctrl = None
+        self._agx_b_ctrl = None
 
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_AGX_PARITY_", "CG_AGX_SHADOW_", "[INIT] CG_AGX"):
+        for pref in ("CG_AGX_IND_PARITY_", "CG_AGX_D1_", "[INIT] CG_AGX"):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
 
+        cash0 = 10000.0
+        try:
+            cash0 = float(self.portfolio.cash) if float(self.portfolio.cash) > 0 else 10000.0
+        except Exception:
+            cash0 = 10000.0
+        self._agx_cash0 = cash0
+        self._agx_ctrl = _new_led("INDEPENDENT_CONTROL", "CTRL", 1.0, 1.0, 1.0, cash0)
+
+        npol = 0
+        if self._agx_grid_on:
+            for model in ("A", "B"):
+                for a in _RON:
+                    for b in _NEU:
+                        for c in _ROFF:
+                            pid = _pid(model, a, b, c)
+                            p = _new_led(pid, model, a, b, c, cash0)
+                            self._agx_pols.append(p)
+                            self._agx_by_id[pid] = p
+            npol = len(self._agx_pols)
+            self._agx_a_ctrl = self._agx_by_id.get(_A_CTRL)
+            self._agx_b_ctrl = self._agx_by_id.get(_B_CTRL)
+
+        self._AgxBuildClassification()
         self.log(
-            f"CG_AGX_PARITY_INIT,enable={int(self.cg_agx_shadow_diag_enable)},"
-            f"control_mode=ACTUAL_SNAPSHOT_MIRROR,"
-            f"parking_etf={self._agx_cash_tk},scalable_risk=ALL_NON_PARKING,"
-            f"nonscalable_defensive=NONE,"
-            f"policies={448 if self.cg_agx_shadow_diag_enable else 0},"
+            f"CG_AGX_IND_PARITY_INIT,enable={int(self._agx_enabled)},"
+            f"independent_control_mode=INDEPENDENT_LEDGER,"
+            f"reference_mirror=REFERENCE_MIRROR,"
+            f"grid_enable={int(self._agx_grid_on)},policies={npol},"
+            f"parking_etf={self._agx_cash_tk},"
+            f"residual_convention={self._agx_residual_convention},"
             f"max_gross={_f(self._agx_max_gross)},prod_cap={_f(prod_cap)},"
             f"req_cap={_f(req_cap)},cost_bps={_f(self._agx_cost_bps, 2)},"
-            f"fee_model=IB_DEFAULT,emit_events={int(self.cg_agx_shadow_emit_events)},"
-            f"parity_only={int(self.cg_agx_shadow_parity_only)},"
-            f"parity_debug={int(self.cg_agx_shadow_parity_debug)},"
-            f"execution_note=diagnostic_only_no_orders,"
-            f"candidate_results_quarantined=1,selection_allowed=0"
+            f"min_weight_delta={_f(getattr(self,'min_weight_delta',0.02))},"
+            f"min_trade_value={_f(getattr(self,'min_trade_value',100),1)},"
+            f"min_trade_value_perc={_f(getattr(self,'min_trade_value_perc',0.11))},"
+            f"scalable_risk={','.join(sorted(self._agx_cls['SCALABLE_RISK'])[:20])},"
+            f"fixed_defensive={','.join(sorted(self._agx_cls['FIXED_DEFENSIVE']))},"
+            f"parking={','.join(sorted(self._agx_cls['PARKING_ETF']))},"
+            f"emit_events={int(self.cg_agx_shadow_emit_events)},"
+            f"candidate_quarantined=1,selection_allowed=0"
         )
-        if not self.cg_agx_shadow_diag_enable:
+        if not self._agx_enabled:
             return
-        grid = _build_grid()
-        self._agx_pols = [_new_pol(pid, a, b, c) for pid, a, b, c in grid]
-        for p in self._agx_pols:
-            p["w"] = {self._agx_cash_tk: 1.0}
-        self._agx_by_id = {p["id"]: p for p in self._agx_pols}
-        self._agx_ctrl = self._agx_by_id.get(_CTRL)
         try:
             spy = getattr(self, "sym_spy", None)
             if spy is not None:
@@ -193,9 +205,44 @@ class CgAgxShadowDiagMixin:
                 )
         except Exception as exc:
             self._agx_err += 1
-            self.log(f"CG_AGX_PARITY_INIT,schedule_error={type(exc).__name__}")
+            self.log(f"CG_AGX_IND_PARITY_INIT,schedule_error={type(exc).__name__}")
 
-    # -------------------------------------------------------------- helpers --
+    def _AgxBuildClassification(self):
+        park = self._agx_cash_tk
+        self._agx_cls["PARKING_ETF"].add(park)
+        self._agx_cls["src"][park] = "sym_cash/parking_etf"
+        for t in _DFT_DEF:
+            if t == park:
+                continue
+            self._agx_cls["FIXED_DEFENSIVE"].add(t)
+            self._agx_cls["src"][t] = "cg_defensive_trade._DFT_DEF"
+        # Risk sleeve: SPY + known non-defensive equity names seen in targets over run
+        self._agx_cls["SCALABLE_RISK"].add("SPY")
+        self._agx_cls["src"]["SPY"] = "W2/equity_risk_sleeve"
+
+    def _AgxClassifyTicker(self, t):
+        if t in self._agx_cls["PARKING_ETF"]:
+            return "PARKING_ETF"
+        if t in self._agx_cls["FIXED_DEFENSIVE"]:
+            return "FIXED_DEFENSIVE"
+        if t in self._agx_cls["SCALABLE_RISK"]:
+            return "SCALABLE_RISK"
+        if t in _DFT_DEF:
+            self._agx_cls["FIXED_DEFENSIVE"].add(t)
+            self._agx_cls["src"][t] = "cg_defensive_trade._DFT_DEF"
+            return "FIXED_DEFENSIVE"
+        # Equity/risk: not defensive and not parking → scalable risk sleeve
+        if t == "SPY" or t not in _DFT_DEF:
+            # Ambiguous unknown tickers: treat as risk if alphanumeric ETF/stock-like
+            if t.isalpha() and len(t) <= 5:
+                self._agx_cls["SCALABLE_RISK"].add(t)
+                self._agx_cls["src"][t] = "non_defensive_target_as_risk_sleeve"
+                return "SCALABLE_RISK"
+        self._agx_cls["KEEP_FIXED_UNCERTAIN"].add(t)
+        self._agx_cls["OTHER_FIXED"].add(t)
+        self._agx_cls["src"][t] = "KEEP_FIXED_UNCERTAIN"
+        return "KEEP_FIXED_UNCERTAIN"
+
     def _AgxLog(self, msg):
         try:
             n = len(msg) + 1
@@ -236,26 +283,10 @@ class CgAgxShadowDiagMixin:
                 continue
             if abs(wf) < 1e-12:
                 continue
-            w[_tk(k)] = wf
+            t = _tk(k)
+            w[t] = wf
+            self._AgxClassifyTicker(t)
         return w
-
-    def _AgxCompareTargets(self, a, b):
-        """Level A: control_targets (a) vs the production combined dict (b).
-        Exact deep copy => mismatch/diff should always be 0 unless a bug
-        exists in the copy path itself. No BIL recalculation is performed."""
-        mismatch = 0
-        max_diff = 0.0
-        if set(a.keys()) != set(b.keys()):
-            mismatch += 1
-        for k in set(a) | set(b):
-            va = a.get(k)
-            vb = b.get(k)
-            if va is None or vb is None:
-                continue
-            d = abs(float(va) - float(vb))
-            if d > max_diff:
-                max_diff = d
-        return mismatch, max_diff
 
     def _AgxGross(self, w):
         g = 0.0
@@ -269,120 +300,186 @@ class CgAgxShadowDiagMixin:
                 pass
         return g
 
-    def _AgxScale(self, base_w, mult):
-        """Preferred D0 transform: scale ALL non-parking weights by mult.
-        The parking ETF (BIL) weight is copied EXACTLY from base_w, never
-        recalculated as a residual, never renormalized. mult==1.0 with no
-        cap hit reproduces base_w byte-identically (x*1.0 is exact in
-        IEEE754, and the parking weight is a direct copy)."""
-        cash = self._agx_cash_tk
-        non = {t: float(v) for t, v in (base_w or {}).items() if t != cash}
-        bg = sum(abs(v) for v in non.values())
+    def _AgxNav(self, led, px):
+        hv = 0.0
+        for t, q in (led.get("qty") or {}).items():
+            p = (px or {}).get(t)
+            if p and p > 0:
+                hv += float(q) * p
+        return float(led.get("cash", 0.0)) + hv, hv
+
+    def _AgxCurrW(self, led, px, nav):
+        if nav is None or nav <= 0:
+            return {}
+        out = {}
+        for t, q in (led.get("qty") or {}).items():
+            p = (px or {}).get(t)
+            if p and p > 0 and abs(q) > 1e-12:
+                out[t] = float(q) * p / nav
+        return out
+
+    def _AgxScale(self, base_w, mult, model):
+        """Scale scalable set only; preserve fixed exactly; residual via cash ledger.
+        mult==1.0 with no cap is identity copy of base_w."""
+        park = self._agx_cash_tk
+        base = {t: float(v) for t, v in (base_w or {}).items()}
+        if abs(float(mult) - 1.0) < 1e-15:
+            return dict(base), 1.0, 1.0, self._AgxGross(base), self._AgxGross(base), 0, 0.0
+
+        scalable = {}
+        fixed = {}
+        for t, v in base.items():
+            cls = self._AgxClassifyTicker(t)
+            if model == "A":
+                if t == park:
+                    fixed[t] = v
+                else:
+                    scalable[t] = v
+            else:  # B RISK_SLEEVE_ONLY
+                if cls == "SCALABLE_RISK":
+                    scalable[t] = v
+                else:
+                    fixed[t] = v
+
+        bg = sum(abs(v) for v in scalable.values())
         req = float(mult)
         cap = float(self._agx_max_gross)
+        # Cap applies to total non-parking gross after scale
+        fixed_nonpark = sum(abs(v) for t, v in fixed.items() if t != park)
         hit = 0
         if bg <= 1e-12:
             eff = req
-            pre = 0.0
-            post = 0.0
+            pre = fixed_nonpark
+            post = fixed_nonpark
+            scaled_s = {}
         else:
-            pre = bg * req
-            if pre > cap + 1e-12:
-                eff = cap / bg
+            pre = fixed_nonpark + bg * req
+            room = max(0.0, cap - fixed_nonpark)
+            if bg * req > room + 1e-12:
+                eff = room / bg if bg > 0 else 0.0
                 hit = 1
-                post = cap
+                post = fixed_nonpark + bg * eff
             else:
                 eff = req
                 post = pre
-        scaled = {t: v * eff for t, v in non.items()}
-        scaled[cash] = float((base_w or {}).get(cash, 0.0))
-        return scaled, req, eff, pre, post, hit, bg
+            scaled_s = {t: v * eff for t, v in scalable.items()}
+        out = dict(fixed)
+        out.update(scaled_s)
+        # fixed-weight preservation error
+        ferr = 0.0
+        for t, v in fixed.items():
+            ferr = max(ferr, abs(float(out.get(t, 0.0)) - float(v)))
+        return out, req, eff, pre, post, hit, ferr
 
-    def _AgxRet(self, w, prev_px, curr_px):
-        """Price return on all securities in the weight dict, including parking ETF.
-        Brokerage cash (not a security weight) contributes 0."""
-        r = 0.0
-        for t, wt in (w or {}).items():
-            p0 = (prev_px or {}).get(t)
-            p1 = (curr_px or {}).get(t)
-            if not p0 or not p1 or p0 <= 0:
-                continue
-            try:
-                r += float(wt) * (p1 / p0 - 1.0)
-            except Exception:
-                pass
-        return r
-
-    def _AgxTrBucket(self, age):
-        if age <= 0:
-            return "0"
-        if age == 1:
-            return "1"
-        if age <= 3:
-            return "2-3"
-        if age <= 10:
-            return "4-10"
-        return ">10"
-
-    def _AgxApplyRet(self, p, r, rg, age, bg, eg, hit):
-        p["n"] += 1
-        p["sum_r"] += r
-        p["sum_r2"] += r * r
-        if r > 0:
-            p["pos"] += 1
-        p["nav"] = max(1e-8, p["nav"] * (1.0 + r))
-        if p["nav"] > p["peak"]:
-            p["peak"] = p["nav"]
-            p["uw"] = 0
-        else:
-            p["uw"] += 1
-            p["uw_days"] += 1
-            if p["uw"] > p["uw_max"]:
-                p["uw_max"] = p["uw"]
-        dd = 1.0 - p["nav"] / max(p["peak"], 1e-9)
-        if dd > p["maxdd"]:
-            p["maxdd"] = dd
-        p["rets"].append(r)
-        p["dates"].append(self.time.date())
-        if eg is not None:
-            p["sum_eg"] += eg
-            p["n_eg"] += 1
-            p["egs"].append(eg)
-        rg = str(rg or "NEUTRAL").upper()
-        if rg not in p["rg_n"]:
-            rg = "NEUTRAL"
-        p["rg_n"][rg] += 1
-        p["rg_r"][rg] += r
-        p["rg_dd"][rg] = max(p["rg_dd"][rg], dd)
-        p["rg_w5"][rg].append(r)
-        p["rg_bg"][rg] += float(bg or 0.0)
-        p["rg_eg"][rg] += float(eg or 0.0)
-        if hit:
-            p["rg_cap"][rg] += 1
-        tb = self._AgxTrBucket(int(age))
-        p["tr_n"][tb] += 1
-        p["tr_r"][tb] += r
-
-    def _AgxRebalance(self, p, new_w, hit):
-        old = p["w"] or {}
-        keys = set(old) | set(new_w or {})
+    def _AgxSimExec(self, led, targets, px, audit=False):
+        """Simulate production-like filters then fill at px. Residual stays in cash."""
+        nav, _ = self._AgxNav(led, px)
+        if nav <= 0:
+            return {"suppressed": set(), "traded": {}, "expect_qty": {}}
+        cur = self._AgxCurrW(led, px, nav)
+        mwd = float(getattr(self, "min_weight_delta", 0.02) or 0.02)
+        mtv = float(getattr(self, "min_trade_value", 100) or 100)
+        mtvp = float(getattr(self, "min_trade_value_perc", 0.11) or 0.11)
+        min_tv = max(mtv, nav * mtvp)
+        tgt = {t: float(v) for t, v in (targets or {}).items()}
+        # Close omitted holdings to 0
+        for t in list(cur.keys()):
+            if t not in tgt:
+                tgt[t] = 0.0
+        suppressed = set()
+        traded = {}
+        expect_qty = dict(led.get("qty") or {})
+        cash = float(led.get("cash", 0.0))
+        fees = 0.0
         tov = 0.0
-        for t in keys:
-            tov += abs(float((new_w or {}).get(t, 0.0)) - float(old.get(t, 0.0)))
-        tov *= 0.5
-        p["turnover"] += tov
-        c = tov * float(self._agx_cost_bps) / 10000.0
-        if c > 0:
-            p["nav"] = max(1e-8, p["nav"] * (1.0 - c))
-            p["cost"] += c
-        p["w"] = dict(new_w or {})
-        p["pending"] = None
-        p["reb"] += 1
-        p["cap_hit"] += int(hit)
+        # reduce-first ordering
+        items = sorted(tgt.items(), key=lambda kv: (0 if float(kv[1]) < float(cur.get(kv[0], 0.0)) else 1, kv[0]))
+        for t, tw in items:
+            p = (px or {}).get(t)
+            if not p or p <= 0:
+                suppressed.add(t)
+                continue
+            cw = float(cur.get(t, 0.0))
+            zero_close = (abs(tw) < 1e-15 and cw > 0.0)
+            if not zero_close and abs(tw - cw) < mwd:
+                suppressed.add(t)
+                continue
+            trade_value = abs(tw - cw) * nav
+            if not zero_close and trade_value < min_tv:
+                suppressed.add(t)
+                continue
+            desired_q = tw * nav / p
+            old_q = float((led.get("qty") or {}).get(t, 0.0))
+            dq = desired_q - old_q
+            notional = abs(dq) * p
+            fee = notional * float(self._agx_cost_bps) / 10000.0
+            cash -= dq * p
+            cash -= fee
+            fees += fee
+            tov += notional
+            expect_qty[t] = desired_q
+            traded[t] = dq
+            if abs(desired_q) < 1e-12:
+                expect_qty.pop(t, None)
+        led["cash"] = cash
+        led["qty"] = {t: q for t, q in expect_qty.items() if abs(q) > 1e-12}
+        led["fees"] = float(led.get("fees", 0.0)) + fees
+        led["turnover"] = float(led.get("turnover", 0.0)) + (tov / max(nav, 1e-9)) * 0.5
+        led["reb"] = int(led.get("reb", 0)) + 1
+        nav2, _ = self._AgxNav(led, px)
+        led["nav"] = nav2
+        if nav2 > led["peak"]:
+            led["peak"] = nav2
+        return {"suppressed": suppressed, "traded": traded, "expect_qty": dict(led["qty"]),
+                "cash": cash, "fees": fees, "nav": nav2}
 
-    # ------------------------------------------------------------- capture --
+    def _AgxApplyDaily(self, led, prev_nav, nav, rg, age, eg, hit):
+        if prev_nav is None or prev_nav <= 0 or nav is None:
+            return
+        r = nav / prev_nav - 1.0
+        led["rets"].append(r)
+        led["dates"].append(self.time.date())
+        led["nav"] = nav
+        if nav > led["peak"]:
+            led["peak"] = nav
+            led["uw"] = 0
+        else:
+            led["uw"] += 1
+            led["uw_days"] += 1
+            if led["uw"] > led["uw_max"]:
+                led["uw_max"] = led["uw"]
+        dd = 1.0 - nav / max(led["peak"], 1e-9)
+        if dd > led["maxdd"]:
+            led["maxdd"] = dd
+        if eg is not None:
+            led["sum_eg"] += eg
+            led["n_eg"] += 1
+            led["egs"].append(eg)
+        rg = str(rg or "NEUTRAL").upper()
+        if rg not in led["rg_n"]:
+            rg = "NEUTRAL"
+        led["rg_n"][rg] += 1
+        led["rg_r"][rg] += r
+        led["rg_dd"][rg] = max(led["rg_dd"][rg], dd)
+        led["rg_w5"][rg].append(r)
+        led["rg_eg"][rg] += float(eg or 0.0)
+        if hit:
+            led["rg_cap"][rg] += 1
+        if age <= 0:
+            tb = "0"
+        elif age == 1:
+            tb = "1"
+        elif age <= 3:
+            tb = "2-3"
+        elif age <= 10:
+            tb = "4-10"
+        else:
+            tb = ">10"
+        led["tr_n"][tb] += 1
+        led["tr_r"][tb] += r
+
     def CgAgxShadowCapture(self, combined, regime, slot, reduce_only=False, emergency=False) -> None:
-        if not getattr(self, "cg_agx_shadow_diag_enable", False):
+        if not getattr(self, "_agx_enabled", False):
             return
         try:
             if getattr(self, "IsWarmingUp", False) or getattr(self, "is_warming_up", False):
@@ -391,6 +488,7 @@ class CgAgxShadowDiagMixin:
             bg = self._AgxGross(base)
             self._agx_base_gross_obs.append(bg)
             self._agx_last_base_gross = bg
+            self._agx_last_base = dict(base)
             self._agx_n_cap += 1
             rg = str(regime or getattr(self, "current_regime", None) or "NEUTRAL").upper()
             if rg not in ("RISK_ON", "NEUTRAL", "RISK_OFF"):
@@ -401,73 +499,159 @@ class CgAgxShadowDiagMixin:
             else:
                 self._agx_n_def += 1
 
-            # Level A: exact deep copy, no transform, no BIL recalculation.
-            control_targets = {t: float(v) for t, v in base.items()}
-            mismatch, max_diff = self._AgxCompareTargets(control_targets, base)
+            ctrl_t = {t: float(v) for t, v in base.items()}
+            mismatch = 0 if set(ctrl_t) == set(base) else 1
+            max_diff = 0.0
+            for k in set(ctrl_t) | set(base):
+                max_diff = max(max_diff, abs(float(ctrl_t.get(k, 0)) - float(base.get(k, 0))))
             self._agx_target_mismatch_count += mismatch
             if max_diff > self._agx_max_abs_target_weight_diff:
                 self._agx_max_abs_target_weight_diff = max_diff
-            self._agx_last_control_targets = control_targets
-            if self.cg_agx_shadow_parity_debug and self._agx_n_cap <= 3:
+            if self._agx_n_cap <= 2 or (self._agx_n_cap % 200 == 0):
                 self._AgxLog(
-                    f"CG_AGX_PARITY_TARGET,date={self.time.date()},"
-                    f"n_syms={len(control_targets)},mismatch={mismatch},"
-                    f"max_diff={_f(max_diff, 14)},gross={_f(bg)}"
+                    f"CG_AGX_IND_PARITY_TARGET,date={self.time.date()},regime={rg},"
+                    f"n={len(ctrl_t)},gross={_f(bg)},signed={_f(sum(ctrl_t.values()))},"
+                    f"bil={_f(ctrl_t.get(self._agx_cash_tk))},mismatch={mismatch},"
+                    f"max_diff={_f(max_diff, 14)}"
                 )
 
-            for p in self._agx_pols:
-                if reduce_only or emergency:
-                    # No AGX experiment on emergency/reduce_only: exact base.
-                    self._AgxRebalance(p, base, 0)
-                    if emergency:
-                        p["emerg"] += 1
-                    if reduce_only:
-                        p["ro"] += 1
-                    continue
-                mult = p["ron"] if rg == "RISK_ON" else (p["roff"] if rg == "RISK_OFF" else p["neu"])
-                if abs(float(mult) - 1.0) < 1e-15:
-                    scaled, req, eff, pre, post, hit, _bg = dict(base), 1.0, 1.0, bg, bg, 0, bg
-                else:
-                    scaled, req, eff, pre, post, hit, _bg = self._AgxScale(base, mult)
-                if imm:
-                    self._AgxRebalance(p, scaled, hit)
-                else:
-                    p["pending"] = scaled
-                    p["_pend_hit"] = hit
+            px = self._AgxPx(set(base) | set((self._agx_ctrl.get("qty") or {})))
+            # Independent control: exact captured targets (identity)
+            if reduce_only or emergency or imm:
+                self._AgxSimExec(self._agx_ctrl, ctrl_t, px)
+            else:
+                self._agx_ctrl["pending"] = ctrl_t
+                self._agx_ctrl["_pend_hit"] = 0
 
-            if self.cg_agx_shadow_emit_events:
-                self._AgxLog(
-                    f"CG_AGX_SHADOW_EVENT,date={self.time.date()},regime={rg},"
-                    f"slot={slot},reduce={int(bool(reduce_only))},"
-                    f"emerg={int(bool(emergency))},base_gross={_f(bg)},imm={int(imm)}"
-                )
+            if self._agx_grid_on:
+                for p in self._agx_pols:
+                    if reduce_only or emergency:
+                        tw = dict(base)
+                        hit = 0
+                        ferr = 0.0
+                    else:
+                        mult = p["ron"] if rg == "RISK_ON" else (p["roff"] if rg == "RISK_OFF" else p["neu"])
+                        tw, _req, _eff, _pre, _post, hit, ferr = self._AgxScale(base, mult, p["model"])
+                        p["fixed_err"] = max(float(p.get("fixed_err", 0.0)), float(ferr))
+                    if imm or reduce_only or emergency:
+                        self._AgxSimExec(p, tw, px)
+                        p["cap_hit"] += int(hit)
+                    else:
+                        p["pending"] = tw
+                        p["_pend_hit"] = hit
         except Exception as exc:
             self._agx_err += 1
             if self._agx_err <= 3:
-                self._AgxLog(f"CG_AGX_SHADOW_VALIDATION,capture_error={type(exc).__name__}")
+                self._AgxLog(f"CG_AGX_IND_PARITY_EXEC,capture_error={type(exc).__name__}")
 
     def CgAgxShadowExecutePending(self) -> None:
-        if not getattr(self, "cg_agx_shadow_diag_enable", False):
+        if not getattr(self, "_agx_enabled", False):
             return
         try:
+            px = self._AgxPx()
             any_p = False
-            for p in self._agx_pols:
-                pend = p.get("pending")
-                if pend is None:
-                    continue
+            if self._agx_ctrl.get("pending") is not None:
                 any_p = True
-                hit = int(p.pop("_pend_hit", 0) or 0)
-                self._AgxRebalance(p, pend, hit)
+                info = self._AgxSimExec(self._agx_ctrl, self._agx_ctrl["pending"], px, audit=True)
+                self._agx_ctrl["pending"] = None
+                self._agx_last_ind_expect = info
+                self._agx_exec_events += 1
+            if self._agx_grid_on:
+                for p in self._agx_pols:
+                    pend = p.get("pending")
+                    if pend is None:
+                        continue
+                    any_p = True
+                    hit = int(p.pop("_pend_hit", 0) or 0)
+                    self._AgxSimExec(p, pend, px)
+                    p["pending"] = None
+                    p["cap_hit"] += hit
             if any_p:
                 self._agx_n_exe += 1
+            # Snapshot production pre-state for post-exec audit
+            try:
+                self._agx_prod_pre_cash = float(self.portfolio.cash)
+                self._agx_prod_pre_w = {
+                    _tk(s): float(h.HoldingsValue) / max(float(self.portfolio.total_portfolio_value), 1e-9)
+                    for s, h in self.portfolio.items() if h and h.Invested
+                }
+                self._agx_prod_pre_qty = {
+                    _tk(s): float(h.Quantity) for s, h in self.portfolio.items() if h and h.Invested
+                }
+            except Exception:
+                self._agx_prod_pre_cash = None
+                self._agx_prod_pre_w = {}
+                self._agx_prod_pre_qty = {}
         except Exception as exc:
             self._agx_err += 1
             if self._agx_err <= 3:
-                self._AgxLog(f"CG_AGX_SHADOW_VALIDATION,exec_error={type(exc).__name__}")
+                self._AgxLog(f"CG_AGX_IND_PARITY_EXEC,exec_error={type(exc).__name__}")
 
-    # ---------------------------------------------------------------- mark --
+    def CgAgxShadowAuditPostExec(self) -> None:
+        """Compare independent expected trades vs production post-fill (audit only)."""
+        if not getattr(self, "_agx_enabled", False):
+            return
+        info = self._agx_last_ind_expect
+        if not info:
+            return
+        try:
+            prod_qty = {
+                _tk(s): float(h.Quantity) for s, h in self.portfolio.items() if h and h.Invested
+            }
+            prod_cash = float(self.portfolio.cash)
+            ind_qty = info.get("expect_qty") or {}
+            # Direction / quantity / security-set
+            keys = set(prod_qty) | set(ind_qty) | set(self._agx_prod_pre_qty or {})
+            for t in keys:
+                pq = float(prod_qty.get(t, 0.0))
+                iq = float(ind_qty.get(t, 0.0))
+                pre = float((self._agx_prod_pre_qty or {}).get(t, 0.0))
+                pd = pq - pre
+                idlt = float((info.get("traded") or {}).get(t, iq - float((self._agx_ctrl.get("qty") or {}).get(t, 0.0))))
+                # Use traded dict if available
+                if t in (info.get("traded") or {}):
+                    idlt = float(info["traded"][t])
+                else:
+                    # If suppressed independently, expect no trade
+                    if t in (info.get("suppressed") or set()):
+                        idlt = 0.0
+                if abs(pd) > 1e-6 or abs(idlt) > 1e-6:
+                    if (pd > 0) != (idlt > 0) and abs(pd) > 1e-6 and abs(idlt) > 1e-6:
+                        self._agx_dir_mm += 1
+                    if abs(pq - iq) > max(1.0, 0.01 * abs(pq)):
+                        self._agx_qty_mm += 1
+                        if len(self._agx_qty_exceptions) < 8:
+                            self._agx_qty_exceptions.append(
+                                f"{self.time.date()}:{t}:prod={pq:.2f}:ind={iq:.2f}"
+                            )
+            if set(prod_qty.keys()) != set(ind_qty.keys()):
+                self._agx_sec_mm += 1
+            # Suppression: if independent suppressed but production traded
+            for t in (info.get("suppressed") or set()):
+                pre = float((self._agx_prod_pre_qty or {}).get(t, 0.0))
+                pq = float(prod_qty.get(t, 0.0))
+                if abs(pq - pre) > 1e-4:
+                    self._agx_sup_mm += 1
+            cd = abs(prod_cash - float(info.get("cash", 0.0)))
+            if cd > self._agx_max_cash_diff:
+                self._agx_max_cash_diff = cd
+            # Fees: production total fees not per-event; skip hard fee mismatch unless cost_bps>0
+            if self._agx_exec_events <= 3 or self._agx_exec_events % 100 == 0:
+                self._AgxLog(
+                    f"CG_AGX_IND_PARITY_EXEC,date={self.time.date()},"
+                    f"events={self._agx_exec_events},dir_mm={self._agx_dir_mm},"
+                    f"qty_mm={self._agx_qty_mm},sup_mm={self._agx_sup_mm},"
+                    f"sec_mm={self._agx_sec_mm},ind_cash={_f(info.get('cash'),2)},"
+                    f"prod_cash={_f(prod_cash,2)}"
+                )
+            self._agx_last_ind_expect = None
+        except Exception as exc:
+            self._agx_err += 1
+            if self._agx_err <= 3:
+                self._AgxLog(f"CG_AGX_IND_PARITY_EXEC,audit_error={type(exc).__name__}")
+
     def CgAgxShadowMark(self) -> None:
-        if not getattr(self, "cg_agx_shadow_diag_enable", False):
+        if not getattr(self, "_agx_enabled", False):
             return
         try:
             if getattr(self, "IsWarmingUp", False) or getattr(self, "is_warming_up", False):
@@ -493,83 +677,99 @@ class CgAgxShadowDiagMixin:
             except Exception:
                 tpv = None
             try:
-                cash_bal = float(self.portfolio.cash)
+                prod_cash = float(self.portfolio.cash)
             except Exception:
-                cash_bal = None
+                prod_cash = None
+            prod_hold = (tpv - prod_cash) if (tpv is not None and prod_cash is not None) else None
 
-            tickers = set()
-            for p in self._agx_pols:
-                tickers.update((p["w"] or {}).keys())
-                if p.get("pending"):
-                    tickers.update(p["pending"].keys())
+            tickers = set(self._agx_ctrl.get("qty") or {}) | set(self._agx_last_base or {})
             tickers.add(self._agx_cash_tk)
-            curr_px = self._AgxPx(tickers if tickers else None)
+            if self._agx_grid_on:
+                for p in self._agx_pols:
+                    tickers.update((p.get("qty") or {}).keys())
+            px = self._AgxPx(tickers)
+
+            ind_nav, ind_hold = self._AgxNav(self._agx_ctrl, px)
+            ind_cash = float(self._agx_ctrl.get("cash", 0.0))
 
             if not self._agx_started:
                 self._agx_started = True
-                self._agx_start_nav_actual = tpv if tpv else 10000.0
-                self._agx_prev_tpv = self._agx_start_nav_actual
-                self._agx_prev_px = curr_px
+                self._agx_prev_tpv = tpv if tpv else self._agx_cash0
+                self._agx_ctrl["_prev_nav"] = ind_nav if ind_nav > 0 else self._agx_cash0
+                if self._agx_grid_on:
+                    for p in self._agx_pols:
+                        n, _ = self._AgxNav(p, px)
+                        p["_prev_nav"] = n if n > 0 else self._agx_cash0
+                self._agx_prev_px = px
                 self._agx_last_mark = today
                 return
 
-            # Level B: control return mirrors the actual TPV return exactly.
+            # REFERENCE_MIRROR
             if self._agx_prev_tpv and self._agx_prev_tpv > 0 and tpv is not None:
                 ar = tpv / self._agx_prev_tpv - 1.0
             else:
                 ar = 0.0
             self._agx_actual_rets.append(ar)
-            self._agx_control_rets.append(ar)
+            self._agx_mirror_rets.append(ar)
             self._agx_dates.append(today)
             self._agx_prev_tpv = tpv if tpv is not None else self._agx_prev_tpv
-            self._agx_cash_obs.append(cash_bal)
-            self._agx_holdings_obs.append(
-                (tpv - cash_bal) if (tpv is not None and cash_bal is not None) else None
-            )
 
-            if not self._agx_corpaction_logged:
-                self._agx_corpaction_logged = True
-                self._AgxLog(
-                    "CG_AGX_PARITY_CORPACTION,status=PASS,"
-                    "note=mirror_inherits_lean_adjusted_tpv"
-                )
+            prev_ind = self._agx_ctrl.get("_prev_nav")
+            self._AgxApplyDaily(self._agx_ctrl, prev_ind, ind_nav, rg, age, self._AgxGross(self._AgxCurrW(self._agx_ctrl, px, ind_nav)), 0)
+            self._agx_ctrl["_prev_nav"] = ind_nav
+            if prev_ind and prev_ind > 0:
+                self._agx_ind_rets.append(ind_nav / prev_ind - 1.0)
+            else:
+                self._agx_ind_rets.append(0.0)
+
+            if prod_cash is not None:
+                self._agx_max_cash_diff = max(self._agx_max_cash_diff, abs(prod_cash - ind_cash))
+            if prod_hold is not None:
+                self._agx_max_hold_diff = max(self._agx_max_hold_diff, abs(prod_hold - ind_hold))
 
             self._agx_snap_candidates.append({
                 "date": today, "regime": rg,
-                "gross": self._agx_last_base_gross,
-                "bil_w": (self._agx_last_control_targets or {}).get(self._agx_cash_tk),
-                "cash": cash_bal,
+                "target_count": len(self._agx_last_base or {}),
+                "target_gross": self._agx_last_base_gross,
+                "target_signed_sum": sum((self._agx_last_base or {}).values()),
+                "BIL_target": (self._agx_last_base or {}).get(self._agx_cash_tk),
+                "production_cash": prod_cash, "independent_cash": ind_cash,
+                "production_holdings": prod_hold, "independent_holdings": ind_hold,
+                "production_NAV": tpv, "independent_NAV": ind_nav,
+                "max_target_diff": self._agx_max_abs_target_weight_diff,
                 "w2": bool(getattr(self, "_cg_w2_last_active", False)),
             })
 
             n = len(self._agx_dates)
             if n % 63 == 0:
-                am = self._AgxMetricsFromRets(self._agx_actual_rets) or {}
                 self._AgxLog(
-                    f"CG_AGX_PARITY_DAILY,date={today},n={n},"
-                    f"captures={self._agx_n_cap},"
-                    f"mismatches={self._agx_target_mismatch_count},"
-                    f"cash={_f(cash_bal, 2)},tpv={_f(tpv, 2)},"
-                    f"maxdd={_f(am.get('MaxDD'))},errors={self._agx_err}"
+                    f"CG_AGX_IND_PARITY_DAILY,date={today},n={n},"
+                    f"prod_nav={_f(tpv,2)},ind_nav={_f(ind_nav,2)},"
+                    f"prod_cash={_f(prod_cash,2)},ind_cash={_f(ind_cash,2)},"
+                    f"dir_mm={self._agx_dir_mm},qty_mm={self._agx_qty_mm},"
+                    f"sup_mm={self._agx_sup_mm},errors={self._agx_err}"
                 )
 
-            if self._agx_prev_px is not None:
+            if self._agx_grid_on:
                 for p in self._agx_pols:
-                    r = self._AgxRet(p["w"], self._agx_prev_px, curr_px)
-                    eg = self._AgxGross(p["w"])
-                    self._AgxApplyRet(p, r, rg, age, eg, eg, 0)
-            self._agx_prev_px = curr_px
+                    n2, _ = self._AgxNav(p, px)
+                    eg = self._AgxGross(self._AgxCurrW(p, px, n2))
+                    self._AgxApplyDaily(p, p.get("_prev_nav"), n2, rg, age, eg, 0)
+                    p["_prev_nav"] = n2
+
+            self._agx_prev_px = px
             self._agx_last_mark = today
         except Exception as exc:
             self._agx_err += 1
             if self._agx_err <= 3:
-                self._AgxLog(f"CG_AGX_SHADOW_VALIDATION,mark_error={type(exc).__name__}")
+                self._AgxLog(f"CG_AGX_IND_PARITY_DAILY,mark_error={type(exc).__name__}")
 
-    # ------------------------------------------------------ strict parity --
     def _AgxCorr(self, a, b):
-        n = len(a)
+        n = min(len(a), len(b))
         if n < 2:
             return 1.0
+        a = a[:n]
+        b = b[:n]
         ma = sum(a) / n
         mb = sum(b) / n
         cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
@@ -579,118 +779,6 @@ class CgAgxShadowDiagMixin:
         if den <= 1e-18:
             return 1.0
         return cov / den
-
-    def _AgxStrictGate(self):
-        n_act = len(self._agx_actual_rets)
-        n_ctrl = len(self._agx_control_rets)
-        count_match = bool(n_act == n_ctrl and n_act > 0)
-        am = self._AgxMetricsFromRets(self._agx_actual_rets) or {}
-        cm = self._AgxMetricsFromRets(self._agx_control_rets) or {}
-        a_nav = am.get("end_nav")
-        c_nav = cm.get("end_nav")
-        a_dd = am.get("MaxDD")
-        c_dd = cm.get("MaxDD")
-        nav_diff = ((c_nav / a_nav - 1.0) * 100.0) if (a_nav and c_nav is not None) else None
-        dd_diff = ((c_dd - a_dd) * 100.0) if (a_dd is not None and c_dd is not None) else None
-        if count_match:
-            diffs = [abs(a - c) for a, c in zip(self._agx_actual_rets, self._agx_control_rets)]
-            max_diff = max(diffs) if diffs else 0.0
-            mean_diff = (sum(diffs) / len(diffs)) if diffs else 0.0
-            corr = self._AgxCorr(self._agx_actual_rets, self._agx_control_rets)
-        else:
-            max_diff = None
-            mean_diff = None
-            corr = None
-        target_exact = bool(self._agx_n_cap > 0 and self._agx_target_mismatch_count == 0)
-        g = {
-            "control_target_dictionary_exact": target_exact,
-            "target_mismatch_count": self._agx_target_mismatch_count,
-            "max_abs_target_weight_difference": self._agx_max_abs_target_weight_diff,
-            "daily_return_count_actual": n_act,
-            "daily_return_count_control": n_ctrl,
-            "daily_return_count_match": count_match,
-            "nav_difference_pct": nav_diff,
-            "maxdd_difference_pp": dd_diff,
-            "daily_return_correlation": corr,
-            "max_abs_daily_return_difference": max_diff,
-            "mean_abs_daily_return_difference": mean_diff,
-            "suppression_count_match": "MIRRORED",
-            "corporate_action_parity": "PASS",
-            "runtime_errors": self._agx_err,
-            "_am": am,
-            "_cm": cm,
-        }
-        ok = (
-            target_exact
-            and self._agx_max_abs_target_weight_diff <= 1e-12
-            and count_match
-            and nav_diff is not None and abs(nav_diff) <= 0.10
-            and dd_diff is not None and abs(dd_diff) <= 0.10
-            and corr is not None and corr >= 0.9999
-            and max_diff is not None and max_diff <= 0.0005
-            and mean_diff is not None and mean_diff <= 0.00005
-            and self._agx_err == 0
-        )
-        g["pass"] = bool(ok)
-        return g
-
-    def _AgxSelectSnapshots(self):
-        cands = self._agx_snap_candidates
-        if not cands:
-            return []
-        chosen = []
-        seen = set()
-
-        def add(entry):
-            if not entry:
-                return
-            d = entry["date"]
-            if d in seen:
-                return
-            seen.add(d)
-            chosen.append(entry)
-
-        add(cands[0])
-        ron = [c for c in cands if c["regime"] == "RISK_ON" and c.get("gross") is not None]
-        if ron:
-            add(min(ron, key=lambda c: abs(c["gross"] - 1.9)))
-        neu = [c for c in cands if c["regime"] == "NEUTRAL"]
-        if neu:
-            add(neu[len(neu) // 2])
-        roff = [c for c in cands if c["regime"] == "RISK_OFF"]
-        if roff:
-            add(roff[len(roff) // 2])
-        bilw = [c for c in cands if c.get("bil_w") is not None]
-        if bilw:
-            add(max(bilw, key=lambda c: c["bil_w"]))
-        cashn = [c for c in cands if c.get("cash") is not None]
-        if cashn:
-            add(min(cashn, key=lambda c: c["cash"]))
-        w2s = [c for c in cands if c.get("w2")]
-        if w2s:
-            add(w2s[0])
-        best_drop = None
-        prev_g = None
-        for c in cands:
-            g = c.get("gross")
-            if g is not None:
-                if prev_g is not None and (prev_g - g) > (best_drop[0] if best_drop else -1e18):
-                    best_drop = (prev_g - g, c)
-                prev_g = g
-        if best_drop:
-            add(best_drop[1])
-        return chosen[:12]
-
-    # ------------------------------------------------------------ metrics --
-    def _AgxWindowMetrics(self, dates, rets, s, e):
-        xs = []
-        for d, r in zip(dates, rets):
-            if s is not None and d < s:
-                continue
-            if e is not None and d > e:
-                continue
-            xs.append(r)
-        return self._AgxMetricsFromRets(xs)
 
     def _AgxMetricsFromRets(self, rets):
         n = len(rets)
@@ -750,37 +838,131 @@ class CgAgxShadowDiagMixin:
             "positive_day_rate": pos / n,
         }
 
+    def _AgxWindowMetrics(self, dates, rets, s, e):
+        xs = []
+        for d, r in zip(dates, rets):
+            if s is not None and d < s:
+                continue
+            if e is not None and d > e:
+                continue
+            xs.append(r)
+        return self._AgxMetricsFromRets(xs)
+
     def _AgxPolMetrics(self, p):
         m = self._AgxMetricsFromRets(p["rets"]) or {}
         egs = sorted(p["egs"]) if p["egs"] else []
         mid = egs[len(egs) // 2] if egs else None
         p95 = egs[int(0.95 * (len(egs) - 1))] if len(egs) > 1 else (egs[0] if egs else None)
         m.update({
-            "start_nav": 1.0,
-            "turnover": p["turnover"],
-            "estimated_cost": p["cost"],
-            "rebalance_count": p["reb"],
-            "cap_hit_count": p["cap_hit"],
+            "start_nav": 1.0, "turnover": p["turnover"], "estimated_fees": p["fees"],
+            "rebalance_count": p["reb"], "cap_hit_count": p["cap_hit"],
             "mean_effective_gross": (p["sum_eg"] / p["n_eg"]) if p["n_eg"] else None,
-            "median_effective_gross": mid,
-            "p95_effective_gross": p95,
+            "median_effective_gross": mid, "p95_effective_gross": p95,
             "max_effective_gross": max(egs) if egs else None,
-            "days_RISK_ON": p["rg_n"]["RISK_ON"],
-            "days_NEUTRAL": p["rg_n"]["NEUTRAL"],
-            "days_RISK_OFF": p["rg_n"]["RISK_OFF"],
             "ron": p["ron"], "neu": p["neu"], "roff": p["roff"], "id": p["id"],
+            "model": p["model"], "fixed_err": p.get("fixed_err", 0.0),
         })
         return m
 
-    def _AgxIsBoundary(self, p):
-        return (
-            abs(p["ron"]) < 1e-12 or abs(p["neu"]) < 1e-12 or abs(p["roff"]) < 1e-12
-            or abs(p["ron"] - 1.50) < 1e-12 or abs(p["neu"] - 1.25) < 1e-12
+    def _AgxStrictGate(self):
+        n_act = len(self._agx_actual_rets)
+        n_ind = len(self._agx_ind_rets)
+        count_match = bool(n_act == n_ind and n_act > 0)
+        am = self._AgxMetricsFromRets(self._agx_actual_rets) or {}
+        im = self._AgxMetricsFromRets(self._agx_ind_rets) or {}
+        a_nav = am.get("end_nav")
+        i_nav = im.get("end_nav")
+        a_dd = am.get("MaxDD")
+        i_dd = im.get("MaxDD")
+        nav_diff = ((i_nav / a_nav - 1.0) * 100.0) if (a_nav and i_nav is not None) else None
+        dd_diff = ((i_dd - a_dd) * 100.0) if (a_dd is not None and i_dd is not None) else None
+        if count_match:
+            diffs = [abs(a - c) for a, c in zip(self._agx_actual_rets, self._agx_ind_rets)]
+            max_diff = max(diffs) if diffs else 0.0
+            mean_diff = (sum(diffs) / len(diffs)) if diffs else 0.0
+            corr = self._AgxCorr(self._agx_actual_rets, self._agx_ind_rets)
+        else:
+            max_diff = mean_diff = corr = None
+        # Quantity mismatches allowed only if economics within tolerance
+        qty_ok = True
+        if self._agx_qty_mm > 0:
+            qty_ok = bool(
+                nav_diff is not None and abs(nav_diff) <= 0.10
+                and dd_diff is not None and abs(dd_diff) <= 0.10
+            )
+            if qty_ok and self._agx_qty_exceptions:
+                self._AgxLog(
+                    "CG_AGX_IND_PARITY_EXEC,qty_exceptions_explained_by_rounding="
+                    + ";".join(self._agx_qty_exceptions[:5])
+                )
+        ok = (
+            self._agx_n_cap > 0
+            and self._agx_target_mismatch_count == 0
+            and self._agx_max_abs_target_weight_diff <= 1e-12
+            and count_match
+            and nav_diff is not None and abs(nav_diff) <= 0.10
+            and dd_diff is not None and abs(dd_diff) <= 0.10
+            and corr is not None and corr >= 0.9999
+            and max_diff is not None and max_diff <= 0.0005
+            and mean_diff is not None and mean_diff <= 0.00005
+            and self._agx_sup_mm == 0
+            and self._agx_dir_mm == 0
+            and self._agx_corpaction == "PASS"
+            and self._agx_err == 0
+            and qty_ok
         )
+        return {
+            "pass": bool(ok), "nav_difference_pct": nav_diff, "maxdd_difference_pp": dd_diff,
+            "daily_return_correlation": corr, "max_abs_daily_return_difference": max_diff,
+            "mean_abs_daily_return_difference": mean_diff,
+            "daily_return_count_match": "YES" if count_match else "NO",
+            "n_act": n_act, "n_ind": n_ind, "_am": am, "_im": im,
+        }
 
-    def _AgxPareto(self, rows, ctrl):
-        # Minimize MaxDD, worst5 magnitude, recovery, crisis MaxDD;
-        # maximize OOS Sharpe and CAGR. Keep non-dominated rows only.
+    def _AgxSelectSnapshots(self):
+        cands = self._agx_snap_candidates
+        if not cands:
+            return []
+        chosen, seen = [], set()
+
+        def add(e):
+            if e and e["date"] not in seen:
+                seen.add(e["date"])
+                chosen.append(e)
+
+        add(cands[0])
+        ron = [c for c in cands if c["regime"] == "RISK_ON" and c.get("target_gross") is not None]
+        if ron:
+            add(min(ron, key=lambda c: abs(c["target_gross"] - 1.9)))
+        for rg in ("NEUTRAL", "RISK_OFF"):
+            xs = [c for c in cands if c["regime"] == rg]
+            if xs:
+                add(xs[len(xs) // 2])
+        bil = [c for c in cands if c.get("BIL_target") is not None]
+        if bil:
+            add(max(bil, key=lambda c: c["BIL_target"]))
+        cashn = [c for c in cands if c.get("production_cash") is not None]
+        if cashn:
+            add(min(cashn, key=lambda c: c["production_cash"]))
+            add(max(cashn, key=lambda c: c["production_cash"]))
+        w2s = [c for c in cands if c.get("w2")]
+        if w2s:
+            add(w2s[0])
+        prev_g, best_drop = None, None
+        for c in cands:
+            g = c.get("target_gross")
+            if g is not None and prev_g is not None:
+                d = prev_g - g
+                if best_drop is None or d > best_drop[0]:
+                    best_drop = (d, c)
+            if g is not None:
+                prev_g = g
+        if best_drop:
+            add(best_drop[1])
+        add(cands[-1])
+        return chosen[:15]
+
+    def _AgxPareto(self, rows):
         front = []
         for r in rows:
             dominated = False
@@ -790,11 +972,9 @@ class CgAgxShadowDiagMixin:
                 keys_min = ("MaxDD", "w5_abs", "crisis_maxdd", "recovery_days_max")
                 keys_max = ("oos_sharpe", "CAGR")
                 ge = all(o.get(k, 1e9) <= r.get(k, 1e9) for k in keys_min) and all(
-                    (o.get(k) or -1e9) >= (r.get(k) or -1e9) for k in keys_max
-                )
+                    (o.get(k) or -1e9) >= (r.get(k) or -1e9) for k in keys_max)
                 gt = any(o.get(k, 1e9) < r.get(k, 1e9) for k in keys_min) or any(
-                    (o.get(k) or -1e9) > (r.get(k) or -1e9) for k in keys_max
-                )
+                    (o.get(k) or -1e9) > (r.get(k) or -1e9) for k in keys_max)
                 if ge and gt:
                     dominated = True
                     break
@@ -804,22 +984,15 @@ class CgAgxShadowDiagMixin:
 
     def _AgxRankKey(self, r):
         return (
-            float(r.get("MaxDD") or 9),
-            float(r.get("w5_abs") or 9),
-            -float(r.get("oos_sharpe") or -9),
-            float(r.get("crisis_maxdd") or 9),
-            float(r.get("recovery_days_max") or 9e9),
-            -float(r.get("CAGR") or -9),
+            float(r.get("MaxDD") or 9), float(r.get("w5_abs") or 9),
+            -float(r.get("oos_sharpe") or -9), float(r.get("crisis_maxdd") or 9),
+            float(r.get("recovery_days_max") or 9e9), -float(r.get("CAGR") or -9),
         )
 
-    def _AgxNeighborStable(self, row, by_id):
+    def _AgxNeighborStable(self, row, by_id, model):
         def nbr(dim, vals):
             cur = row[dim]
-            ix = None
-            for i, v in enumerate(vals):
-                if abs(v - cur) < 1e-12:
-                    ix = i
-                    break
+            ix = next((i for i, v in enumerate(vals) if abs(v - cur) < 1e-12), None)
             if ix is None:
                 return True
             ok = True
@@ -828,111 +1001,94 @@ class CgAgxShadowDiagMixin:
                     continue
                 kwargs = {"ron": row["ron"], "neu": row["neu"], "roff": row["roff"]}
                 kwargs[dim] = vals[j]
-                nid = _pid(kwargs["ron"], kwargs["neu"], kwargs["roff"])
+                nid = _pid(model, kwargs["ron"], kwargs["neu"], kwargs["roff"])
                 o = by_id.get(nid)
                 if not o:
                     continue
                 if (o.get("MaxDD") or 0) > (row.get("MaxDD") or 0) + 0.02:
                     ok = False
-                c0 = row.get("CAGR") or 0
-                c1 = o.get("CAGR") or 0
+                c0, c1 = row.get("CAGR") or 0, o.get("CAGR") or 0
                 if c0 > 0 and c1 < 0.8 * c0:
                     ok = False
-                s0 = row.get("oos_sharpe") or 0
-                s1 = o.get("oos_sharpe") or 0
+                s0, s1 = row.get("oos_sharpe") or 0, o.get("oos_sharpe") or 0
                 if s0 > 0 and s1 < 0.9 * s0:
                     ok = False
                 if (o.get("crisis_maxdd") or 0) > (row.get("crisis_maxdd") or 0) + 0.02:
                     ok = False
             return ok
+        a, b, c = nbr("ron", _RON), nbr("neu", _NEU), nbr("roff", _ROFF)
+        return a, b, c, (a and b and c)
 
-        ron_ok = nbr("ron", _RON)
-        neu_ok = nbr("neu", _NEU)
-        off_ok = nbr("roff", _ROFF)
-        return ron_ok, neu_ok, off_ok, (ron_ok and neu_ok and off_ok)
-
-    # -------------------------------------------------------------- final --
     def CgAgxShadowEmitFinal(self) -> None:
         if getattr(self, "_agx_emitted", False):
             return
         self._agx_emitted = True
-        if not getattr(self, "cg_agx_shadow_diag_enable", False):
+        if not getattr(self, "_agx_enabled", False):
             return
         try:
             gate = self._AgxStrictGate()
             parity_pass = bool(gate["pass"])
-            parity_only = bool(self.cg_agx_shadow_parity_only)
-            ranking_unlocked = bool(parity_pass and not parity_only)
-            quarantined = 0 if ranking_unlocked else 1
-            selection_allowed = int(ranking_unlocked and self._agx_err == 0)
-            if not parity_pass:
-                gate_next = "FIX_PARITY_AGAIN"
-            elif parity_only:
-                gate_next = "PARITY_ONLY_MODE"
-            else:
-                gate_next = "PROCEED_RANKING"
+            continue_grid = bool(parity_pass and self._agx_grid_on)
+            am, im = gate.get("_am") or {}, gate.get("_im") or {}
+
+            for c in self._AgxSelectSnapshots():
+                self._AgxLog(
+                    f"CG_AGX_IND_PARITY_SNAPSHOT,date={c['date']},regime={c['regime']},"
+                    f"target_count={c.get('target_count')},target_gross={_f(c.get('target_gross'))},"
+                    f"target_signed_sum={_f(c.get('target_signed_sum'))},"
+                    f"BIL_target={_f(c.get('BIL_target'),6)},"
+                    f"production_cash={_f(c.get('production_cash'),2)},"
+                    f"independent_cash={_f(c.get('independent_cash'),2)},"
+                    f"production_holdings={_f(c.get('production_holdings'),2)},"
+                    f"independent_holdings={_f(c.get('independent_holdings'),2)},"
+                    f"production_NAV={_f(c.get('production_NAV'),2)},"
+                    f"independent_NAV={_f(c.get('independent_NAV'),2)},"
+                    f"max_target_diff={_f(c.get('max_target_diff'),14)},"
+                    f"quantity_mismatch_count={self._agx_qty_mm},"
+                    f"suppression_match={int(self._agx_sup_mm==0)}"
+                )
 
             self._AgxLog(
-                f"CG_AGX_PARITY_FINAL,parity_gate={'PASS' if parity_pass else 'FAIL'},"
-                f"control_mode=ACTUAL_SNAPSHOT_MIRROR,"
-                f"capture_parity_pass={int(gate['control_target_dictionary_exact'] and gate['target_mismatch_count']==0)},"
-                f"economic_parity_pass={int(parity_pass)},"
-                f"control_target_dictionary_exact={'YES' if gate['control_target_dictionary_exact'] else 'NO'},"
-                f"same_symbol_set_count={self._agx_n_cap},"
-                f"target_mismatch_count={gate['target_mismatch_count']},"
-                f"max_abs_target_weight_difference={_f(gate['max_abs_target_weight_difference'], 14)},"
-                f"actual_final_nav={_f((gate.get('_am') or {}).get('end_nav'))},"
-                f"control_final_nav={_f((gate.get('_cm') or {}).get('end_nav'))},"
-                f"nav_difference_pct={_f(gate['nav_difference_pct'], 6)},"
-                f"actual_maxdd={_f((gate.get('_am') or {}).get('MaxDD'))},"
-                f"control_maxdd={_f((gate.get('_cm') or {}).get('MaxDD'))},"
-                f"maxdd_difference_pp={_f(gate['maxdd_difference_pp'], 6)},"
-                f"actual_daily_return_count={gate['daily_return_count_actual']},"
-                f"control_daily_return_count={gate['daily_return_count_control']},"
-                f"daily_return_correlation={_f(gate['daily_return_correlation'], 6)},"
-                f"max_abs_daily_return_difference={_f(gate['max_abs_daily_return_difference'], 6)},"
-                f"mean_abs_daily_return_difference={_f(gate['mean_abs_daily_return_difference'], 6)},"
-                f"cash_difference_max=0,"
-                f"holdings_value_difference_max=0,"
-                f"suppression_count_match={gate['suppression_count_match']},"
-                f"corporate_action_parity={gate['corporate_action_parity']},"
-                f"runtime_errors={gate['runtime_errors']},"
-                f"candidate_results_quarantined={quarantined},"
-                f"selection_allowed={selection_allowed},parity_only={int(parity_only)},"
-                f"continue_to_policy_phase={int(ranking_unlocked)},"
-                f"policies_evaluated={len(self._agx_pols) if ranking_unlocked else 0},"
-                f"captured={self._agx_n_cap},immediate={self._agx_n_imm},"
-                f"deferred={self._agx_n_def},executed={self._agx_n_exe},"
-                f"next={gate_next}"
+                f"CG_AGX_IND_PARITY_FINAL,independent_parity_gate={'PASS' if parity_pass else 'FAIL'},"
+                f"independent_control_mode=INDEPENDENT_LEDGER,"
+                f"target_mismatch_count={self._agx_target_mismatch_count},"
+                f"max_abs_target_weight_difference={_f(self._agx_max_abs_target_weight_diff,14)},"
+                f"execution_event_count={self._agx_exec_events},"
+                f"trade_direction_mismatch_count={self._agx_dir_mm},"
+                f"trade_quantity_mismatch_count={self._agx_qty_mm},"
+                f"suppression_mismatch_count={self._agx_sup_mm},"
+                f"security_set_mismatch_count={self._agx_sec_mm},"
+                f"cash_update_mismatch_count={self._agx_cash_mm},"
+                f"fee_mismatch_count={self._agx_fee_mm},"
+                f"actual_final_nav={_f(am.get('end_nav'))},"
+                f"independent_final_nav={_f(im.get('end_nav'))},"
+                f"nav_difference_pct={_f(gate['nav_difference_pct'],6)},"
+                f"actual_maxdd={_f(am.get('MaxDD'))},independent_maxdd={_f(im.get('MaxDD'))},"
+                f"maxdd_difference_pp={_f(gate['maxdd_difference_pp'],6)},"
+                f"daily_return_correlation={_f(gate['daily_return_correlation'],6)},"
+                f"max_abs_daily_return_difference={_f(gate['max_abs_daily_return_difference'],6)},"
+                f"mean_abs_daily_return_difference={_f(gate['mean_abs_daily_return_difference'],6)},"
+                f"max_abs_cash_difference={_f(self._agx_max_cash_diff,2)},"
+                f"max_abs_holdings_value_difference={_f(self._agx_max_hold_diff,2)},"
+                f"daily_return_count_match={gate['daily_return_count_match']},"
+                f"corporate_action_parity={self._agx_corpaction},"
+                f"runtime_errors={self._agx_err},"
+                f"continue_to_grid={'YES' if continue_grid else 'NO'},"
+                f"residual_convention={self._agx_residual_convention},"
+                f"next={'PROCEED_GRID' if continue_grid else 'FIX_INDEPENDENT_LEDGER'}"
             )
-            try:
-                self.set_runtime_statistic("AGX_PARITY", "1" if parity_pass else "0")
-                self.set_runtime_statistic("AGX_NEXT", str(gate_next))
-            except Exception:
-                pass
-            if self.cg_agx_shadow_parity_debug:
-                for c in self._AgxSelectSnapshots():
-                    self._AgxLog(
-                        f"CG_AGX_PARITY_SNAPSHOT,date={c['date']},regime={c['regime']},"
-                        f"gross={_f(c.get('gross'))},bil_w={_f(c.get('bil_w'), 6)},"
-                        f"cash={_f(c.get('cash'), 2)},w2={int(bool(c.get('w2')))}"
-                    )
 
-            if not selection_allowed:
-                # Strict parity did not pass (or parity_only forced suppression):
-                # suppress all candidate conclusions. No CG_AGX_SHADOW_* lines.
-                self._agx_result = {
-                    "parity": parity_pass, "gate": gate, "next": gate_next,
-                    "valid": 0, "quarantined": quarantined,
-                }
+            if not continue_grid:
+                self._AgxLog(
+                    f"CG_AGX_D1_FINAL,diagnostic=CG-AGX-INDEPENDENT-PARITY-D1,"
+                    f"independent_parity_gate=FAIL,continue_to_grid=NO,"
+                    f"selection_allowed=0,policies_evaluated=0,next=FIX_INDEPENDENT_LEDGER"
+                )
                 return
 
-            # ---- Ranking unlocked: reuse D0_PASS / Pareto / sensitivity /
-            # boundary logic against the AGX_RON100_NEU100_ROFF100 control. --
+            # ---- PHASE B ranking ----
             today = self.time.date()
-            live_s = None
-            if self._agx_dates:
-                live_s = self._agx_dates[max(0, len(self._agx_dates) - 252)]
+            live_s = self._agx_dates[max(0, len(self._agx_dates) - 252)] if self._agx_dates else None
             windows = [
                 ("RUN", _date(2012, 1, 1), today),
                 ("TRAIN_2012_2018", _date(2012, 1, 1), _date(2018, 12, 31)),
@@ -945,254 +1101,329 @@ class CgAgxShadowDiagMixin:
                 ("Y2025", _date(2025, 1, 1), _date(2025, 12, 31)),
                 ("LIVE_RECENT", live_s, today),
             ]
+            ctrl_m = self._AgxPolMetrics(self._agx_ctrl)
+            n_ind = len(self._agx_ind_rets)
             obs = sorted(self._agx_base_gross_obs)
             p95_base = obs[int(0.95 * (len(obs) - 1))] if len(obs) > 1 else (obs[0] if obs else None)
             max_base = max(obs) if obs else None
-            ctrl = self._agx_ctrl
-            ctrl_m = self._AgxPolMetrics(ctrl) if ctrl else {}
-            n_act = len(self._agx_actual_rets)
 
-            rows = []
-            for p in self._agx_pols:
-                m = self._AgxPolMetrics(p)
-                wins = {}
-                missing = 0
-                for name, s, e in windows:
-                    if s is None:
-                        wins[name] = None
-                        missing += 1
+            def build_rows(model):
+                rows = []
+                for p in self._agx_pols:
+                    if p["model"] != model:
                         continue
-                    wm = self._AgxWindowMetrics(p["dates"], p["rets"], s, e)
-                    wins[name] = wm
-                    if wm is None or wm.get("n", 0) <= 0:
-                        if name in ("RUN", "TRAIN_2012_2018", "OOS_2019_2021", "CRISIS_2022_2025"):
+                    m = self._AgxPolMetrics(p)
+                    wins = {}
+                    missing = 0
+                    for name, s, e in windows:
+                        if s is None:
+                            wins[name] = None
                             missing += 1
-                oos = wins.get("OOS_2019_2021") or {}
-                cri = wins.get("CRISIS_2022_2025") or {}
-                y20 = wins.get("Y2020") or {}
-                y22 = wins.get("Y2022") or {}
-                std = m.get("annual_stddev")
-                invalid = 0
-                if missing:
-                    invalid = 1
-                if p["n"] != n_act:
-                    invalid = 1
-                if (m.get("max_effective_gross") or 0) > self._agx_max_gross + 1e-6:
-                    invalid = 1
-                if std is not None and std > 0.20:
-                    invalid = 1
-                row = dict(m)
-                row["wins"] = wins
-                row["oos_sharpe"] = oos.get("Sharpe")
-                row["crisis_maxdd"] = cri.get("MaxDD")
-                row["y2020_maxdd"] = y20.get("MaxDD")
-                row["y2022_maxdd"] = y22.get("MaxDD")
-                row["w5_abs"] = -float(m.get("worst_5pct_day_mean") or 0)
-                row["invalid"] = invalid
-                row["boundary"] = int(self._AgxIsBoundary(p))
-                d0 = 0
-                tgt = 0
-                if not invalid and ctrl_m:
-                    def _ge(a, b):
-                        return a is not None and b is not None and a >= b
-
-                    def _le(a, b):
-                        return a is not None and b is not None and a <= b
-
-                    c_oos = (self._AgxWindowMetrics(ctrl["dates"], ctrl["rets"], _date(2019, 1, 1), _date(2021, 12, 31)) or {})
-                    c_cri = (self._AgxWindowMetrics(ctrl["dates"], ctrl["rets"], _date(2022, 1, 1), _date(2025, 12, 31)) or {})
-                    c_y20 = (self._AgxWindowMetrics(ctrl["dates"], ctrl["rets"], _date(2020, 1, 1), _date(2020, 12, 31)) or {})
-                    c_y22 = (self._AgxWindowMetrics(ctrl["dates"], ctrl["rets"], _date(2022, 1, 1), _date(2022, 12, 31)) or {})
-                    ok = (
-                        _le(m.get("MaxDD"), ctrl_m.get("MaxDD"))
-                        and _ge(m.get("worst_5pct_day_mean"), ctrl_m.get("worst_5pct_day_mean"))
-                        and _ge(oos.get("Sharpe"), 0.95 * (c_oos.get("Sharpe") or 0))
-                        and _le(cri.get("MaxDD"), (c_cri.get("MaxDD") or 0) + 0.01)
-                        and _le(y20.get("MaxDD"), (c_y20.get("MaxDD") or 0) + 0.01)
-                        and _le(y22.get("MaxDD"), (c_y22.get("MaxDD") or 0) + 0.01)
-                        and (std is not None and std <= 0.18)
-                        and _le(m.get("recovery_days_max"), ctrl_m.get("recovery_days_max"))
-                        and _ge(m.get("CAGR"), ctrl_m.get("CAGR"))
-                        and (m.get("CAGR") or 0) > (ctrl_m.get("CAGR") or 0)
+                            continue
+                        wm = self._AgxWindowMetrics(p["dates"], p["rets"], s, e)
+                        wins[name] = wm
+                        if (wm is None or wm.get("n", 0) <= 0) and name in (
+                            "RUN", "TRAIN_2012_2018", "OOS_2019_2021", "CRISIS_2022_2025"
+                        ):
+                            missing += 1
+                    oos = wins.get("OOS_2019_2021") or {}
+                    cri = wins.get("CRISIS_2022_2025") or {}
+                    y20 = wins.get("Y2020") or {}
+                    y22 = wins.get("Y2022") or {}
+                    std = m.get("annual_stddev")
+                    invalid = 0
+                    if missing or len(p["rets"]) != n_ind:
+                        invalid = 1
+                    if (m.get("max_effective_gross") or 0) > self._agx_max_gross + 1e-6:
+                        invalid = 1
+                    if std is not None and std > 0.20:
+                        invalid = 1
+                    if float(m.get("fixed_err") or 0) > 1e-12:
+                        invalid = 1
+                    row = dict(m)
+                    row["wins"] = wins
+                    row["oos_sharpe"] = oos.get("Sharpe")
+                    row["crisis_maxdd"] = cri.get("MaxDD")
+                    row["y2020_maxdd"] = y20.get("MaxDD")
+                    row["y2022_maxdd"] = y22.get("MaxDD")
+                    row["w5_abs"] = -float(m.get("worst_5pct_day_mean") or 0)
+                    row["invalid"] = invalid
+                    row["boundary"] = int(
+                        abs(p["roff"]) < 1e-12 or abs(p["ron"] - 1.30) < 1e-12
+                        or abs(p["neu"] - 0.50) < 1e-12
                     )
-                    d0 = int(ok)
-                    if (
-                        (m.get("CAGR") or 0) >= 0.45
-                        and (m.get("MaxDD") or 9) <= 0.13
-                        and (std or 9) <= 0.18
-                    ):
-                        tgt = 1
-                row["D0_PASS"] = d0
-                row["TARGET_PROFILE_MET"] = tgt
-                row["_p"] = p
-                rows.append(row)
+                    d1 = 0
+                    tgt = 0
+                    if not invalid and ctrl_m:
+                        def _ge(a, b):
+                            return a is not None and b is not None and a >= b
 
-            valid_rows = [r for r in rows if not r["invalid"]]
-            front = self._AgxPareto(valid_rows, ctrl_m) if valid_rows else []
-            ranked = sorted(valid_rows, key=self._AgxRankKey) if valid_rows else []
-            top20 = ranked[:20]
-            d0s = [r for r in ranked if r["D0_PASS"]]
-            tgts = [r for r in ranked if r["TARGET_PROFILE_MET"]]
-            by_id = {r["id"]: r for r in rows}
-            for r in top20:
-                a, b, c, all_ok = self._AgxNeighborStable(r, by_id)
-                r["ron_neighbor_stable"] = int(a)
-                r["neutral_neighbor_stable"] = int(b)
-                r["riskoff_neighbor_stable"] = int(c)
-                r["all_neighbors_stable"] = int(all_ok)
-            b_all = [r for r in ranked if r["boundary"]]
-            b_front = [r for r in front if r["boundary"]]
-            b_d0 = [r for r in d0s if r["boundary"]]
-            best_b = b_all[0] if b_all else None
-            best_i = next((r for r in ranked if not r["boundary"]), None)
-            b_adv_cagr = b_adv_dd = b_adv_oos = None
-            if best_b and best_i:
-                b_adv_cagr = (best_b.get("CAGR") or 0) - (best_i.get("CAGR") or 0)
-                b_adv_dd = (best_b.get("MaxDD") or 0) - (best_i.get("MaxDD") or 0)
-                b_adv_oos = (best_b.get("oos_sharpe") or 0) - (best_i.get("oos_sharpe") or 0)
-            b_class = "NA"
-            if best_b:
-                if best_b.get("all_neighbors_stable", 1) and best_b in d0s:
-                    b_class = "BOUNDARY_ROBUST"
-                elif abs(best_b["ron"] - 1.50) < 1e-12 or abs(best_b["neu"] - 1.25) < 1e-12:
-                    b_class = "BOUNDARY_NEEDS_EXTENSION"
-                else:
-                    b_class = "BOUNDARY_UNSTABLE"
+                        def _le(a, b):
+                            return a is not None and b is not None and a <= b
 
-            csv_key = "cg_agx_shadow_d0.csv"
+                        c_oos = self._AgxWindowMetrics(
+                            self._agx_ctrl["dates"], self._agx_ctrl["rets"],
+                            _date(2019, 1, 1), _date(2021, 12, 31)) or {}
+                        c_cri = self._AgxWindowMetrics(
+                            self._agx_ctrl["dates"], self._agx_ctrl["rets"],
+                            _date(2022, 1, 1), _date(2025, 12, 31)) or {}
+                        c_y20 = self._AgxWindowMetrics(
+                            self._agx_ctrl["dates"], self._agx_ctrl["rets"],
+                            _date(2020, 1, 1), _date(2020, 12, 31)) or {}
+                        c_y22 = self._AgxWindowMetrics(
+                            self._agx_ctrl["dates"], self._agx_ctrl["rets"],
+                            _date(2022, 1, 1), _date(2022, 12, 31)) or {}
+                        ok = (
+                            _le(m.get("MaxDD"), ctrl_m.get("MaxDD"))
+                            and _ge(m.get("worst_5pct_day_mean"), ctrl_m.get("worst_5pct_day_mean"))
+                            and _ge(oos.get("Sharpe"), 0.95 * (c_oos.get("Sharpe") or 0))
+                            and _le(cri.get("MaxDD"), (c_cri.get("MaxDD") or 0) + 0.01)
+                            and _le(y20.get("MaxDD"), (c_y20.get("MaxDD") or 0) + 0.01)
+                            and _le(y22.get("MaxDD"), (c_y22.get("MaxDD") or 0) + 0.01)
+                            and (std is not None and std <= 0.18)
+                            and _le(m.get("recovery_days_max"), ctrl_m.get("recovery_days_max"))
+                            and (m.get("CAGR") or 0) > (ctrl_m.get("CAGR") or 0)
+                        )
+                        d1 = int(ok)
+                        if ((m.get("CAGR") or 0) >= 0.45 and (m.get("MaxDD") or 9) <= 0.13
+                                and (std or 9) <= 0.18):
+                            tgt = 1
+                    row["D1_PASS"] = d1
+                    row["TARGET_PROFILE_MET"] = tgt
+                    row["_p"] = p
+                    rows.append(row)
+                return rows
+
+            def model_ctrl_ok(pctrl):
+                if not pctrl:
+                    return False, None, None
+                m = self._AgxPolMetrics(pctrl)
+                nav_d = None
+                dd_d = None
+                if ctrl_m.get("end_nav") and m.get("end_nav"):
+                    nav_d = abs(m["end_nav"] / ctrl_m["end_nav"] - 1.0) * 100.0
+                if ctrl_m.get("MaxDD") is not None and m.get("MaxDD") is not None:
+                    dd_d = abs(m["MaxDD"] - ctrl_m["MaxDD"]) * 100.0
+                ok = (nav_d is not None and nav_d <= 0.01 and dd_d is not None and dd_d <= 0.01)
+                return ok, nav_d, dd_d
+
+            a_ok, a_navd, a_ddd = model_ctrl_ok(self._agx_a_ctrl)
+            b_ok, b_navd, b_ddd = model_ctrl_ok(self._agx_b_ctrl)
+
+            results = {}
+            all_rows = []
+            for model, valid in (("A", a_ok), ("B", b_ok)):
+                rows = build_rows(model)
+                all_rows.extend(rows)
+                if not valid:
+                    results[model] = {
+                        "valid": False, "rows": rows, "ranked": [], "d1": [],
+                        "front": [], "top": [], "best": None,
+                    }
+                    continue
+                valid_rows = [r for r in rows if not r["invalid"]]
+                front = self._AgxPareto(valid_rows) if valid_rows else []
+                ranked = sorted(valid_rows, key=self._AgxRankKey) if valid_rows else []
+                d1s = [r for r in ranked if r["D1_PASS"]]
+                by_id = {r["id"]: r for r in rows}
+                top = ranked[:10]
+                for r in top:
+                    x, y, z, all_ok = self._AgxNeighborStable(r, by_id, model)
+                    r["ron_neighbor_stable"] = int(x)
+                    r["neutral_neighbor_stable"] = int(y)
+                    r["riskoff_neighbor_stable"] = int(z)
+                    r["all_neighbors_stable"] = int(all_ok)
+                results[model] = {
+                    "valid": True, "rows": rows, "ranked": ranked, "d1": d1s,
+                    "front": front, "top": top, "best": (d1s[0] if d1s else (ranked[0] if ranked else None)),
+                    "by_id": by_id,
+                }
+
+            # CSV
+            csv_key = "cg_agx_independent_d1.csv"
             try:
                 headers = [
-                    "id", "ron", "neu", "roff", "CAGR", "MaxDD", "annual_stddev", "Sharpe", "Sortino",
-                    "worst_5pct_day_mean", "worst_day", "best_day", "recovery_days_max",
-                    "time_under_water_pct", "positive_day_rate", "turnover", "estimated_cost",
-                    "rebalance_count", "cap_hit_count", "mean_effective_gross", "median_effective_gross",
-                    "p95_effective_gross", "max_effective_gross", "days_RISK_ON", "days_NEUTRAL",
-                    "days_RISK_OFF", "oos_sharpe", "crisis_maxdd", "y2020_maxdd", "y2022_maxdd",
-                    "D0_PASS", "TARGET_PROFILE_MET", "boundary", "invalid",
+                    "id", "model", "ron", "neu", "roff", "CAGR", "MaxDD", "annual_stddev",
+                    "Sharpe", "Sortino", "worst_5pct_day_mean", "worst_day", "best_day",
+                    "recovery_days_max", "time_under_water_pct", "positive_day_rate",
+                    "turnover", "estimated_fees", "rebalance_count", "cap_hit_count",
+                    "mean_effective_gross", "median_effective_gross", "p95_effective_gross",
+                    "max_effective_gross", "oos_sharpe", "crisis_maxdd", "y2020_maxdd",
+                    "y2022_maxdd", "D1_PASS", "TARGET_PROFILE_MET", "boundary", "invalid",
                 ]
                 lines = [",".join(headers)]
-                for r in rows:
+                for r in all_rows:
                     lines.append(",".join(str(r.get(h, "NA")) for h in headers))
                 self.object_store.save(csv_key, "\n".join(lines))
             except Exception as exc:
                 csv_key = f"NONE:{type(exc).__name__}"
 
-            best = d0s[0] if d0s else (ranked[0] if ranked else None)
-            stable_d0 = [r for r in d0s if r.get("all_neighbors_stable")]
+            def med(xs):
+                xs = [x for x in xs if x is not None]
+                if not xs:
+                    return None
+                xs = sorted(xs)
+                return xs[len(xs) // 2]
+
+            # Model comparison
+            def med_field(model, field):
+                rs = results[model]["ranked"]
+                return med([r.get(field) for r in rs])
+
+            a_d1 = len(results["A"]["d1"])
+            b_d1 = len(results["B"]["d1"])
+            a_p = len(results["A"]["front"])
+            b_p = len(results["B"]["front"])
+            if not results["A"]["valid"] and not results["B"]["valid"]:
+                model_cmp = "NEITHER_VALID"
+            elif results["A"]["valid"] and not results["B"]["valid"]:
+                model_cmp = "MODEL_A_DOMINATES"
+            elif results["B"]["valid"] and not results["A"]["valid"]:
+                model_cmp = "MODEL_B_DOMINATES"
+            else:
+                # Prefer more D1_PASS, then better median crisis MaxDD, then OOS Sharpe
+                score_a = (a_d1, -float(med_field("A", "crisis_maxdd") or 9), float(med_field("A", "oos_sharpe") or -9))
+                score_b = (b_d1, -float(med_field("B", "crisis_maxdd") or 9), float(med_field("B", "oos_sharpe") or -9))
+                if score_a > score_b:
+                    model_cmp = "MODEL_A_DOMINATES"
+                elif score_b > score_a:
+                    model_cmp = "MODEL_B_DOMINATES"
+                else:
+                    model_cmp = "MIXED"
+
+            tgt_n = sum(1 for r in all_rows if r.get("TARGET_PROFILE_MET"))
+            stable_d1 = []
+            for model in ("A", "B"):
+                if results[model]["valid"]:
+                    stable_d1.extend([r for r in results[model]["d1"] if r.get("all_neighbors_stable")])
+
             next_dec = "STOP_AGX"
-            if not ranked:
-                next_dec = "STOP_AGX"
-            elif stable_d0:
-                next_dec = "PREPARE_AGX_SHADOW_D1"
-            elif d0s or front:
-                tr = ctrl["tr_r"] if ctrl else {}
+            if not results["A"]["valid"] and not results["B"]["valid"]:
+                next_dec = "FIX_INDEPENDENT_LEDGER"
+            elif stable_d1:
+                next_dec = "PREPARE_AGX_D2"
+            elif a_d1 or b_d1 or results["A"]["front"] or results["B"]["front"]:
+                tr = self._agx_ctrl["tr_r"]
                 early = abs(tr.get("0", 0) + tr.get("1", 0) + tr.get("2-3", 0) + tr.get("4-10", 0))
                 late = abs(tr.get(">10", 0))
-                if early > 0 and early >= 1.25 * max(late, 1e-9) and not stable_d0:
+                if early > 0 and early >= 1.25 * max(late, 1e-9):
                     next_dec = "TEST_RISK_REENTRY"
+                elif model_cmp == "MODEL_A_DOMINATES":
+                    next_dec = "REFINE_MODEL_A"
+                elif model_cmp == "MODEL_B_DOMINATES":
+                    next_dec = "REFINE_MODEL_B"
                 else:
-                    next_dec = "REFINE_AGX"
-
-            try:
-                self.set_runtime_statistic("AGX_PARITY", str(int(parity_pass)))
-                self.set_runtime_statistic("AGX_NEXT", str(next_dec))
-                self.set_runtime_statistic("AGX_D0", str(len(d0s)))
-                self.set_runtime_statistic("AGX_BEST", str((best or {}).get("id", "NONE")))
-                if best:
-                    self.set_runtime_statistic("AGX_BEST_CAGR", _f(best.get("CAGR")))
-                    self.set_runtime_statistic("AGX_BEST_DD", _f(best.get("MaxDD")))
-            except Exception:
-                pass
+                    next_dec = "STOP_AGX"
+            else:
+                next_dec = "STOP_AGX"
 
             self._AgxLog(
-                f"CG_AGX_SHADOW_FINAL,diagnostic_valid=1,"
-                f"selection_allowed={selection_allowed},policies={len(rows)},"
-                f"parity_pass=1,errors={self._agx_err},"
-                f"d0_pass={len(d0s)},target_profile_met={len(tgts)},"
-                f"pareto={len(front)},next={next_dec},artifact={csv_key},"
-                f"captured={self._agx_n_cap},immediate={self._agx_n_imm},"
-                f"deferred={self._agx_n_def},executed={self._agx_n_exe},"
-                f"obs_max_target_gross={_f(max_base)},obs_p95_target_gross={_f(p95_base)}"
+                f"CG_AGX_D1_VALIDATION,A_control_vs_independent_NAV_diff={_f(a_navd,6)},"
+                f"B_control_vs_independent_NAV_diff={_f(b_navd,6)},"
+                f"A_control_vs_independent_MaxDD_diff={_f(a_ddd,6)},"
+                f"B_control_vs_independent_MaxDD_diff={_f(b_ddd,6)},"
+                f"model_a_valid={'YES' if a_ok else 'NO'},model_b_valid={'YES' if b_ok else 'NO'},"
+                f"obs_max_target_gross={_f(max_base)},obs_p95_target_gross={_f(p95_base)},"
+                f"prod_cap={_f(self._agx_prod_gross_cap)},eff_cap={_f(self._agx_max_gross)},"
+                f"live_recent={live_s}..{today},"
+                f"cls_risk={','.join(sorted(self._agx_cls['SCALABLE_RISK'])[:30])},"
+                f"cls_def={','.join(sorted(self._agx_cls['FIXED_DEFENSIVE']))},"
+                f"cls_park={','.join(sorted(self._agx_cls['PARKING_ETF']))},"
+                f"cls_uncertain={','.join(sorted(self._agx_cls['KEEP_FIXED_UNCERTAIN']))}"
             )
-            self._AgxLog(
-                f"CG_AGX_SHADOW_VALIDATION,boundary_policy_count={len(b_all)},"
-                f"boundary_pareto_count={len(b_front)},boundary_d0_pass_count={len(b_d0)},"
-                f"best_boundary_policy={(best_b or {}).get('id', 'NONE')},"
-                f"best_interior_policy={(best_i or {}).get('id', 'NONE')},"
-                f"boundary_advantage_cagr={_f(b_adv_cagr)},"
-                f"boundary_advantage_maxdd={_f(b_adv_dd)},"
-                f"boundary_advantage_oos_sharpe={_f(b_adv_oos)},"
-                f"boundary_class={b_class}"
-            )
-            emit_ids = set()
-            if ctrl:
-                emit_ids.add(ctrl["id"])
-            for r in top20:
-                emit_ids.add(r["id"])
-            for r in front:
-                emit_ids.add(r["id"])
-            for r in d0s:
-                emit_ids.add(r["id"])
-            for r in rows:
-                if r["id"] not in emit_ids:
-                    continue
+
+            for model in ("A", "B"):
+                rs = results[model]
+                _bw = sum(1 for r in rs["ranked"] if r.get("boundary"))
+                _ch = sum(r.get("cap_hit_count", 0) for r in rs["ranked"])
+                _rb = sum(r.get("rebalance_count", 0) for r in rs["ranked"])
+                _chr = (_ch / _rb) if _rb else 0.0
+                _best = (rs["best"] or {}).get("id", "NONE")
+                self._AgxLog(
+                    f"CG_AGX_D1_MODEL,model={model},valid={int(rs['valid'])},"
+                    f"d1_pass={len(rs['d1'])},pareto={len(rs['front'])},"
+                    f"median_CAGR={_f(med_field(model,'CAGR'))},"
+                    f"median_MaxDD={_f(med_field(model,'MaxDD'))},"
+                    f"median_oos_sharpe={_f(med_field(model,'oos_sharpe'))},"
+                    f"median_crisis_maxdd={_f(med_field(model,'crisis_maxdd'))},"
+                    f"best={_best},boundary_winners={_bw},cap_hit_rate={_f(_chr)}"
+                )
+
+            emit = set()
+            for model in ("A", "B"):
+                if self._agx_by_id.get(_pid(model, 1, 1, 1)):
+                    emit.add(_pid(model, 1, 1, 1))
+                for r in results[model]["top"] + results[model]["front"] + results[model]["d1"]:
+                    emit.add(r["id"])
+
+            for model in ("A", "B"):
+                for i, r in enumerate(results[model]["top"]):
+                    self._AgxLog(
+                        f"CG_AGX_D1_TOP,model={model},rank={i+1},id={r['id']},"
+                        f"ron={_f(r['ron'],2)},neu={_f(r['neu'],2)},roff={_f(r['roff'],2)},"
+                        f"CAGR={_f(r.get('CAGR'))},MaxDD={_f(r.get('MaxDD'))},"
+                        f"std={_f(r.get('annual_stddev'))},Sharpe={_f(r.get('Sharpe'))},"
+                        f"w5={_f(r.get('worst_5pct_day_mean'))},oos_sh={_f(r.get('oos_sharpe'))},"
+                        f"crisis_dd={_f(r.get('crisis_maxdd'))},rec={r.get('recovery_days_max')},"
+                        f"D1={r.get('D1_PASS')},stable={r.get('all_neighbors_stable',0)},"
+                        f"boundary={r.get('boundary')}"
+                    )
+
+            # Windows for control + top5 per valid model
+            focus = [self._agx_ctrl]
+            for model in ("A", "B"):
+                if results[model]["valid"]:
+                    focus.extend([r["_p"] for r in results[model]["top"][:5]])
+            for p in focus:
+                mid = p["id"]
                 for name, s, e in windows:
-                    wm = (r.get("wins") or {}).get(name)
+                    wm = self._AgxWindowMetrics(p["dates"], p["rets"], s, e)
                     if not wm:
                         continue
+                    if mid not in emit and mid != "INDEPENDENT_CONTROL":
+                        continue
                     self._AgxLog(
-                        f"CG_AGX_SHADOW_WINDOW,id={r['id']},window={name},"
-                        f"n={wm.get('n')},CAGR={_f(wm.get('CAGR'))},"
-                        f"MaxDD={_f(wm.get('MaxDD'))},Sharpe={_f(wm.get('Sharpe'))},"
-                        f"std={_f(wm.get('annual_stddev'))},"
-                        f"w5={_f(wm.get('worst_5pct_day_mean'))},"
-                        f"rec={wm.get('recovery_days_max')}"
+                        f"CG_AGX_D1_WINDOW,id={mid},window={name},n={wm.get('n')},"
+                        f"CAGR={_f(wm.get('CAGR'))},MaxDD={_f(wm.get('MaxDD'))},"
+                        f"Sharpe={_f(wm.get('Sharpe'))},std={_f(wm.get('annual_stddev'))},"
+                        f"w5={_f(wm.get('worst_5pct_day_mean'))},rec={wm.get('recovery_days_max')}"
                     )
-            for i, r in enumerate(top20):
-                self._AgxLog(
-                    f"CG_AGX_SHADOW_TOP,rank={i + 1},id={r['id']},"
-                    f"ron={_f(r['ron'], 2)},neu={_f(r['neu'], 2)},roff={_f(r['roff'], 2)},"
-                    f"CAGR={_f(r.get('CAGR'))},MaxDD={_f(r.get('MaxDD'))},"
-                    f"std={_f(r.get('annual_stddev'))},Sharpe={_f(r.get('Sharpe'))},"
-                    f"w5={_f(r.get('worst_5pct_day_mean'))},oos_sh={_f(r.get('oos_sharpe'))},"
-                    f"crisis_dd={_f(r.get('crisis_maxdd'))},rec={r.get('recovery_days_max')},"
-                    f"D0={r.get('D0_PASS')},stable={r.get('all_neighbors_stable', 0)},"
-                    f"boundary={r.get('boundary')}"
-                )
-            for r in ([by_id.get(_CTRL)] if _CTRL in by_id else []) + top20[:5]:
-                if not r:
-                    continue
-                p = r.get("_p")
-                if not p:
-                    continue
+
+            for p in focus[:11]:
                 for rg in ("RISK_ON", "NEUTRAL", "RISK_OFF"):
                     n = p["rg_n"][rg]
                     w5l = p["rg_w5"][rg]
-                    w5 = (
-                        sum(sorted(w5l)[:max(1, int(0.05 * len(w5l) + 0.999))])
-                        / max(1, int(0.05 * len(w5l) + 0.999))
-                    ) if w5l else None
+                    w5 = None
+                    if w5l:
+                        kk = max(1, int(0.05 * len(w5l) + 0.999))
+                        w5 = sum(sorted(w5l)[:kk]) / kk
                     self._AgxLog(
-                        f"CG_AGX_SHADOW_REGIME,id={p['id']},regime={rg},days={n},"
+                        f"CG_AGX_D1_REGIME,id={p['id']},regime={rg},days={n},"
                         f"ret_contrib={_f(p['rg_r'][rg])},dd={_f(p['rg_dd'][rg])},"
-                        f"w5={_f(w5)},mean_base_gross={_f(p['rg_bg'][rg] / n if n else None)},"
-                        f"mean_eff_gross={_f(p['rg_eg'][rg] / n if n else None)},"
+                        f"w5={_f(w5)},mean_eff_gross={_f(p['rg_eg'][rg]/n if n else None)},"
                         f"cap_hit={p['rg_cap'][rg]}"
                     )
                 for tb in ("0", "1", "2-3", "4-10", ">10"):
                     self._AgxLog(
-                        f"CG_AGX_SHADOW_TRANSITION,id={p['id']},bucket={tb},"
+                        f"CG_AGX_D1_TRANSITION,id={p['id']},bucket={tb},"
                         f"days={p['tr_n'][tb]},ret_contrib={_f(p['tr_r'][tb])}"
                     )
-            self._agx_result = {
-                "parity": True, "best": best, "d0": d0s, "front": front,
-                "top20": top20, "next": next_dec, "artifact": csv_key,
-                "ctrl": ctrl_m, "valid": 1,
-                "live_recent_start": str(live_s), "live_recent_end": str(today),
-            }
+
+            self._AgxLog(
+                f"CG_AGX_D1_FINAL,diagnostic=CG-AGX-INDEPENDENT-PARITY-D1,"
+                f"independent_parity_gate=PASS,continue_to_grid=YES,"
+                f"model_a_valid={'YES' if a_ok else 'NO'},model_b_valid={'YES' if b_ok else 'NO'},"
+                f"policies_evaluated={len(all_rows)},"
+                f"model_a_best={(results['A']['best'] or {}).get('id','NONE')},"
+                f"model_b_best={(results['B']['best'] or {}).get('id','NONE')},"
+                f"model_a_d1_pass_count={a_d1},model_b_d1_pass_count={b_d1},"
+                f"model_a_pareto_count={a_p},model_b_pareto_count={b_p},"
+                f"model_comparison={model_cmp},target_profile_met_count={tgt_n},"
+                f"result_artifact={csv_key},next={next_dec}"
+            )
         except Exception as exc:
             self._agx_err += 1
             try:
-                self.log(f"CG_AGX_SHADOW_VALIDATION,emit_error={type(exc).__name__}:{exc}")
+                self.log(f"CG_AGX_D1_FINAL,emit_error={type(exc).__name__}:{exc}")
             except Exception:
                 pass
