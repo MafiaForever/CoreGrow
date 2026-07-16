@@ -15,8 +15,7 @@ from cg_subscriptions import CoreGrowthSubscriptionMixin
 from cg_core_recovery_diag import CgCoreRecoveryDiagMixin
 from cg_ids_normal_cap_diag import CgIdsNormalCapDiagMixin
 from cg_defensive_trade import CgDefensiveTradeMixin
-from cg_agx_shadow_diag import CgAgxShadowDiagMixin
-from cg_agx_exec_replay_p1 import CgAgxExecReplayMixin
+from cg_shadow_replay import CgShadowReplayMixin
 from cg_main_runtime_utils import CgMainRuntimeUtilsMixin, AttachCgMixins
 
 
@@ -1108,7 +1107,7 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         if order_event is None: return
         try: self.CgCoreRecoveryOnOrder(order_event)  # [CORE-D0.2]
         except Exception: pass
-        try: self.CgAgxReplayOnOrderEvent(order_event)
+        try: self.CgShadowReplayOnOrderEvent(order_event)
         except Exception: pass
         try:
             _t=getattr(order_event.symbol,"Value","")
@@ -1177,10 +1176,10 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
     def OnData(self, data):
         try: self.SHOnData(data)
         except Exception: pass
-        try: self.CgAgxReplayOnData(data)
+        try: self.CgShadowReplayOnData(data)
         except Exception: pass
 
 
 from sh_hedge import _SH_IDLE, _SH_HEDGED, _SH_ENTRY_PENDING, _SH_EXIT_PENDING  # noqa: F401
 
-AttachCgMixins(CoreGrowthPlusConditionalTrendSleeve, (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgDefensiveTradeMixin, CgAgxShadowDiagMixin, CgAgxExecReplayMixin, CgMainRuntimeUtilsMixin))
+AttachCgMixins(CoreGrowthPlusConditionalTrendSleeve, (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgDefensiveTradeMixin, CgShadowReplayMixin, CgMainRuntimeUtilsMixin))

@@ -302,14 +302,8 @@ class CgRegimeRebalTimeTradeMixin:
             self._cg_rt_n_cap += 1
             self._cg_rt_n_imm += 1
             try:
-                if getattr(self, "cg_agx_shadow_diag_enable", False):
-                    self.CgAgxShadowCapture(
-                        combined, regime, _SIGNAL_SLOT,
-                        reduce_only=bool(reduce_only),
-                        emergency=bool(force_immediate and not reduce_only),
-                    )
-                if getattr(self, "_agx_rp_on", False):
-                    self.CgAgxReplayCapture(
+                if getattr(self, "_sr_on", False):
+                    self.CgShadowReplayCapture(
                         combined, regime, _SIGNAL_SLOT,
                         reduce_only=bool(reduce_only),
                         emergency=bool(force_immediate and not reduce_only),
@@ -322,10 +316,8 @@ class CgRegimeRebalTimeTradeMixin:
         if slot == _SIGNAL_SLOT:
             self._cg_rt_n_imm += 1
             try:
-                if getattr(self, "cg_agx_shadow_diag_enable", False):
-                    self.CgAgxShadowCapture(combined, rg, slot, False, False)
-                if getattr(self, "_agx_rp_on", False):
-                    self.CgAgxReplayCapture(combined, rg, slot, False, False)
+                if getattr(self, "_sr_on", False):
+                    self.CgShadowReplayCapture(combined, rg, slot, False, False)
             except Exception:
                 pass
             return True
@@ -339,8 +331,7 @@ class CgRegimeRebalTimeTradeMixin:
         self._cg_rt_pending_ts = self.time
         self._cg_rt_n_def += 1
         prev_rg = getattr(self, "_cg_rt_last_regime_log", None)
-        if (not getattr(self, "cg_agx_shadow_diag_enable", False)
-                and (slot != _SIGNAL_SLOT or rg != prev_rg)):
+        if slot != _SIGNAL_SLOT or rg != prev_rg:
             self.log(
                 f"CG_REGIME_TIME_PENDING,date={self._cg_rt_pending_date},"
                 f"regime={rg},slot={slot},"
@@ -351,10 +342,8 @@ class CgRegimeRebalTimeTradeMixin:
         else:
             self._cg_rt_last_regime_log = rg
         try:
-            if getattr(self, "cg_agx_shadow_diag_enable", False):
-                self.CgAgxShadowCapture(combined, rg, slot, False, False)
-            if getattr(self, "_agx_rp_on", False):
-                self.CgAgxReplayCapture(combined, rg, slot, False, False)
+            if getattr(self, "_sr_on", False):
+                self.CgShadowReplayCapture(combined, rg, slot, False, False)
         except Exception:
             pass
         self._RtTradeSaveLive()
@@ -416,30 +405,22 @@ class CgRegimeRebalTimeTradeMixin:
                 delay = int(slot_minutes) - _SIGNAL_SLOT
             reduce_only = bool(self._cg_rt_pending_reduce)
             try:
-                if getattr(self, "cg_agx_shadow_diag_enable", False):
-                    self.CgAgxShadowExecutePending()
-                if getattr(self, "_agx_rp_on", False):
-                    self.CgAgxReplayExecutePending()
+                if getattr(self, "_sr_on", False):
+                    self.CgShadowReplayExecutePending()
             except Exception:
                 pass
             if reduce_only:
                 self.ExecuteTargets(targets, reduce_only=True)
             else:
                 self.ExecuteTargets(targets)
-            try:
-                if getattr(self, "_agx_enabled", False):
-                    self.CgAgxShadowAuditPostExec()
-            except Exception:
-                pass
             self._cg_rt_pending_executed = True
             self._cg_rt_n_exe += 1
-            if not getattr(self, "cg_agx_shadow_diag_enable", False):
-                self.log(
-                    f"CG_REGIME_TIME_EXEC,date={d},"
-                    f"regime={self._cg_rt_pending_regime},slot={slot_minutes},"
-                    f"captured={captured},executed={self.time},"
-                    f"delay_minutes={delay},target_count={len(targets)}"
-                )
+            self.log(
+                f"CG_REGIME_TIME_EXEC,date={d},"
+                f"regime={self._cg_rt_pending_regime},slot={slot_minutes},"
+                f"captured={captured},executed={self.time},"
+                f"delay_minutes={delay},target_count={len(targets)}"
+            )
             self._RtTradeClearPending()
             self._RtTradeSaveLive()
         except Exception as exc:
@@ -528,10 +509,6 @@ class CgRegimeRebalTimeTradeMixin:
         except Exception:
             pass
         try:
-            self.CgAgxShadowEmitFinal()
-        except Exception:
-            pass
-        try:
-            self.CgAgxReplayEmitFinal()
+            self.CgShadowReplayEmitFinal()
         except Exception:
             pass
