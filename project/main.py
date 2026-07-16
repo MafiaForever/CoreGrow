@@ -1089,26 +1089,16 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
             return
         equity = float(self.portfolio.total_portfolio_value)
         dd     = self.CurrentDrawdown()
-
         self.plot("portfolio", "Equity",   equity)
         self.plot("portfolio", "Drawdown", dd * 100.0)
-
-        if self.current_regime == "RISK_OFF":
-            regime_code = 0
-        elif self.current_regime == "RISK_ON":
-            regime_code = 2
-        else:
-            regime_code = 1
-
+        regime_code = {"RISK_OFF": 0, "RISK_ON": 2}.get(self.current_regime, 1)
         self.plot("Regime", "RegimeCode", regime_code)
         self.plot("Regime", "TrendState", 1 if self.trend_state_in_spy else 0)
-
         realized_vol = self.GetApproxRealizedVol()
         try:
             vix_pct = self.GetVixPercentile()
         except Exception:
             vix_pct = None
-
         if realized_vol is not None and np.isfinite(realized_vol):
             self.plot("Volatility", "RealizedVolApprox", realized_vol * 100.0)
         if vix_pct is not None and np.isfinite(vix_pct):
@@ -1118,18 +1108,16 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         if order_event is None: return
         try: self.CgCoreRecoveryOnOrder(order_event)  # [CORE-D0.2]
         except Exception: pass
+        try: self.CgAgxReplayOnOrderEvent(order_event)
+        except Exception: pass
         try:
             _t=getattr(order_event.symbol,"Value","")
-            _rs={getattr(s,"Value","") for s in getattr(self,"_rrx_symbols",[])}
-            if _t in _rs: self._rrxg_rrx_orders=getattr(self,"_rrxg_rrx_orders",0)+1
+            if _t in {getattr(s,"Value","") for s in getattr(self,"_rrx_symbols",[])}:
+                self._rrxg_rrx_orders=getattr(self,"_rrxg_rrx_orders",0)+1
         except Exception: pass
         if not self.live_mode: return
         if order_event.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
-            self.log(
-                f"[FILL] {order_event.symbol.value} "
-                f"qty={order_event.fill_quantity} "
-                f"price={order_event.fill_price} "
-                f"status={order_event.status}")
+            self.log(f"[FILL] {order_event.symbol.value} qty={order_event.fill_quantity} price={order_event.fill_price} status={order_event.status}")
             if order_event.status == OrderStatus.FILLED:
                 if order_event.symbol in (self.sym_sh, self.sym_spy):
                     self.SHOnOrderFill(order_event.symbol)
@@ -1188,6 +1176,8 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
 
     def OnData(self, data):
         try: self.SHOnData(data)
+        except Exception: pass
+        try: self.CgAgxReplayOnData(data)
         except Exception: pass
 
 

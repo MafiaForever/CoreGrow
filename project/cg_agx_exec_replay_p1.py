@@ -241,31 +241,8 @@ class CgAgxExecReplayMixin:
             return _oliq(symbol, *a, **kw)
 
         self.liquidate = _wliq
-        # Observe fills/dividends without editing main callback bodies.
-        _ooe = self.OnOrderEvent
-
-        def _woe(order_event):
-            try:
-                self.CgAgxReplayOnOrderEvent(order_event)
-            except Exception:
-                pass
-            return _ooe(order_event)
-
-        self.OnOrderEvent = _woe
-        _od = self.OnData
-
-        def _wod(data):
-            try:
-                r = _od(data)
-            except Exception:
-                r = None
-            try:
-                self.CgAgxReplayOnData(data)
-            except Exception:
-                pass
-            return r
-
-        self.OnData = _wod
+        # LEAN dispatches OnOrderEvent/OnData via class methods; those hooks
+        # are wired in main.py. Keep set_holdings/liquidate wrappers only.
 
     def _AgxRpLog(self, msg):
         try:
