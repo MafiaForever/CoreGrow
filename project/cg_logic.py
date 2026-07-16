@@ -245,7 +245,11 @@ class CoreGrowthLogic(CoreGrowthRiskTacticalMixin):
             f"cooldown_until={self._dd_cb_resume_date} "
             f"regime={self.current_regime} panic={self.panic_mode_active}")
 
+        try: self.CgAgxReplayPushCtx("dd_cb","CheckDdCircuitBreaker","MANDATORY_OVERRIDE",emergency=True)
+        except Exception: pass
         self.liquidate()   # full portfolio including SH
+        try: self.CgAgxReplayPopCtx()
+        except Exception: pass
         return True   # skip rebalance this bar
 
     def CheckEmergencyStop(self):
@@ -287,11 +291,19 @@ class CoreGrowthLogic(CoreGrowthRiskTacticalMixin):
                 if symbol != park_symbol:
                     emergency_targets.append(PortfolioTarget(symbol, 0.0))
             emergency_targets.append(PortfolioTarget(park_symbol, 1.0))
+            try: self.CgAgxReplayPushCtx("emergency","TriggerEmergencyLiquidation","MANDATORY_OVERRIDE",emergency=True)
+            except Exception: pass
             self.set_holdings(emergency_targets)
+            try: self.CgAgxReplayPopCtx()
+            except Exception: pass
             self.log(f"[EMERGENCY] Submitted full defensive rebalance into {park_symbol.Value}")
         else:
+            try: self.CgAgxReplayPushCtx("emergency","TriggerEmergencyLiquidation","MANDATORY_OVERRIDE",emergency=True)
+            except Exception: pass
             for symbol in invested_symbols:
                 self.liquidate(symbol)
+            try: self.CgAgxReplayPopCtx()
+            except Exception: pass
             self.log("[EMERGENCY] Defensive asset unavailable; liquidated all positions to cash")
         self.emergency_liquidation_executed = True
         self.last_trade_date = self.time.date()
@@ -639,6 +651,16 @@ class CoreGrowthLogic(CoreGrowthRiskTacticalMixin):
         w = self.CombineWithTrendSleeve(w)
         return w
     def ExecuteTargets(self, targets, reduce_only=False):  # [LSS2]
+        _ecl = "MANDATORY_OVERRIDE" if reduce_only else "NORMAL_AGX_ELIGIBLE"
+        try: self.CgAgxReplayPushCtx("ExecuteTargets","ExecuteTargets",_ecl,reduce_only=bool(reduce_only),agx_eligible=not reduce_only,targets=targets)
+        except Exception: pass
+        try:
+            self._ExecuteTargetsBody(targets, reduce_only=reduce_only)
+        finally:
+            try: self.CgAgxReplayPopCtx()
+            except Exception: pass
+
+    def _ExecuteTargetsBody(self, targets, reduce_only=False):  # [LSS2]
         if getattr(self, "emergency_stop_triggered", False):
             self._diag['emergency_stop'] = 1
             return

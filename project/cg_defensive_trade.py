@@ -63,6 +63,10 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
             self.CgAgxShadowInit()
         except Exception:
             pass
+        try:
+            self.CgAgxReplayInit()
+        except Exception:
+            pass
 
     def _DftCashSym(self):
         return getattr(self, "sym_cash", None)

@@ -308,6 +308,12 @@ class CgRegimeRebalTimeTradeMixin:
                         reduce_only=bool(reduce_only),
                         emergency=bool(force_immediate and not reduce_only),
                     )
+                if getattr(self, "_agx_rp_on", False):
+                    self.CgAgxReplayCapture(
+                        combined, regime, _SIGNAL_SLOT,
+                        reduce_only=bool(reduce_only),
+                        emergency=bool(force_immediate and not reduce_only),
+                    )
             except Exception:
                 pass
             return True
@@ -318,6 +324,8 @@ class CgRegimeRebalTimeTradeMixin:
             try:
                 if getattr(self, "cg_agx_shadow_diag_enable", False):
                     self.CgAgxShadowCapture(combined, rg, slot, False, False)
+                if getattr(self, "_agx_rp_on", False):
+                    self.CgAgxReplayCapture(combined, rg, slot, False, False)
             except Exception:
                 pass
             return True
@@ -345,6 +353,8 @@ class CgRegimeRebalTimeTradeMixin:
         try:
             if getattr(self, "cg_agx_shadow_diag_enable", False):
                 self.CgAgxShadowCapture(combined, rg, slot, False, False)
+            if getattr(self, "_agx_rp_on", False):
+                self.CgAgxReplayCapture(combined, rg, slot, False, False)
         except Exception:
             pass
         self._RtTradeSaveLive()
@@ -408,6 +418,8 @@ class CgRegimeRebalTimeTradeMixin:
             try:
                 if getattr(self, "cg_agx_shadow_diag_enable", False):
                     self.CgAgxShadowExecutePending()
+                if getattr(self, "_agx_rp_on", False):
+                    self.CgAgxReplayExecutePending()
             except Exception:
                 pass
             if reduce_only:
@@ -517,5 +529,9 @@ class CgRegimeRebalTimeTradeMixin:
             pass
         try:
             self.CgAgxShadowEmitFinal()
+        except Exception:
+            pass
+        try:
+            self.CgAgxReplayEmitFinal()
         except Exception:
             pass

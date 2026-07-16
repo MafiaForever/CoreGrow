@@ -21,6 +21,7 @@ RRX_PARAMS = {
     "cg_agx_shadow_parity_debug":      "0",
     "cg_agx_independent_parity_enable": "0",
     "cg_agx_independent_grid_enable":  "0",
+    "cg_agx_exec_replay_enable":       "0",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
