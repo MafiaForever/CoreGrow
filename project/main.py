@@ -16,6 +16,7 @@ from cg_core_recovery_diag import CgCoreRecoveryDiagMixin
 from cg_ids_normal_cap_diag import CgIdsNormalCapDiagMixin
 from cg_defensive_trade import CgDefensiveTradeMixin
 from cg_shadow_replay import CgShadowReplayMixin
+from cg_maisr_diag import CgMaisrDiagMixin
 from cg_main_runtime_utils import CgMainRuntimeUtilsMixin, AttachCgMixins
 
 
@@ -1178,8 +1179,10 @@ class CoreGrowthPlusConditionalTrendSleeve(QCAlgorithm):
         except Exception: pass
         try: self.CgShadowReplayOnData(data)
         except Exception: pass
+        try: self.CgMaisrOnData(data)
+        except Exception: pass
 
 
 from sh_hedge import _SH_IDLE, _SH_HEDGED, _SH_ENTRY_PENDING, _SH_EXIT_PENDING  # noqa: F401
 
-AttachCgMixins(CoreGrowthPlusConditionalTrendSleeve, (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgDefensiveTradeMixin, CgShadowReplayMixin, CgMainRuntimeUtilsMixin))
+AttachCgMixins(CoreGrowthPlusConditionalTrendSleeve, (CoreGrowthSubscriptionMixin, CoreGrowthLogic, SHHedgeLogic, PanicScoreLogic, StressScenarioMixin, CoreGrowthMarketStructureMixin, DynamicThresholdDiagMixin, DynamicAllocationDiagMixin, RRXSectorDiagMixin, LiveCashFlowMixin, CgCoreRecoveryDiagMixin, CgIdsNormalCapDiagMixin, CgDefensiveTradeMixin, CgShadowReplayMixin, CgMaisrDiagMixin, CgMainRuntimeUtilsMixin))
