@@ -80,6 +80,8 @@ class CgShadowReplayMixin:
         self.cg_maisr_diag_enable = _bool("cg_maisr_diag_enable", "0")
         self.cg_maisr_grid_enable = _bool("cg_maisr_grid_enable", "0")
         self.cg_maisr_emit_events = _bool("cg_maisr_emit_events", "0")
+        self.cg_maisr_identity_only = _bool("cg_maisr_identity_only", "0")
+        self.cg_maisr_identity_debug = _bool("cg_maisr_identity_debug", "0")
         self._sr_cost_bps = _float("cg_maisr_cost_bps", 0.0)
         prod_cap = float(getattr(self, "max_total_exposure", 1.90) or 1.90)
         self._sr_prod_gross_cap = prod_cap
@@ -175,9 +177,10 @@ class CgShadowReplayMixin:
         self._sr_pols = []
         self._sr_by_id = {}
         self._sr_identity_ids = set()
+        self._sr_identity_leds = {}
 
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_MAISR_D0_", "CG_SHADOW_REPLAY_", "[INIT] CG_MAISR"):
+        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_", "CG_SHADOW_REPLAY_", "[INIT] CG_MAISR"):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
@@ -201,6 +204,71 @@ class CgShadowReplayMixin:
             except Exception as exc:
                 self._sr_err += 1
                 self.log(f"CG_SHADOW_REPLAY_INIT,schedule_error={type(exc).__name__}")
+            if self.cg_maisr_diag_enable:
+                try:
+                    self.CgShadowRegisterIdentityLedgers()
+                except Exception:
+                    self._sr_err += 1
+
+    def CgShadowRegisterIdentityLedgers(self) -> None:
+        """Fill-tracking ledgers that always apply production fills and are
+        NEVER touched by router reductions or synthetic weight reconstruction.
+        These prove the fill-replay accounting itself (root-cause fix for the
+        prior _MsSimulate-based identity, which never received real fills)."""
+        if not getattr(self, "_sr_on", False):
+            return
+        if getattr(self, "_sr_identity_leds", None):
+            return
+        cash0 = float(self._sr_cash0)
+        ids = (
+            "MAISR_REPLAY_IDENTITY",
+            "MAISR_PIPELINE_OFF_IDENTITY",
+            "MAISR_SENSOR_NO_ACTION_IDENTITY",
+            "MAISR_CANARY",
+        )
+        leds = {}
+        for pid in ids:
+            leds[pid] = _new_led(pid, cash0, {"identity": True})
+        self._sr_identity_leds = leds
+        if getattr(self, "cg_maisr_identity_debug", False):
+            self._SrLog(
+                f"CG_SHADOW_REPLAY_IDENTITY_LEDGERS,ids={','.join(ids)},cash0={_f(cash0,2)}"
+            )
+
+    def CgShadowIdentityCompare(self, replay_rets):
+        """Strict comparison of an identity ledger's daily-return series to
+        production actuals. Same thresholds already proven by _sr_ctrl / _SrGate."""
+        a = list(self._sr_actual_rets or [])
+        r = list(replay_rets or [])
+        n_a, n_r = len(a), len(r)
+        match = bool(n_a == n_r and n_a > 0)
+        am = self._SrMetrics(a) or {}
+        rm = self._SrMetrics(r) or {}
+        a_nav, r_nav = am.get("end_nav"), rm.get("end_nav")
+        a_dd, r_dd = am.get("MaxDD"), rm.get("MaxDD")
+        nav_d = ((r_nav / a_nav - 1.0) * 100.0) if (a_nav and r_nav is not None) else None
+        dd_d = ((r_dd - a_dd) * 100.0) if (a_dd is not None and r_dd is not None) else None
+        first_div_idx = None
+        if match:
+            diffs = [abs(x - y) for x, y in zip(a, r)]
+            max_d = max(diffs) if diffs else 0.0
+            mean_d = sum(diffs) / len(diffs) if diffs else 0.0
+            corr = self._SrCorr(a, r)
+            first_div_idx = next((i for i, dv in enumerate(diffs) if dv > 0.0005), None)
+        else:
+            max_d = mean_d = corr = None
+        ok = (
+            match
+            and nav_d is not None and abs(nav_d) <= 0.10
+            and dd_d is not None and abs(dd_d) <= 0.10
+            and corr is not None and corr >= 0.9999
+            and max_d is not None and max_d <= 0.0005
+            and mean_d is not None and mean_d <= 0.00005
+        )
+        return {
+            "pass": bool(ok), "match": match, "n": n_r, "nav_d": nav_d, "dd_d": dd_d,
+            "corr": corr, "max_d": max_d, "mean_d": mean_d, "first_div_idx": first_div_idx,
+        }
 
     def CgShadowRegisterPolicies(self, policies):
         """Attach candidate ledgers (called by MAISR after TRAIN selection)."""
@@ -606,6 +674,8 @@ class CgShadowReplayMixin:
             self._sr_cash_cat["ORDER_FEE"] += fee_delta
             self._SrApplyFill(self._sr_ctrl, t, signed, px, fee)
             self._SrNoteCashDiverg("FILL", t, None, notional_delta + fee_delta, signed)
+            for ild in (self._sr_identity_leds or {}).values():
+                self._SrApplyFill(ild, t, signed, px, fee)
 
             if not self._sr_grid_on:
                 return
@@ -669,7 +739,9 @@ class CgShadowReplayMixin:
                         credit = q * dist
                         self._sr_div_applied += 1
                         self._sr_cash_cat["DIVIDEND_CASH"] += credit
-                        for led in [self._sr_ctrl] + (self._sr_pols if self._sr_grid_on else []):
+                        all_leds = ([self._sr_ctrl] + list((self._sr_identity_leds or {}).values())
+                                    + (self._sr_pols if self._sr_grid_on else []))
+                        for led in all_leds:
                             lq = float((led.get("qty") or {}).get(t, 0.0))
                             if abs(lq) > 0:
                                 led["cash"] = float(led.get("cash", 0.0)) + lq * dist
@@ -692,7 +764,9 @@ class CgShadowReplayMixin:
                             self._sr_wu_ign += 1
                             continue
                         self._sr_split_n += 1
-                        for led in [self._sr_ctrl] + (self._sr_pols if self._sr_grid_on else []):
+                        all_leds = ([self._sr_ctrl] + list((self._sr_identity_leds or {}).values())
+                                    + (self._sr_pols if self._sr_grid_on else []))
+                        for led in all_leds:
                             q = float((led.get("qty") or {}).get(t, 0.0))
                             if abs(q) > 0:
                                 led["qty"][t] = q / factor
@@ -725,6 +799,25 @@ class CgShadowReplayMixin:
             g += abs(float(v or 0.0))
         return g
 
+    def _SrAuditPipelineOff(self, base) -> None:
+        """PIPELINE_OFF identity: candidate planned target is an exact copy of
+        the production base. Count key/weight mismatches (proof of no drift);
+        store the exact base for audit only -- never apply scaled weights."""
+        po = (self._sr_identity_leds or {}).get("MAISR_PIPELINE_OFF_IDENTITY")
+        if po is None:
+            return
+        candidate = dict(base)
+        base_keys, cand_keys = set(base.keys()), set(candidate.keys())
+        key_mismatches = base_keys.symmetric_difference(cand_keys)
+        weight_mismatches = sum(
+            1 for k in (base_keys & cand_keys)
+            if abs(float(base[k]) - float(candidate[k])) > 1e-9
+        )
+        n_mismatch = len(key_mismatches) + weight_mismatches
+        po["mismatch_events"] = int(po.get("mismatch_events", 0) or 0) + (1 if n_mismatch else 0)
+        po["mismatch_keys"] = int(po.get("mismatch_keys", 0) or 0) + n_mismatch
+        po["pending_audit"] = dict(base)
+
     def CgShadowReplayCapture(self, combined, regime, slot, reduce_only=False, emergency=False) -> None:
         if not getattr(self, "_sr_on", False):
             return
@@ -751,6 +844,7 @@ class CgShadowReplayMixin:
                 "imm": imm, "reduce_only": bool(reduce_only), "emergency": bool(emergency),
                 "date": self.time.date(),
             }
+            self._SrAuditPipelineOff(base)
             # MAISR may queue pending candidate targets for deferred slot
             try:
                 if hasattr(self, "CgMaisrOnCapture"):
@@ -860,6 +954,8 @@ class CgShadowReplayMixin:
             prod_hold = (tpv - prod_cash) if (tpv is not None and prod_cash is not None) else None
             tickers = set(self._sr_ctrl.get("qty") or {}) | set(self._sr_last_base or {})
             tickers.add(self._sr_cash_tk)
+            for ild in (self._sr_identity_leds or {}).values():
+                tickers.update((ild.get("qty") or {}).keys())
             if self._sr_grid_on:
                 for p in self._sr_pols:
                     tickers.update((p.get("qty") or {}).keys())
@@ -870,6 +966,9 @@ class CgShadowReplayMixin:
                 self._sr_started = True
                 self._sr_prev_tpv = tpv if tpv else self._sr_cash0
                 self._sr_ctrl["_prev_nav"] = ind_nav if ind_nav > 0 else self._sr_cash0
+                for ild in (self._sr_identity_leds or {}).values():
+                    n0, _ = self._SrNav(ild, px)
+                    ild["_prev_nav"] = n0 if n0 > 0 else self._sr_cash0
                 if self._sr_grid_on:
                     for p in self._sr_pols:
                         n, _ = self._SrNav(p, px)
@@ -895,6 +994,10 @@ class CgShadowReplayMixin:
                 self._SrNoteCashDiverg("MARK", self._sr_cash_tk, None, None)
             if prod_hold is not None:
                 self._sr_max_hold_diff = max(self._sr_max_hold_diff, abs(prod_hold - ind_hold))
+            for ild in (self._sr_identity_leds or {}).values():
+                n_i, _ = self._SrNav(ild, px)
+                self._SrApplyDaily(ild, ild.get("_prev_nav"), n_i, rg, age, None)
+                ild["_prev_nav"] = n_i
             if self._sr_grid_on:
                 for p in self._sr_pols:
                     n2, _ = self._SrNav(p, px)

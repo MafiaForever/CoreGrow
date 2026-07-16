@@ -17,6 +17,8 @@ RRX_PARAMS = {
     "cg_maisr_grid_enable":            "0",
     "cg_maisr_emit_events":            "0",
     "cg_maisr_cost_bps":               "0",
+    "cg_maisr_identity_only":          "0",
+    "cg_maisr_identity_debug":         "0",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
@@ -127,5 +129,5 @@ RRX_PARAMS = {
     "dyn_rr_add_exp":                  "0.00",
     "dyn_rr_max_exp":                  "0.25",
     # Log filter
-    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_,CG_REGIME_TIME_,CG_REGIME_TIME_TRADE,CG_REGIME_TIME_PENDING,CG_REGIME_TIME_EXEC,CG_MAISR_D0_,CG_SHADOW_REPLAY_",
+    "log_only_prefixes": "RRX_D8_ALLOC_FINAL,CG_CRISIS_,[EOA],CG_CORE_,CG_REGIME_TIME_,CG_REGIME_TIME_TRADE,CG_REGIME_TIME_PENDING,CG_REGIME_TIME_EXEC,CG_MAISR_D0_,CG_MAISR_P1_,CG_SHADOW_REPLAY_",
 }

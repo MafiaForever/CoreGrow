@@ -2,6 +2,7 @@
 from AlgorithmImports import *
 from datetime import date as _date
 from collections import deque
+from cg_maisr_p1_diag import CgMaisrP1Mixin, _P1_CANARY_CFG, _P1_CANARY_STATES
 # endregion
 # cg_maisr_diag.py -- CG-MAISR-D0: multi-asset independent stress router.
 # Sensors classify panel stress via a 54-config grid (3 sensitivities x
@@ -80,7 +81,7 @@ def _f(x, d=4):
         return "NA"
 
 
-class CgMaisrDiagMixin:
+class CgMaisrDiagMixin(CgMaisrP1Mixin):
     """CG-MAISR-D0: multi-asset stress classifier grid + 324-policy router sim."""
 
     def CgMaisrInit(self) -> None:
@@ -104,6 +105,8 @@ class CgMaisrDiagMixin:
         self.cg_maisr_diag_enable = _bool("cg_maisr_diag_enable", "0")
         self.cg_maisr_grid_enable = _bool("cg_maisr_grid_enable", "0")
         self.cg_maisr_emit_events = _bool("cg_maisr_emit_events", "0")
+        self.cg_maisr_identity_only = _bool("cg_maisr_identity_only", "0")
+        self.cg_maisr_identity_debug = _bool("cg_maisr_identity_debug", "0")
         self._ms_cost_bps = _float("cg_maisr_cost_bps", 0.0)
         self._ms_on = bool(self.cg_maisr_diag_enable)
         self._ms_grid_on = bool(self._ms_on and self.cg_maisr_grid_enable)
@@ -113,8 +116,9 @@ class CgMaisrDiagMixin:
         self._ms_emitted = False
 
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        if "CG_MAISR_D0_" not in lp:
-            lp.append("CG_MAISR_D0_")
+        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_"):
+            if pref not in lp:
+                lp.append(pref)
         self.log_only_prefixes = lp
 
         if not self._ms_on:
@@ -136,6 +140,32 @@ class CgMaisrDiagMixin:
         self._ms_n_exe = 0
         self._ms_current_risk = set()
         self._ms_last_day = None
+
+        # Minute-bar dedup counters (Slice.Bars TradeBars only).
+        self._ms_bd_seen = 0
+        self._ms_bd_accept = 0
+        self._ms_bd_dup = 0
+        self._ms_bd_conflict = 0
+        self._ms_bd_oo = 0
+        self._ms_bar_last_et = {}
+        # Evaluation dedup counters.
+        self._ms_eval_seen = 0
+        self._ms_eval_uniq = 0
+        self._ms_eval_dup = 0
+        self._ms_eval_keys = set()
+        # P1 canary state (fixed classifier S2_C2_B50_H2, single-shot).
+        self._ms_canary_idx = None
+        try:
+            self._ms_canary_idx = _ALL_CFG.index(_P1_CANARY_CFG)
+        except Exception:
+            self._ms_canary_idx = None
+        self._ms_canary_armed = False
+        self._ms_canary_fired = False
+        self._ms_canary_signal_time = None
+        self._ms_canary_signal_state = None
+        self._ms_canary_fill_tk = None
+        self._ms_canary_fill_px = None
+        self._ms_canary_fill_time = None
 
         try:
             spy = getattr(self, "sym_spy", None)
@@ -161,28 +191,96 @@ class CgMaisrDiagMixin:
             f"excluded={','.join(sorted(self._ms_excluded)) or 'NONE'},"
             f"mixed_resolution={','.join(getattr(self,'_ms_mixed',[]) or []) or 'NONE'}"
         )
+        self.log(
+            f"CG_MAISR_P1_INIT,identity_only={int(self.cg_maisr_identity_only)},"
+            f"identity_debug={int(self.cg_maisr_identity_debug)},"
+            f"canary_classifier={_clfid(*_P1_CANARY_CFG)},canary_idx={self._ms_canary_idx}"
+        )
+        dup_cfg = getattr(self, "_ms_dup_cfg", []) or []
+        self.log(
+            f"CG_MAISR_P1_SUBSCRIPTION_FINAL,panel_n={len(self._ms_all)},"
+            f"excluded={','.join(sorted(self._ms_excluded)) or 'NONE'},"
+            f"mixed_resolution={','.join(getattr(self,'_ms_mixed',[]) or []) or 'NONE'},"
+            f"duplicate_tradebar_config={','.join(dup_cfg) or 'NONE'},"
+            f"config_rows={len(getattr(self,'_ms_sub_rows',[]) or [])}"
+        )
 
     def _MsAuditSubscriptions(self) -> None:
         want = set()
         for grp in _ROLES.values():
             want.update(grp)
         want.add("GLDM")
-        counts = {}
+        per_tk = {}
+        rows = []
         try:
-            for cfg in self.subscription_manager.subscriptions:
-                try:
-                    tk = str(cfg.symbol.value)
-                    res = cfg.resolution
-                except Exception:
-                    continue
-                if res == Resolution.MINUTE:
-                    counts[tk] = counts.get(tk, 0) + 1
+            all_cfgs = list(self.subscription_manager.subscriptions)
         except Exception:
-            pass
-        # Production often registers tradable symbols twice (m=2). Require >=1
-        # minute feed; report count!=1 as mixed-resolution violations.
-        avail = {tk for tk in want if counts.get(tk, 0) >= 1}
-        self._ms_mixed = sorted(tk for tk in avail if counts.get(tk, 0) != 1)
+            all_cfgs = []
+        for cfg in all_cfgs:
+            try:
+                tk = str(cfg.symbol.value)
+                if tk not in want:
+                    continue
+                res = getattr(cfg, "resolution", None)
+                try:
+                    is_minute = (res == Resolution.MINUTE)
+                    is_daily = (res == Resolution.DAILY)
+                except Exception:
+                    is_minute = is_daily = False
+                res_name = str(res) if res is not None else "NA"
+                dtype = getattr(cfg, "type", None)
+                dtype_name = "NA"
+                if dtype is not None:
+                    dtype_name = getattr(dtype, "Name", None) or getattr(dtype, "__name__", None) \
+                        or str(dtype)
+                ttype = getattr(cfg, "tick_type", None)
+                ttype_name = str(ttype) if ttype is not None else "NA"
+                dn = str(dtype_name).lower()
+                tn = str(ttype_name).lower()
+                is_tb = ("tradebar" in dn) or (tn in ("trade", "0") and "quote" not in dn)
+                is_qb = ("quotebar" in dn) or ("quote" in tn)
+                is_oi = ("openinterest" in dn) or ("open_interest" in dn) or ("openinterest" in tn)
+                rec = per_tk.setdefault(tk, {
+                    "minute": 0, "daily": 0, "other": 0,
+                    "tradebar": 0, "quotebar": 0, "oi": 0,
+                })
+                if is_minute:
+                    rec["minute"] += 1
+                elif is_daily:
+                    rec["daily"] += 1
+                else:
+                    rec["other"] += 1
+                if is_tb:
+                    rec["tradebar"] += 1
+                elif is_qb:
+                    rec["quotebar"] += 1
+                elif is_oi:
+                    rec["oi"] += 1
+                rows.append({
+                    "ticker": tk, "resolution": res_name, "data_type": dtype_name,
+                    "tick_type": ttype_name, "is_tradebar": int(is_tb),
+                    "is_quotebar": int(is_qb), "is_open_interest": int(is_oi),
+                })
+            except Exception:
+                continue
+        avail = {tk for tk, rec in per_tk.items()
+                 if (rec["minute"] + rec["daily"] + rec["other"]) >= 1}
+        classes = {}
+        for tk, rec in per_tk.items():
+            # MIXED_RESOLUTION only when both minute AND daily configs exist.
+            # m=2,d=0 (e.g. TradeBar+QuoteBar) is NORMAL_MULTI_CONFIG, not mixed.
+            if rec["minute"] >= 1 and rec["daily"] >= 1:
+                classes[tk] = "MIXED_RESOLUTION"
+            elif rec["tradebar"] > 1:
+                classes[tk] = "DUPLICATE_TRADEBAR_CONFIG"
+            else:
+                classes[tk] = "NORMAL_MULTI_CONFIG"
+        for row in rows:
+            row["classification"] = classes.get(row["ticker"], "NORMAL_MULTI_CONFIG")
+        self._ms_sub_rows = rows
+        self._ms_sub_classes = classes
+        self._ms_mixed = sorted(tk for tk, c in classes.items() if c == "MIXED_RESOLUTION")
+        self._ms_dup_cfg = sorted(tk for tk, c in classes.items() if c == "DUPLICATE_TRADEBAR_CONFIG")
         self._ms_gold = "GLD" if "GLD" in avail else ("GLDM" if "GLDM" in avail else "GLD")
         roles = {}
         for name, grp in _ROLES.items():
@@ -216,17 +314,46 @@ class CgMaisrDiagMixin:
         try:
             bars = getattr(data, "bars", None) or getattr(data, "Bars", None)
             if bars:
+                seen_local = {}
                 for kvp in bars:
                     try:
                         sym = kvp.Key if hasattr(kvp, "Key") else kvp
                         bar = kvp.Value if hasattr(kvp, "Value") else bars[kvp]
-                        tk = _tk(sym)
-                        if tk not in self._ms_all:
-                            continue
-                        self._MsUpdateBar(tk, self.time, float(bar.open), float(bar.high),
-                                           float(bar.low), float(bar.close), float(bar.volume or 0))
                     except Exception:
                         continue
+                    self._ms_bd_seen += 1
+                    try:
+                        tk = _tk(sym)
+                        et = getattr(bar, "end_time", None) or getattr(bar, "EndTime", None)
+                        period = getattr(bar, "period", None) or getattr(bar, "Period", None)
+                        o, h, l, c = float(bar.open), float(bar.high), float(bar.low), float(bar.close)
+                        v = float(bar.volume or 0)
+                    except Exception:
+                        continue
+                    if tk not in self._ms_all:
+                        continue
+                    dkey = (tk, et, period)
+                    prev_ohlc = seen_local.get(dkey)
+                    if prev_ohlc is not None:
+                        if prev_ohlc == (o, h, l, c):
+                            self._ms_bd_dup += 1
+                        else:
+                            self._ms_bd_conflict += 1
+                        continue
+                    last_et = self._ms_bar_last_et.get(tk)
+                    if last_et is not None and et is not None and et < last_et:
+                        self._ms_bd_oo += 1
+                        continue
+                    seen_local[dkey] = (o, h, l, c)
+                    if et is not None:
+                        self._ms_bar_last_et[tk] = et
+                    self._ms_bd_accept += 1
+                    self._MsUpdateBar(tk, self.time, o, h, l, c, v)
+                if self.cg_maisr_identity_only:
+                    try:
+                        self._MsCanaryTryFire(bars)
+                    except Exception:
+                        self._ms_err += 1
             if getattr(self, "IsWarmingUp", False) or getattr(self, "is_warming_up", False):
                 return
             t = self.time
@@ -377,6 +504,13 @@ class CgMaisrDiagMixin:
         return "NORMAL"
 
     def _MsEval(self, kind) -> None:
+        self._ms_eval_seen += 1
+        ekey = (self.time.date(), self.time.hour, self.time.minute, kind)
+        if ekey in self._ms_eval_keys:
+            self._ms_eval_dup += 1
+            return
+        self._ms_eval_keys.add(ekey)
+        self._ms_eval_uniq += 1
         feat = {}
         for tk in self._ms_all:
             f = self._MsFeat(tk)
@@ -413,6 +547,14 @@ class CgMaisrDiagMixin:
             self._ms_n_pre += 1
         else:
             self._ms_n_post += 1
+        if (kind == "POST" and self.cg_maisr_identity_only and self._ms_canary_idx is not None
+                and not self._ms_canary_fired and not self._ms_canary_armed and self._ms_caps
+                and self._ms_caps[-1][0] == d.toordinal()):
+            st = _STATES[states[self._ms_canary_idx]]
+            if st in _P1_CANARY_STATES:
+                self._ms_canary_armed = True
+                self._ms_canary_signal_time = self.time
+                self._ms_canary_signal_state = st
 
     def CgMaisrOnCapture(self, base, rg, slot, imm, reduce_only, emergency) -> None:
         if not getattr(self, "_ms_on", False):
@@ -962,11 +1104,55 @@ class CgMaisrDiagMixin:
         if not getattr(self, "_ms_on", False):
             return
         try:
+            self._MsLog(
+                f"CG_MAISR_P1_BAR_DEDUP_FINAL,tradebars_seen={self._ms_bd_seen},"
+                f"economic_tradebars_accepted={self._ms_bd_accept},"
+                f"duplicate_tradebars_blocked={self._ms_bd_dup},"
+                f"same_timestamp_conflict_count={self._ms_bd_conflict},"
+                f"out_of_order_bar_count={self._ms_bd_oo},"
+                f"evaluation_callbacks_seen={self._ms_eval_seen},"
+                f"unique_evaluations_executed={self._ms_eval_uniq},"
+                f"duplicate_evaluations_blocked={self._ms_eval_dup}"
+            )
             if not parity_ok:
                 self._MsLog("CG_MAISR_D0_VALIDATION_FINAL,parity=FAIL,policies_evaluated=0,"
                             "next=FIX_MAISR_PARITY")
                 self._MsNoRec("shadow_replay_parity_failed")
+                self._MsLog("CG_MAISR_P1_GATE_FINAL,full_grid_authorized=NO,policies_evaluated=0,"
+                            "reason=shadow_replay_parity_failed")
                 return
+
+            id_results = self._MsIdentityFinals()
+            all_id_pass = bool(id_results) and all(r.get("pass") for r in id_results.values())
+            data_ok = (
+                int(getattr(self, "_ms_bd_conflict", 0) or 0) == 0
+                and int(getattr(self, "_ms_bd_oo", 0) or 0) == 0
+            )
+            all_id_pass = bool(all_id_pass and data_ok)
+            canary_result = self._MsCanaryFinal()
+            try:
+                self._MsExportP1Artifacts(id_results, canary_result)
+            except Exception:
+                self._ms_err += 1
+
+            if getattr(self, "cg_maisr_identity_only", False):
+                self._MsLog(
+                    f"CG_MAISR_P1_GATE_FINAL,full_grid_authorized={'YES' if all_id_pass else 'NO'},"
+                    f"policies_evaluated=0,identity_only=1,"
+                    f"same_timestamp_conflict_count={int(getattr(self,'_ms_bd_conflict',0) or 0)},"
+                    f"out_of_order_bar_count={int(getattr(self,'_ms_bd_oo',0) or 0)},"
+                    f"data_integrity={'PASS' if data_ok else 'FAIL'}"
+                )
+                return
+
+            if not all_id_pass:
+                self._MsLog(
+                    "CG_MAISR_P1_GATE_FINAL,full_grid_authorized=NO,policies_evaluated=0,"
+                    "identity_only=0,reason=identity_check_failed"
+                )
+                self._MsNoRec("identity_check_failed")
+                return
+
             self._MsBuildIndex()
             if not self._ms_days_sorted:
                 self._MsLog("CG_MAISR_D0_VALIDATION_FINAL,parity=PASS,policies_evaluated=0,"
@@ -999,15 +1185,14 @@ class CgMaisrDiagMixin:
             except Exception:
                 ctrl_turnover = 0.0
 
-            ident_led = self._MsSimulate(chosen[0]["idx"], (1.0,) * 7, 1, "T2")
-            i_m = self._MsMetrics(ident_led["rets"]) or {}
-            nav_d = dd_d = None
-            if ctrl_m.get("end_nav") and i_m.get("end_nav"):
-                nav_d = (i_m["end_nav"] / ctrl_m["end_nav"] - 1.0) * 100.0
-            if ctrl_m.get("MaxDD") is not None and i_m.get("MaxDD") is not None:
-                dd_d = (i_m["MaxDD"] - ctrl_m["MaxDD"]) * 100.0
-            identity_ok = bool(nav_d is not None and abs(nav_d) <= 1.0
-                                and dd_d is not None and abs(dd_d) <= 1.0)
+            # Root-cause fix (CG-MAISR-CANDIDATE-IDENTITY-P1): identity is now
+            # sourced from the real fill-replay ledger (MAISR_REPLAY_IDENTITY,
+            # already validated above), not the old _MsSimulate(router=(1,)*7)
+            # weight-reconstruction proxy, which never received production fills.
+            replay_cmp = id_results.get("MAISR_REPLAY_IDENTITY", {}) or {}
+            nav_d = replay_cmp.get("nav_d")
+            dd_d = replay_cmp.get("dd_d")
+            identity_ok = bool(replay_cmp.get("pass")) and all_id_pass
 
             today = self.time.date()
             live_s = ctrl_dates[max(0, len(ctrl_dates) - 252)] if ctrl_dates else None
@@ -1165,6 +1350,10 @@ class CgMaisrDiagMixin:
                 f"strict_pass_count={len(strict_rows)},"
                 f"policies_csv={csv_key},attribution_csv={attrib_key},classifiers_csv={clf_key},"
                 f"runtime_errors={self._ms_err}"
+            )
+            self._MsLog(
+                f"CG_MAISR_P1_GATE_FINAL,full_grid_authorized={'YES' if gate_ok else 'NO'},"
+                f"policies_evaluated={len(rows)},identity_only=0"
             )
             if best is not None:
                 self._MsLog(
