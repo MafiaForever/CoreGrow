@@ -3,8 +3,9 @@ from AlgorithmImports import *
 from datetime import date as _date
 from collections import deque
 from cg_maisr_p1_diag import CgMaisrP1Mixin, _P1_CANARY_CFG, _P1_CANARY_STATES
+from cg_maisr_d2_diag import CgMaisrD2DiagMixin
 # endregion
-# cg_maisr_diag.py -- CG-MAISR-D0: multi-asset independent stress router.
+# cg_maisr_diag.py -- CG-MAISR-D0/P1/D2: multi-asset independent stress router.
 # Sensors classify panel stress via a 54-config grid (3 sensitivities x
 # 2 active-component minimums x 3 breadth thresholds x 3 SH-confirm modes).
 # TRAIN (2012-2018) selects up to 6 classifiers (2 per SH mode); those
@@ -81,7 +82,7 @@ def _f(x, d=4):
         return "NA"
 
 
-class CgMaisrDiagMixin(CgMaisrP1Mixin):
+class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
     """CG-MAISR-D0: multi-asset stress classifier grid + 324-policy router sim."""
 
     def CgMaisrInit(self) -> None:
@@ -107,6 +108,7 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
         self.cg_maisr_emit_events = _bool("cg_maisr_emit_events", "0")
         self.cg_maisr_identity_only = _bool("cg_maisr_identity_only", "0")
         self.cg_maisr_identity_debug = _bool("cg_maisr_identity_debug", "0")
+        self._D2ReadParams(_p, _bool)
         self._ms_cost_bps = _float("cg_maisr_cost_bps", 0.0)
         self._ms_on = bool(self.cg_maisr_diag_enable)
         self._ms_grid_on = bool(self._ms_on and self.cg_maisr_grid_enable)
@@ -116,7 +118,7 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
         self._ms_emitted = False
 
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_"):
+        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_"):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
@@ -191,19 +193,24 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
             f"excluded={','.join(sorted(self._ms_excluded)) or 'NONE'},"
             f"mixed_resolution={','.join(getattr(self,'_ms_mixed',[]) or []) or 'NONE'}"
         )
-        self.log(
-            f"CG_MAISR_P1_INIT,identity_only={int(self.cg_maisr_identity_only)},"
-            f"identity_debug={int(self.cg_maisr_identity_debug)},"
-            f"canary_classifier={_clfid(*_P1_CANARY_CFG)},canary_idx={self._ms_canary_idx}"
-        )
-        dup_cfg = getattr(self, "_ms_dup_cfg", []) or []
-        self.log(
-            f"CG_MAISR_P1_SUBSCRIPTION_FINAL,panel_n={len(self._ms_all)},"
-            f"excluded={','.join(sorted(self._ms_excluded)) or 'NONE'},"
-            f"mixed_resolution={','.join(getattr(self,'_ms_mixed',[]) or []) or 'NONE'},"
-            f"duplicate_tradebar_config={','.join(dup_cfg) or 'NONE'},"
-            f"config_rows={len(getattr(self,'_ms_sub_rows',[]) or [])}"
-        )
+        if not getattr(self, "cg_maisr_label_only", False):
+            self.log(
+                f"CG_MAISR_P1_INIT,identity_only={int(self.cg_maisr_identity_only)},"
+                f"identity_debug={int(self.cg_maisr_identity_debug)},"
+                f"canary_classifier={_clfid(*_P1_CANARY_CFG)},canary_idx={self._ms_canary_idx}"
+            )
+            dup_cfg = getattr(self, "_ms_dup_cfg", []) or []
+            self.log(
+                f"CG_MAISR_P1_SUBSCRIPTION_FINAL,panel_n={len(self._ms_all)},"
+                f"excluded={','.join(sorted(self._ms_excluded)) or 'NONE'},"
+                f"mixed_resolution={','.join(getattr(self,'_ms_mixed',[]) or []) or 'NONE'},"
+                f"duplicate_tradebar_config={','.join(dup_cfg) or 'NONE'},"
+                f"config_rows={len(getattr(self,'_ms_sub_rows',[]) or [])}"
+            )
+        try:
+            self._D2InitHooks()
+        except Exception:
+            self._ms_err += 1
 
     def _MsAuditSubscriptions(self) -> None:
         want = set()
@@ -349,6 +356,11 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
                         self._ms_bar_last_et[tk] = et
                     self._ms_bd_accept += 1
                     self._MsUpdateBar(tk, self.time, o, h, l, c, v)
+                    try:
+                        if getattr(self, "cg_maisr_label_only", False) or getattr(self, "_d2_mode", False):
+                            self._D2OnBar(tk, et, o, h, l, c)
+                    except Exception:
+                        self._ms_err += 1
                 if self.cg_maisr_identity_only:
                     try:
                         self._MsCanaryTryFire(bars)
@@ -543,6 +555,11 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
                 riskbyte |= (1 << bit)
         px = self._MsPx(("SPY", "SH", self._ms_gold, "BND"))
         self._ms_events.append((d.toordinal(), tod, bytes(states), meta, riskbyte, px))
+        try:
+            if getattr(self, "cg_maisr_label_only", False) or getattr(self, "_d2_mode", False):
+                self._D2OnEval(kind, tod, bytes(states), feat)
+        except Exception:
+            self._ms_err += 1
         if kind == "PRE":
             self._ms_n_pre += 1
         else:
@@ -1116,6 +1133,12 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
                             "reason=shadow_replay_parity_failed")
                 return
 
+            try:
+                if self.CgMaisrD2OnEndOfAlgorithm(parity_ok):
+                    return
+            except Exception:
+                self._ms_err += 1
+
             id_results = self._MsIdentityFinals()
             all_id_pass = bool(id_results) and all(r.get("pass") for r in id_results.values())
             data_ok = (
@@ -1214,10 +1237,7 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
             except Exception:
                 ctrl_turnover = 0.0
 
-            # Root-cause fix (CG-MAISR-CANDIDATE-IDENTITY-P1): identity is now
-            # sourced from the real fill-replay ledger (MAISR_REPLAY_IDENTITY,
-            # already validated above), not the old _MsSimulate(router=(1,)*7)
-            # weight-reconstruction proxy, which never received production fills.
+            # Identity from fill-replay ledgers (not _MsSimulate reconstruction).
             replay_cmp = id_results.get("MAISR_REPLAY_IDENTITY", {}) or {}
             nav_d = replay_cmp.get("nav_d")
             dd_d = replay_cmp.get("dd_d")
