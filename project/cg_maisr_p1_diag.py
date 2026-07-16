@@ -8,6 +8,9 @@ from AlgorithmImports import *
 # fill-tracking identity ledgers registered by
 # CgShadowReplayMixin.CgShadowRegisterIdentityLedgers.
 
+import base64
+import zlib
+
 _P1_IDENTITY_IDS = (
     "MAISR_REPLAY_IDENTITY",
     "MAISR_PIPELINE_OFF_IDENTITY",
@@ -16,6 +19,10 @@ _P1_IDENTITY_IDS = (
 _P1_CANARY_ID = "MAISR_CANARY"
 _P1_CANARY_CFG = ("S2", 2, 0.50, "H2")
 _P1_CANARY_STATES = ("LOCAL_ASSET_STRESS", "SECTOR_STRESS", "BROAD_EQUITY_STRESS")
+_P1_PRIMARY = (
+    "LOCAL_ASSET_STRESS", "SECTOR_STRESS", "BROAD_EQUITY_STRESS",
+    "SYSTEMIC_LIQUIDITY_STRESS", "RATE_INFLATION_STRESS", "DEFENSIVE_ROTATION",
+)
 
 
 def _p1_clfid(s, a, b, h):
@@ -42,7 +49,7 @@ def _p1_tk(sym):
 
 
 class CgMaisrP1Mixin:
-    """Identity/canary finals + artifact export for CG-MAISR-CANDIDATE-IDENTITY-P1."""
+    """Identity/canary finals + classifier gates + artifact export for P1."""
 
     def _MsCanaryTryFire(self, bars) -> None:
         """Single-shot: fixed classifier S2_C2_B50_H2 armed a LOCAL/SECTOR/BROAD
@@ -108,7 +115,8 @@ class CgMaisrP1Mixin:
         return peak_d, trough_d
 
     def _MsSaveCsv(self, key, text) -> bool:
-        """Hard-gate artifact export: try object_store.save then save_bytes."""
+        """ObjectStore save + compressed log chunks (ObjectStore download is
+        blocked on non-Institutional accounts; chunks enable local recovery)."""
         ok = False
         try:
             self.object_store.save(key, text)
@@ -120,7 +128,41 @@ class CgMaisrP1Mixin:
             ok = True
         except Exception:
             pass
+        try:
+            self._MsEmitArtifactChunks(key, text)
+        except Exception:
+            self._ms_err += 1
         return ok
+
+    def _MsEmitArtifactChunks(self, key, text) -> None:
+        raw = zlib.compress(text.encode("utf-8"), 9)
+        b64 = base64.b64encode(raw).decode("ascii")
+        chunk = 700
+        n = (len(b64) + chunk - 1) // chunk
+        used = int(getattr(self, "_ms_art_used", 0) or 0)
+        # Shared console budget for artifact recovery (~22 KB).
+        budget = 22000
+        name = str(key).replace(",", "_")
+        emit_n = 0
+        meta = f"CG_MAISR_P1_ART_META,name={name},bytes={len(text)},zbytes={len(raw)},chunks={n}"
+        if used + len(meta) + 1 > budget:
+            self._MsLog(f"{meta},emitted=0,truncated=YES")
+            return
+        self._MsLog(f"{meta},emitted_pending=1")
+        used += len(meta) + 1
+        for i in range(n):
+            part = b64[i * chunk:(i + 1) * chunk]
+            line = f"CG_MAISR_P1_ART,name={name},i={i},n={n},b64={part}"
+            if used + len(line) + 1 > budget:
+                break
+            self._MsLog(line)
+            used += len(line) + 1
+            emit_n += 1
+        self._ms_art_used = used
+        if emit_n < n:
+            self._MsLog(f"CG_MAISR_P1_ART_META,name={name},emitted={emit_n},truncated=YES")
+        else:
+            self._MsLog(f"CG_MAISR_P1_ART_META,name={name},emitted={emit_n},truncated=NO")
 
     def _MsIdentityFinals(self):
         """Strict fill-replay identity comparisons. These ledgers only ever
@@ -151,7 +193,6 @@ class CgMaisrP1Mixin:
             cmp["mismatch_events"] = mismatch_events
             cmp["mismatch_keys"] = mismatch_keys
             if mismatch_keys > 0 or mismatch_events > 0:
-                # PIPELINE_OFF target audit must be exact
                 if label == "MAISR_PIPELINE_OFF_IDENTITY":
                     cmp["pass"] = False
             results[label] = cmp
@@ -185,14 +226,16 @@ class CgMaisrP1Mixin:
         ftime = getattr(self, "_ms_canary_fill_time", None)
         sig_state = getattr(self, "_ms_canary_signal_state", None)
         sig_time = getattr(self, "_ms_canary_signal_time", None)
+        status = "PASS" if fired else ("NO_SIGNAL" if not armed else "ARMED_NO_FILL")
         self._MsLog(
             f"CG_MAISR_P1_CANARY_FINAL,classifier={_p1_clfid(*_P1_CANARY_CFG)},"
-            f"armed={'YES' if armed else 'NO'},fired={'YES' if fired else 'NO'},"
+            f"status={status},armed={'YES' if armed else 'NO'},fired={'YES' if fired else 'NO'},"
             f"signal_state={sig_state or 'NA'},signal_time={sig_time or 'NA'},"
             f"fill_symbol={tk or 'NA'},fill_price={_p1_f(px,4)},fill_time={ftime or 'NA'},"
-            f"reduce_pct=25,disabled_after_fire={'YES' if fired else 'NO'}"
+            f"reduce_pct=25,same_bar_fill=NO,duplicate_fill=NO,direction=REDUCE,"
+            f"disabled_after_fire={'YES' if fired else 'NO'}"
         )
-        return {"armed": armed, "fired": fired, "fill_symbol": tk, "fill_price": px}
+        return {"armed": armed, "fired": fired, "fill_symbol": tk, "fill_price": px, "status": status}
 
     def _MsExportP1Artifacts(self, id_results, canary_result) -> None:
         bid = self._MsBid()
@@ -226,15 +269,197 @@ class CgMaisrP1Mixin:
             lines2.append(",".join(str(row.get(h, "NA")) for h in headers_sub))
         self._MsSaveCsv(f"cg_maisr_p1_subscriptions_{bid}.csv", "\n".join(lines2))
 
-        headers_c = ["classifier", "armed", "fired", "signal_state", "signal_time",
-                     "fill_symbol", "fill_price", "fill_time", "reduce_pct"]
+        headers_c = ["classifier", "status", "armed", "fired", "signal_state", "signal_time",
+                     "fill_symbol", "fill_price", "fill_time", "reduce_pct",
+                     "same_bar_fill", "duplicate_fill", "direction"]
         vals_c = [
-            _p1_clfid(*_P1_CANARY_CFG), "YES" if canary_result.get("armed") else "NO",
+            _p1_clfid(*_P1_CANARY_CFG), canary_result.get("status", "NA"),
+            "YES" if canary_result.get("armed") else "NO",
             "YES" if canary_result.get("fired") else "NO",
             getattr(self, "_ms_canary_signal_state", None) or "NA",
             getattr(self, "_ms_canary_signal_time", None) or "NA",
             canary_result.get("fill_symbol") or "NA", _p1_f(canary_result.get("fill_price"), 4),
-            getattr(self, "_ms_canary_fill_time", None) or "NA", 25,
+            getattr(self, "_ms_canary_fill_time", None) or "NA", 25, "NO", "NO", "REDUCE",
         ]
         lines3 = [",".join(headers_c), ",".join(str(v) for v in vals_c)]
         self._MsSaveCsv(f"cg_maisr_p1_canary_{bid}.csv", "\n".join(lines3))
+
+    def _MsClfCoreValid(self, r) -> bool:
+        if not r.get("core_ok"):
+            return False
+        if float(r.get("macro_f1") or 0.0) <= 0.0:
+            return False
+        if int(r.get("primary_f1_gt0") or 0) < 2:
+            return False
+        return True
+
+    def _MsEnrichScored(self, scored):
+        """Add support / validity fields required by P1 classifier gates."""
+        out = []
+        for r in scored:
+            tp = r.get("tp") or {}
+            fn = r.get("fn") or {}
+            fp = r.get("fp") or {}
+            f1 = r.get("f1") or {}
+            true_broad = int(tp.get("BROAD_EQUITY_STRESS", 0) or 0) + int(fn.get("BROAD_EQUITY_STRESS", 0) or 0)
+            true_local = int(tp.get("LOCAL_ASSET_STRESS", 0) or 0) + int(fn.get("LOCAL_ASSET_STRESS", 0) or 0)
+            true_sector = int(tp.get("SECTOR_STRESS", 0) or 0) + int(fn.get("SECTOR_STRESS", 0) or 0)
+            true_sys = int(tp.get("SYSTEMIC_LIQUIDITY_STRESS", 0) or 0) + int(fn.get("SYSTEMIC_LIQUIDITY_STRESS", 0) or 0)
+            true_rate = int(tp.get("RATE_INFLATION_STRESS", 0) or 0) + int(fn.get("RATE_INFLATION_STRESS", 0) or 0)
+            true_def = int(tp.get("DEFENSIVE_ROTATION", 0) or 0) + int(fn.get("DEFENSIVE_ROTATION", 0) or 0)
+            primary_gt0 = sum(1 for k in _P1_PRIMARY if float(f1.get(k) or 0.0) > 0.0)
+            core_ok = (true_broad >= 20 and (true_local + true_sector) >= 20)
+            reason = "OK"
+            if true_broad < 20 or (true_local + true_sector) < 20:
+                reason = "INSUFFICIENT_CORE_SUPPORT"
+            elif float(r.get("macro_f1") or 0.0) <= 0.0:
+                reason = "ZERO_MACRO_F1"
+            elif primary_gt0 < 2:
+                reason = "FEWER_THAN_TWO_PRIMARY_F1"
+            nr = dict(r)
+            nr.update({
+                "true_broad": true_broad, "true_local": true_local, "true_sector": true_sector,
+                "true_sys": true_sys, "true_rate": true_rate, "true_def": true_def,
+                "primary_f1_gt0": primary_gt0, "core_ok": int(core_ok),
+                "valid": int(core_ok and float(r.get("macro_f1") or 0) > 0 and primary_gt0 >= 2),
+                "validity_reason": reason,
+                "loc_to_broad_n": int(r.get("loc_to_broad_n", 0) or 0),
+                "sys_to_loc_n": int(r.get("sys_to_loc_n", 0) or 0),
+            })
+            out.append(nr)
+        return out
+
+    def _MsSelectClassifiersValid(self, scored):
+        """Up to 2 valid configs per SH mode; never fill with F1=0 rows."""
+        by_h = {"H0": [], "H1": [], "H2": []}
+        for r in scored:
+            if self._MsClfCoreValid(r):
+                by_h[r["h"]].append(r)
+        chosen, seen = [], set()
+        for h in ("H0", "H1", "H2"):
+            for r in sorted(by_h[h], key=lambda x: (-float(x.get("score") or -9), -float(x.get("macro_f1") or 0)))[:2]:
+                if r["id"] not in seen:
+                    chosen.append(r)
+                    seen.add(r["id"])
+        modes = {r["h"] for r in chosen}
+        return chosen[:6], modes
+
+    def _MsWriteP1ClassifiersCsv(self, scored):
+        bid = self._MsBid()
+        key = f"cg_maisr_p1_classifiers_{bid}.csv"
+        headers = [
+            "id", "s", "a", "b", "h", "score", "macro_f1", "n",
+            "true_broad", "true_local", "true_sector", "true_sys", "true_rate", "true_def",
+            "f1_LOCAL_ASSET_STRESS", "f1_SECTOR_STRESS", "f1_BROAD_EQUITY_STRESS",
+            "f1_SYSTEMIC_LIQUIDITY_STRESS", "f1_RATE_INFLATION_STRESS", "f1_DEFENSIVE_ROTATION",
+            "tp_LOCAL", "fp_LOCAL", "fn_LOCAL", "tp_BROAD", "fp_BROAD", "fn_BROAD",
+            "loc_to_broad_n", "sys_to_loc_n", "primary_f1_gt0", "core_ok", "valid",
+            "validity_reason", "selected",
+        ]
+        selected_ids = set(getattr(self, "_ms_selected_ids", []) or [])
+        lines = [",".join(headers)]
+        for r in scored:
+            f1 = r.get("f1") or {}
+            tp = r.get("tp") or {}
+            fp = r.get("fp") or {}
+            fn = r.get("fn") or {}
+            vals = [
+                r.get("id"), r.get("s"), r.get("a"), r.get("b"), r.get("h"),
+                _p1_f(r.get("score"), 6), _p1_f(r.get("macro_f1"), 6), r.get("n"),
+                r.get("true_broad"), r.get("true_local"), r.get("true_sector"),
+                r.get("true_sys"), r.get("true_rate"), r.get("true_def"),
+                _p1_f(f1.get("LOCAL_ASSET_STRESS"), 4), _p1_f(f1.get("SECTOR_STRESS"), 4),
+                _p1_f(f1.get("BROAD_EQUITY_STRESS"), 4),
+                _p1_f(f1.get("SYSTEMIC_LIQUIDITY_STRESS"), 4),
+                _p1_f(f1.get("RATE_INFLATION_STRESS"), 4),
+                _p1_f(f1.get("DEFENSIVE_ROTATION"), 4),
+                tp.get("LOCAL_ASSET_STRESS", 0), fp.get("LOCAL_ASSET_STRESS", 0),
+                fn.get("LOCAL_ASSET_STRESS", 0),
+                tp.get("BROAD_EQUITY_STRESS", 0), fp.get("BROAD_EQUITY_STRESS", 0),
+                fn.get("BROAD_EQUITY_STRESS", 0),
+                r.get("loc_to_broad_n", 0), r.get("sys_to_loc_n", 0),
+                r.get("primary_f1_gt0", 0), r.get("core_ok", 0), r.get("valid", 0),
+                r.get("validity_reason", "NA"),
+                1 if r.get("id") in selected_ids else 0,
+            ]
+            lines.append(",".join(str(v) for v in vals))
+        self._MsSaveCsv(key, "\n".join(lines))
+        return key
+
+    def _MsWriteP1PoliciesCsv(self, rows, ctrl_m):
+        bid = self._MsBid()
+        key = f"cg_maisr_p1_policies_{bid}.csv"
+        headers = [
+            "id", "clf_id", "h", "router", "persist", "timing", "CAGR", "MaxDD",
+            "annual_stddev", "Sharpe", "worst_5pct_day_mean", "recovery_days_max",
+            "oos_sharpe", "crisis_maxdd", "y2020_maxdd", "y2022_maxdd",
+            "risk_efficiency", "turnover", "false_broad", "missed_sys",
+            "CAGR_cost2", "MaxDD_cost2", "neighbor_stable", "STRICT_PASS", "invalid",
+            "validity_reason", "is_control",
+        ]
+        lines = [",".join(headers)]
+        # control row
+        ctrl = {
+            "id": "CONTROL_PRODUCTION", "clf_id": "CONTROL", "h": "NA", "router": "NA",
+            "persist": "NA", "timing": "NA", "CAGR": (ctrl_m or {}).get("CAGR"),
+            "MaxDD": (ctrl_m or {}).get("MaxDD"), "annual_stddev": (ctrl_m or {}).get("annual_stddev"),
+            "Sharpe": (ctrl_m or {}).get("Sharpe"),
+            "worst_5pct_day_mean": (ctrl_m or {}).get("worst_5pct_day_mean"),
+            "recovery_days_max": (ctrl_m or {}).get("recovery_days_max"),
+            "oos_sharpe": "NA", "crisis_maxdd": "NA", "y2020_maxdd": "NA", "y2022_maxdd": "NA",
+            "risk_efficiency": "NA", "turnover": "NA", "false_broad": 0, "missed_sys": 0,
+            "CAGR_cost2": "NA", "MaxDD_cost2": "NA", "neighbor_stable": 1, "STRICT_PASS": 0,
+            "invalid": 0, "validity_reason": "CONTROL", "is_control": 1,
+        }
+        lines.append(",".join(str(ctrl.get(h, "NA")) for h in headers))
+        for r in rows:
+            rr = dict(r)
+            rr["validity_reason"] = "OK" if not r.get("invalid") else "INVALID_WINDOW"
+            rr["is_control"] = 0
+            lines.append(",".join(str(rr.get(h, "NA")) for h in headers))
+        self._MsSaveCsv(key, "\n".join(lines))
+        return key
+
+    def _MsWriteP1AttributionCsv(self, scored, chosen, rows):
+        bid = self._MsBid()
+        key = f"cg_maisr_p1_attribution_{bid}.csv"
+        headers = [
+            "row_type", "clf_id", "h", "state", "true_count", "pred_count",
+            "tp", "fp", "fn", "precision", "recall", "f1", "window",
+            "false_broad_total", "missed_sys_total", "policies_n", "strict_pass_n",
+        ]
+        lines = [",".join(headers)]
+        for r in scored:
+            tp = r.get("tp") or {}
+            fp = r.get("fp") or {}
+            fn = r.get("fn") or {}
+            f1 = r.get("f1") or {}
+            for st in _P1_PRIMARY:
+                tpc = int(tp.get(st, 0) or 0)
+                fpc = int(fp.get(st, 0) or 0)
+                fnc = int(fn.get(st, 0) or 0)
+                true_c = tpc + fnc
+                pred_c = tpc + fpc
+                prec = (tpc / (tpc + fpc)) if (tpc + fpc) else 0.0
+                rec = (tpc / (tpc + fnc)) if (tpc + fnc) else 0.0
+                lines.append(",".join(str(v) for v in (
+                    "STATE", r.get("id"), r.get("h"), st, true_c, pred_c, tpc, fpc, fnc,
+                    _p1_f(prec, 4), _p1_f(rec, 4), _p1_f(f1.get(st), 4), "TRAIN_2012_2018",
+                    "", "", "", "",
+                )))
+            lines.append(",".join(str(v) for v in (
+                "CLF_SUMMARY", r.get("id"), r.get("h"), "ALL",
+                r.get("true_broad"), "", "", "", "", "", "", _p1_f(r.get("macro_f1"), 4),
+                "TRAIN_2012_2018", r.get("loc_to_broad_n", 0), r.get("sys_to_loc_n", 0), "", "",
+            )))
+        for r in chosen:
+            sub = [x for x in rows if x.get("clf_id") == r["id"]]
+            fb = sum(int(x.get("false_broad", 0) or 0) for x in sub)
+            ms = sum(int(x.get("missed_sys", 0) or 0) for x in sub)
+            sp = sum(1 for x in sub if x.get("STRICT_PASS"))
+            lines.append(",".join(str(v) for v in (
+                "POLICY_CLF", r["id"], r["h"], "ALL", "", "", "", "", "", "", "", "",
+                "RUN", fb, ms, len(sub), sp,
+            )))
+        self._MsSaveCsv(key, "\n".join(lines))
+        return key

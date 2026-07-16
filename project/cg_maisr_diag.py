@@ -734,11 +734,14 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
                     loc_to_broad += 1
                 if true_lab == "SYSTEMIC_LIQUIDITY_STRESS" and pred == "LOCAL_ASSET_STRESS":
                     sys_to_loc += 1
+            f1 = {}
             f1s = []
             for k in _STRESS6:
                 p = tp[k] / (tp[k] + fp[k]) if (tp[k] + fp[k]) else 0.0
                 r = tp[k] / (tp[k] + fn[k]) if (tp[k] + fn[k]) else 0.0
-                f1s.append((2 * p * r / (p + r)) if (p + r) else 0.0)
+                fv = (2 * p * r / (p + r)) if (p + r) else 0.0
+                f1[k] = fv
+                f1s.append(fv)
             macro_f1 = sum(f1s) / len(f1s) if f1s else 0.0
             n_sys = tp["SYSTEMIC_LIQUIDITY_STRESS"] + fn["SYSTEMIC_LIQUIDITY_STRESS"]
             n_loc = tp["LOCAL_ASSET_STRESS"] + fn["LOCAL_ASSET_STRESS"]
@@ -750,26 +753,16 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
             scored.append({"idx": i, "id": _clfid(s, a, b, h), "s": s, "a": a, "b": b, "h": h,
                            "score": score, "macro_f1": macro_f1, "sys_fn": sys_fn,
                            "broad_fp": broad_fp, "loc_to_broad": loc_to_broad_r,
-                           "sys_to_loc": sys_to_loc_r, "n": n})
-        return scored
+                           "sys_to_loc": sys_to_loc_r, "n": n,
+                           "tp": tp, "fp": fp, "fn": fn, "f1": f1,
+                           "loc_to_broad_n": loc_to_broad, "sys_to_loc_n": sys_to_loc})
+        return self._MsEnrichScored(scored)
 
     def _MsSelectClassifiers(self, scored):
-        by_h = {"H0": [], "H1": [], "H2": []}
-        for r in scored:
-            by_h[r["h"]].append(r)
-        chosen, seen = [], set()
-        for h in ("H0", "H1", "H2"):
-            for r in sorted(by_h[h], key=lambda r: -r["score"])[:2]:
-                if r["id"] not in seen:
-                    chosen.append(r)
-                    seen.add(r["id"])
-        if len(chosen) < 6:
-            for r in sorted((r for r in scored if r["id"] not in seen), key=lambda r: -r["score"]):
-                if len(chosen) >= 6:
-                    break
-                chosen.append(r)
-                seen.add(r["id"])
-        return chosen[:6]
+        chosen, modes = self._MsSelectClassifiersValid(scored)
+        self._ms_selected_ids = [r["id"] for r in chosen]
+        self._ms_selected_modes = modes
+        return chosen
 
     def _MsBuildPolicies(self, chosen):
         metas = []
@@ -1032,7 +1025,8 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
     def _MsLog(self, msg):
         try:
             n = len(msg) + 1
-            if self._ms_log_used + n > 38000:
+            # P1 console budget target <45 KB; leave headroom for FINAL lines.
+            if self._ms_log_used + n > 44000:
                 return
             self.log(msg)
             self._ms_log_used += n
@@ -1044,7 +1038,7 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
 
     def _MsNoRec(self, reason):
         self._MsLog(
-            "CG_MAISR_D0_RECOMMENDATION,apply=NO,policy=KEEP_CURRENT_SH,classifier=NA,router=NA,"
+            "CG_MAISR_P1_RECOMMENDATION,apply=NO,policy=KEEP_CURRENT_SH,classifier=NA,router=NA,"
             "persistence=NA,timing=NA,SH_mode=NA,CAGR=NA,MaxDD=NA,StdDev=NA,OOS_Sharpe=NA,"
             "CRISIS_MaxDD=NA,Y2020_MaxDD=NA,Y2022_MaxDD=NA,worst5=NA,recovery=NA,turnover=NA,"
             f"false_broad_exits=NA,missed_systemic=NA,CAGR_2bps=NA,MaxDD_2bps=NA,neighbor_stable=NO,"
@@ -1153,26 +1147,61 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
                 self._MsNoRec("identity_check_failed")
                 return
 
+            self._MsLog(
+                f"CG_MAISR_P1_IDENTITY_RECHECK,pass={'YES' if all_id_pass else 'NO'},"
+                f"replay={'YES' if (id_results.get('MAISR_REPLAY_IDENTITY') or {}).get('pass') else 'NO'},"
+                f"pipeline_off={'YES' if (id_results.get('MAISR_PIPELINE_OFF_IDENTITY') or {}).get('pass') else 'NO'},"
+                f"sensor_no_action={'YES' if (id_results.get('MAISR_SENSOR_NO_ACTION_IDENTITY') or {}).get('pass') else 'NO'}"
+            )
+            self._MsLog("CG_MAISR_P1_FULL_INIT,identity_pass=YES,grid_enable=1")
             self._MsBuildIndex()
             if not self._ms_days_sorted:
-                self._MsLog("CG_MAISR_D0_VALIDATION_FINAL,parity=PASS,policies_evaluated=0,"
+                self._MsLog("CG_MAISR_P1_VALIDATION_FINAL,parity=PASS,policies_evaluated=0,"
                             "next=NO_DATA")
                 return
             self._MsBuildLabels()
             scored = self._MsScoreConfigs()
+            n_valid = sum(1 for r in scored if r.get("valid"))
+            tb = max((r.get("true_broad") or 0) for r in scored) if scored else 0
+            tl = max((r.get("true_local") or 0) for r in scored) if scored else 0
+            ts = max((r.get("true_sector") or 0) for r in scored) if scored else 0
+            tsys = max((r.get("true_sys") or 0) for r in scored) if scored else 0
+            self._MsLog(
+                f"CG_MAISR_P1_CLASSIFIER_SUPPORT,configs=54,valid={n_valid},"
+                f"true_broad_max={tb},true_local_max={tl},true_sector_max={ts},"
+                f"true_local_plus_sector_max={tl+ts},true_sys_max={tsys},"
+                f"local_vs_broad_true_local_count={tl},"
+                f"local_vs_broad_true_broad_count={tb},"
+                f"local_vs_broad_error_count={sum(int(r.get('loc_to_broad_n') or 0) for r in scored)}"
+            )
+            if tb < 20 or (tl + ts) < 20:
+                self._MsWriteP1ClassifiersCsv(scored)
+                self._MsLog("CG_MAISR_P1_GATE_FINAL,full_grid_authorized=NO,policies_evaluated=0,"
+                            "reason=insufficient_label_support")
+                self._MsNoRec("REFINE_MAISR_LABELS")
+                return
             chosen = self._MsSelectClassifiers(scored)
+            modes = getattr(self, "_ms_selected_modes", set()) or set()
             for r in chosen[:6]:
                 self._MsLog(
-                    f"CG_MAISR_D0_CLASSIFIER_SELECTED,id={r['id']},H={r['h']},"
+                    f"CG_MAISR_P1_CLASSIFIER_SELECTED,id={r['id']},H={r['h']},"
                     f"score={_f(r['score'],4)},macro_f1={_f(r['macro_f1'],4)},"
-                    f"sys_fn={_f(r['sys_fn'],4)},broad_fp={_f(r['broad_fp'],4)},n={r['n']}"
+                    f"true_broad={r.get('true_broad')},true_local={r.get('true_local')},"
+                    f"true_sector={r.get('true_sector')},primary_f1_gt0={r.get('primary_f1_gt0')},"
+                    f"validity={r.get('validity_reason')},n={r['n']}"
                 )
-            self._MsLog(
-                f"CG_MAISR_D0_CLEANUP_FINAL,stale_refs=0,configs_scored={len(scored)},"
-                f"classifiers_selected={len(chosen)}"
-            )
-            if not self._ms_grid_on or not chosen:
-                self._MsNoRec("grid_disabled_or_no_selection")
+            if len(chosen) < 3 or len(modes) < 2:
+                self._MsWriteP1ClassifiersCsv(scored)
+                self._MsLog(
+                    f"CG_MAISR_P1_GATE_FINAL,full_grid_authorized=NO,policies_evaluated=0,"
+                    f"classifiers_selected={len(chosen)},modes={','.join(sorted(modes)) or 'NONE'},"
+                    f"reason=insufficient_valid_classifiers"
+                )
+                self._MsNoRec("REFINE_MAISR_CLASSIFIER")
+                return
+            if not self._ms_grid_on:
+                self._MsWriteP1ClassifiersCsv(scored)
+                self._MsNoRec("grid_disabled")
                 return
 
             metas = self._MsBuildPolicies(chosen)
@@ -1300,41 +1329,6 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
             strict_rows = [r for r in ranked if r["STRICT_PASS"]]
             top15 = ranked[:15]
 
-            csv_key = self._MsWriteCsv(rows)
-            attrib_key = self._MsWriteAttributionCsv(chosen, rows)
-            clf_key = self._MsWriteClassifiersCsv(scored)
-
-            for i, r in enumerate(top15):
-                self._MsLog(
-                    f"CG_MAISR_D0_TOP,rank={i+1},id={r['id']},clf={r['clf_id']},"
-                    f"router={r['router']},persist={r['persist']},timing={r['timing']},"
-                    f"CAGR={_f(r.get('CAGR'))},MaxDD={_f(r.get('MaxDD'))},"
-                    f"std={_f(r.get('annual_stddev'))},Sharpe={_f(r.get('Sharpe'))},"
-                    f"w5={_f(r.get('worst_5pct_day_mean'))},oos_sh={_f(r.get('oos_sharpe'))},"
-                    f"crisis_dd={_f(r.get('crisis_maxdd'))},risk_eff={_f(r.get('risk_efficiency'))},"
-                    f"STRICT_PASS={r['STRICT_PASS']},stable={r.get('neighbor_stable',0)},"
-                    f"cagr_cost2={_f(r.get('CAGR_cost2'))},cagr_cost5={_f(r.get('CAGR_cost5'))}"
-                )
-
-            local_broad_sep = (1.0 - (sum(r.get("loc_to_broad", 0.0) for r in chosen) / len(chosen))
-                                if chosen else None)
-            h_scores = {}
-            for r in chosen:
-                h_scores.setdefault(r["h"], []).append(r["score"])
-            sh_incr = None
-            if h_scores.get("H2") and h_scores.get("H0"):
-                sh_incr = (sum(h_scores["H2"]) / len(h_scores["H2"])) - \
-                          (sum(h_scores["H0"]) / len(h_scores["H0"]))
-
-            self._MsLog(
-                f"CG_MAISR_D0_ATTRIBUTION_FINAL,policies_evaluated={len(rows)},"
-                f"valid={len(valid_rows)},strict_pass={len(strict_rows)},"
-                f"identity_nav_diff_pct={_f(nav_d,4)},identity_maxdd_diff_pp={_f(dd_d,4)},"
-                f"identity_ok={'YES' if identity_ok else 'NO'},"
-                f"control_CAGR={_f(ctrl_m.get('CAGR'))},control_MaxDD={_f(ctrl_m.get('MaxDD'))},"
-                f"local_vs_broad_separation={_f(local_broad_sep,4)},SH_incremental_value={_f(sh_incr,4)}"
-            )
-
             gate_ok = identity_ok and (self._ms_err == 0)
             best = strict_rows[0] if (gate_ok and strict_rows) else None
             if not gate_ok:
@@ -1344,20 +1338,56 @@ class CgMaisrDiagMixin(CgMaisrP1Mixin):
             else:
                 reason = "no_strict_pass"
 
+            for i, r in enumerate(top15):
+                self._MsLog(
+                    f"CG_MAISR_P1_TOP,rank={i+1},id={r['id']},clf={r['clf_id']},"
+                    f"router={r['router']},persist={r['persist']},timing={r['timing']},"
+                    f"CAGR={_f(r.get('CAGR'))},MaxDD={_f(r.get('MaxDD'))},"
+                    f"std={_f(r.get('annual_stddev'))},Sharpe={_f(r.get('Sharpe'))},"
+                    f"w5={_f(r.get('worst_5pct_day_mean'))},oos_sh={_f(r.get('oos_sharpe'))},"
+                    f"crisis_dd={_f(r.get('crisis_maxdd'))},risk_eff={_f(r.get('risk_efficiency'))},"
+                    f"STRICT_PASS={r['STRICT_PASS']},stable={r.get('neighbor_stable',0)},"
+                    f"cagr_cost2={_f(r.get('CAGR_cost2'))},cagr_cost5={_f(r.get('CAGR_cost5'))}"
+                )
+
+            clf_key = self._MsWriteP1ClassifiersCsv(scored)
+            attrib_key = self._MsWriteP1AttributionCsv(scored, chosen, rows)
+            csv_key = self._MsWriteP1PoliciesCsv(rows, ctrl_m)
+
+            local_err = sum(int(r.get("loc_to_broad_n") or 0) for r in chosen)
+            local_den = sum(int(r.get("true_local") or 0) for r in chosen)
+            broad_den = sum(int(r.get("true_broad") or 0) for r in chosen)
+            local_broad_sep = None
+            if local_den > 0 and broad_den > 0:
+                local_broad_sep = 1.0 - (local_err / max(local_den, 1))
+            h_scores = {}
+            for r in chosen:
+                h_scores.setdefault(r["h"], []).append(r["score"])
+            sh_incr = None
+            if h_scores.get("H2") and h_scores.get("H0"):
+                sh_incr = (sum(h_scores["H2"]) / len(h_scores["H2"])) - \
+                          (sum(h_scores["H0"]) / len(h_scores["H0"]))
+
             self._MsLog(
-                f"CG_MAISR_D0_VALIDATION_FINAL,parity=PASS,identity_ok={'YES' if identity_ok else 'NO'},"
-                f"configs_scored=54,classifiers_selected={len(chosen)},policies_evaluated={len(rows)},"
-                f"strict_pass_count={len(strict_rows)},"
+                f"CG_MAISR_P1_VALIDATION_FINAL,parity=PASS,identity_recheck={'PASS' if identity_ok else 'FAIL'},"
+                f"configs_scored=54,classifiers_selected={len(chosen)},policies_defined={len(metas)},"
+                f"policies_evaluated={len(rows)},strict_pass_count={len(strict_rows)},"
+                f"local_vs_broad_separation={_f(local_broad_sep,4)},"
+                f"local_vs_broad_true_local_count={local_den},"
+                f"local_vs_broad_true_broad_count={broad_den},"
+                f"local_vs_broad_error_count={local_err},"
+                f"SH_incremental_value={_f(sh_incr,4)},"
                 f"policies_csv={csv_key},attribution_csv={attrib_key},classifiers_csv={clf_key},"
                 f"runtime_errors={self._ms_err}"
             )
             self._MsLog(
                 f"CG_MAISR_P1_GATE_FINAL,full_grid_authorized={'YES' if gate_ok else 'NO'},"
-                f"policies_evaluated={len(rows)},identity_only=0"
+                f"policies_evaluated={len(rows)},identity_only=0,"
+                f"identity_recheck={'PASS' if identity_ok else 'FAIL'}"
             )
             if best is not None:
                 self._MsLog(
-                    f"CG_MAISR_D0_RECOMMENDATION,apply=YES,policy={best['id']},"
+                    f"CG_MAISR_P1_RECOMMENDATION,apply=YES,policy={best['id']},"
                     f"classifier={best['clf_id']},router={best['router']},persistence={best['persist']},"
                     f"timing={best['timing']},SH_mode={best.get('h','NA')},"
                     f"CAGR={_f(best.get('CAGR'))},MaxDD={_f(best.get('MaxDD'))},"
