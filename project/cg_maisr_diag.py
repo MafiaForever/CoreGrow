@@ -1138,6 +1138,11 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                     return
             except Exception:
                 self._ms_err += 1
+            try:
+                if self.CgMaisrD2EconomicGate(parity_ok):
+                    return
+            except Exception:
+                self._ms_err += 1
 
             id_results = self._MsIdentityFinals()
             all_id_pass = bool(id_results) and all(r.get("pass") for r in id_results.values())
@@ -1184,47 +1189,14 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                 return
             self._MsBuildLabels()
             scored = self._MsScoreConfigs()
-            n_valid = sum(1 for r in scored if r.get("valid"))
-            tb = max((r.get("true_broad") or 0) for r in scored) if scored else 0
-            tl = max((r.get("true_local") or 0) for r in scored) if scored else 0
-            ts = max((r.get("true_sector") or 0) for r in scored) if scored else 0
-            tsys = max((r.get("true_sys") or 0) for r in scored) if scored else 0
-            self._MsLog(
-                f"CG_MAISR_P1_CLASSIFIER_SUPPORT,configs=54,valid={n_valid},"
-                f"true_broad_max={tb},true_local_max={tl},true_sector_max={ts},"
-                f"true_local_plus_sector_max={tl+ts},true_sys_max={tsys},"
-                f"local_vs_broad_true_local_count={tl},"
-                f"local_vs_broad_true_broad_count={tb},"
-                f"local_vs_broad_error_count={sum(int(r.get('loc_to_broad_n') or 0) for r in scored)}"
-            )
-            if tb < 20 or (tl + ts) < 20:
-                self._MsWriteP1ClassifiersCsv(scored)
-                self._MsLog("CG_MAISR_P1_GATE_FINAL,full_grid_authorized=NO,policies_evaluated=0,"
-                            "reason=insufficient_label_support")
-                self._MsNoRec("REFINE_MAISR_LABELS")
-                return
-            chosen = self._MsSelectClassifiers(scored)
-            modes = getattr(self, "_ms_selected_modes", set()) or set()
-            for r in chosen[:6]:
-                self._MsLog(
-                    f"CG_MAISR_P1_CLASSIFIER_SELECTED,id={r['id']},H={r['h']},"
-                    f"score={_f(r['score'],4)},macro_f1={_f(r['macro_f1'],4)},"
-                    f"true_broad={r.get('true_broad')},true_local={r.get('true_local')},"
-                    f"true_sector={r.get('true_sector')},primary_f1_gt0={r.get('primary_f1_gt0')},"
-                    f"validity={r.get('validity_reason')},n={r['n']}"
-                )
-            if len(chosen) < 3 or len(modes) < 2:
-                self._MsWriteP1ClassifiersCsv(scored)
-                self._MsLog(
-                    f"CG_MAISR_P1_GATE_FINAL,full_grid_authorized=NO,policies_evaluated=0,"
-                    f"classifiers_selected={len(chosen)},modes={','.join(sorted(modes)) or 'NONE'},"
-                    f"reason=insufficient_valid_classifiers"
-                )
-                self._MsNoRec("REFINE_MAISR_CLASSIFIER")
-                return
-            if not self._ms_grid_on:
-                self._MsWriteP1ClassifiersCsv(scored)
-                self._MsNoRec("grid_disabled")
+            if getattr(self, "_d2_econ_ready", False) and getattr(self, "_d2_frozen_scored", None):
+                chosen = list(self._d2_frozen_scored)
+                self._ms_selected_ids = [r["id"] for r in chosen]
+                self._ms_selected_modes = {r["h"] for r in chosen}
+            else:
+                chosen = self._MsSelectClassifiers(scored)
+            if not chosen or not self._ms_grid_on:
+                self._MsNoRec("grid_disabled_or_no_selection")
                 return
 
             metas = self._MsBuildPolicies(chosen)

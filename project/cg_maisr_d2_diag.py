@@ -31,7 +31,12 @@ class CgMaisrD2DiagMixin(CgMaisrD2LabelMixin):
     def _D2InitHooks(self):
         self._D2InitLabelEngine()
         self._d2_canary = {"armed": 0, "fired": 0, "status": "PENDING"}
-        self._d2_mode = bool(self.cg_maisr_label_only)
+        self._d2_mode = bool(
+            self.cg_maisr_label_only
+            or bool(getattr(self, "cg_maisr_selected_classifiers", None))
+            or (str(getattr(self, "cg_maisr_label_pack", "AUTO")) not in ("AUTO", "", "0")
+                and getattr(self, "_ms_grid_on", False))
+        )
         self._MsLog(
             f"CG_MAISR_D2_INIT,label_only={int(self.cg_maisr_label_only)},"
             f"label_pack={self.cg_maisr_label_pack},"
@@ -332,3 +337,55 @@ class CgMaisrD2DiagMixin(CgMaisrD2LabelMixin):
         )
         self._d2_gate = {"auth": auth, "pack": pack, "chosen": chosen, "next": next_step}
         return True
+
+    def CgMaisrD2EconomicGate(self, parity_ok) -> bool:
+        """Frozen-pack economic revalidation gate. Returns True if handled
+        (either fail-stop or ready for existing policy simulation)."""
+        sels = getattr(self, "cg_maisr_selected_classifiers", None) or []
+        pack = str(getattr(self, "cg_maisr_label_pack", "AUTO") or "AUTO")
+        if not sels or pack in ("AUTO", "", "0") or not getattr(self, "_ms_grid_on", False):
+            return False
+        if getattr(self, "cg_maisr_label_only", False):
+            return False
+        try:
+            self._D2FlushPending()
+        except Exception:
+            self._d2_err += 1
+        self._MsLog(
+            f"CG_MAISR_D2_ECON_INIT,pack={pack},classifiers={','.join(sels)},grid=1"
+        )
+        if not parity_ok:
+            self._MsLog("CG_MAISR_D2_REVALIDATION_FINAL,pass=NO,reason=parity_fail")
+            self._MsLog("CG_MAISR_D2_GATE_FINAL,full_grid_authorized=NO,reason=parity_fail")
+            return True
+        id_results = self._D2IdentityFinals()
+        id_ok = bool(id_results) and all(r.get("pass") for r in id_results.values())
+        chosen_pack, pack_stats = self._D2SelectPack()
+        pack_ok = (chosen_pack == pack)
+        scored = self._D2ScoreClassifiers(pack) if pack_ok else []
+        by_id = {r["id"]: r for r in scored}
+        frozen_ok = all(i in by_id and by_id[i].get("valid") for i in sels)
+        score_match = True
+        for i in sels:
+            if i not in by_id:
+                score_match = False
+                break
+        reval = id_ok and pack_ok and frozen_ok and score_match and self._d2_err == 0
+        self._MsLog(
+            f"CG_MAISR_D2_REVALIDATION_FINAL,pass={'YES' if reval else 'NO'},"
+            f"identity={'PASS' if id_ok else 'FAIL'},pack_match={'YES' if pack_ok else 'NO'},"
+            f"classifiers_match={'YES' if frozen_ok else 'NO'},"
+            f"expected_pack={pack},observed_pack={chosen_pack or 'NONE'}"
+        )
+        if not reval:
+            self._MsLog(
+                "CG_MAISR_D2_GATE_FINAL,full_grid_authorized=NO,"
+                "reason=revalidation_fail,next=FIX_MAISR_GRID_INTERFERENCE"
+            )
+            self._MsNoRec("FIX_MAISR_GRID_INTERFERENCE")
+            return True
+        # Stash frozen chosen rows for existing policy builder
+        self._ms_selected_ids = list(sels)
+        self._d2_frozen_scored = [by_id[i] for i in sels if i in by_id]
+        self._d2_econ_ready = True
+        return False  # continue into policy simulation with frozen IDs
