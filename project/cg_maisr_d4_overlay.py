@@ -1058,7 +1058,7 @@ class CgMaisrD4OverlayMixin:
             vl.append(",".join(str(vr[k]) for k in (
                 "artifact", "bytes", "rows", "expected_rows", "sha256", "exists",
                 "schema_ok", "row_count_ok", "placeholder_only", "pass")))
-        vl.append(",".join([
+        vl.append(",".join(str(x) for x in [
             self_c["artifact"], 0, len(val_rows), len(val_rows), self_c["sha256"],
             1, 1, 1, 0, int(all_pass),
         ]))
