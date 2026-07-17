@@ -95,12 +95,6 @@ class CgMacroA1DiagMixin:
         for tk, w in (held or {}).items():
             if tk in _MACRO_PARK or float(w or 0) <= 0:
                 continue
-            if hasattr(self, "_DftIsEquity"):
-                try:
-                    if not self._DftIsEquity(tk):
-                        continue
-                except Exception:
-                    pass
             out[tk] = float(w)
         s = sum(out.values())
         if s > 0:
