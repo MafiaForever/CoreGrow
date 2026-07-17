@@ -51,6 +51,52 @@ def _p1_tk(sym):
 class CgMaisrP1Mixin:
     """Identity/canary finals + classifier gates + artifact export for P1."""
 
+    def _MsWriteCsv(self, rows):
+        key = f"cg_maisr_d0_policies_{self._MsBid()}.csv"
+        try:
+            headers = ["id", "clf_id", "h", "router", "persist", "timing", "CAGR", "MaxDD",
+                       "annual_stddev", "Sharpe", "worst_5pct_day_mean", "recovery_days_max",
+                       "oos_sharpe", "crisis_maxdd", "y2020_maxdd", "y2022_maxdd",
+                       "risk_efficiency", "turnover", "false_broad", "missed_sys",
+                       "CAGR_cost2", "MaxDD_cost2", "neighbor_stable", "STRICT_PASS", "invalid"]
+            lines = [",".join(headers)]
+            for r in rows:
+                lines.append(",".join(str(r.get(h, "NA")) for h in headers))
+            self.object_store.save(key, "\n".join(lines))
+            return key
+        except Exception as exc:
+            return f"NONE:{type(exc).__name__}"
+
+    def _MsWriteAttributionCsv(self, chosen, rows):
+        key = f"cg_maisr_d0_attribution_{self._MsBid()}.csv"
+        try:
+            headers = ["clf_id", "h", "false_broad_total", "missed_sys_total",
+                       "policies_n", "strict_pass_n"]
+            lines = [",".join(headers)]
+            for r in chosen:
+                sub = [x for x in rows if x.get("clf_id") == r["id"]]
+                fb = sum(int(x.get("false_broad", 0) or 0) for x in sub)
+                ms = sum(int(x.get("missed_sys", 0) or 0) for x in sub)
+                sp = sum(1 for x in sub if x.get("STRICT_PASS"))
+                lines.append(",".join(str(v) for v in (r["id"], r["h"], fb, ms, len(sub), sp)))
+            self.object_store.save(key, "\n".join(lines))
+            return key
+        except Exception as exc:
+            return f"NONE:{type(exc).__name__}"
+
+    def _MsWriteClassifiersCsv(self, scored):
+        key = f"cg_maisr_d0_classifiers_{self._MsBid()}.csv"
+        try:
+            headers = ["id", "s", "a", "b", "h", "score", "macro_f1", "sys_fn",
+                       "broad_fp", "loc_to_broad", "sys_to_loc", "n"]
+            lines = [",".join(headers)]
+            for r in scored:
+                lines.append(",".join(str(r.get(h, "NA")) for h in headers))
+            self.object_store.save(key, "\n".join(lines))
+            return key
+        except Exception as exc:
+            return f"NONE:{type(exc).__name__}"
+
     def _MsCanaryTryFire(self, bars) -> None:
         """Single-shot: fixed classifier S2_C2_B50_H2 armed a LOCAL/SECTOR/BROAD
         signal; fire a 25% reduce of the first eligible held risk symbol at the

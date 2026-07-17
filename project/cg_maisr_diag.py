@@ -6,6 +6,7 @@ from cg_maisr_p1_diag import CgMaisrP1Mixin, _P1_CANARY_CFG, _P1_CANARY_STATES
 from cg_maisr_d2_diag import CgMaisrD2DiagMixin
 from cg_maisr_final_d3 import CgMaisrFinalD3Mixin
 from cg_maisr_d4_overlay import CgMaisrD4OverlayMixin
+from cg_macro_resid_b1_diag import CgMacroResidB1DiagMixin
 from cg_macro_a1_diag import CgMacroA1DiagMixin
 from cg_maisr_ms_classify import ms_classify
 # endregion
@@ -34,7 +35,6 @@ _AMIN = (2, 3)
 _BRTH = (0.50, 0.65, 0.75)
 _HMODE = ("H0", "H1", "H2")
 _W5 = (0.20, 0.25, 0.20, 0.25, 0.10)
-_RESID_THR = {"S1": 0.5, "S2": 0.75, "S3": 1.0}
 
 
 def _clfid(s, a, b, h):
@@ -80,7 +80,7 @@ def _f(x, d=4):
         return "NA"
 
 
-class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
+class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
     """CG-MAISR-D0: multi-asset stress classifier grid + 324-policy router sim."""
 
     def CgMaisrInit(self) -> None:
@@ -110,12 +110,16 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
         self._D3ReadParams(_p, _bool)
         self._D4ReadParams(_p, _bool)
         self._MacroA1ReadParams(_p, _bool)
+        self._MacroResidB1ReadParams(_p, _bool)
         self._ms_cost_bps = _float("cg_maisr_cost_bps", 0.0)
         self._ms_on = bool(self.cg_maisr_diag_enable)
         if getattr(self, "cg_maisr_d4_enable", False):
             self._ms_on = True
             self.cg_maisr_diag_enable = True
         if getattr(self, "cg_macro_a1_enable", False):
+            self._ms_on = True
+            self.cg_maisr_diag_enable = True
+        if getattr(self, "cg_macro_resid_b1_enable", False):
             self._ms_on = True
             self.cg_maisr_diag_enable = True
         self._ms_grid_on = bool(self._ms_on and self.cg_maisr_grid_enable)
@@ -127,7 +131,7 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
         lp = list(getattr(self, "log_only_prefixes", None) or [])
         for pref in (
             "CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_", "CG_MAISR_D3_", "CG_MAISR_D4_",
-            "CG_MAISR_CLOSEOUT", "CG_MACRO_A1_",
+            "CG_MAISR_CLOSEOUT", "CG_MACRO_A1_", "CG_MACRO_RESID_B1_", "CG_MACRO_A1_CLOSEOUT",
         ):
             if pref not in lp:
                 lp.append(pref)
@@ -231,6 +235,10 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
             self._ms_err += 1
         try:
             self._MacroA1InitHooks()
+        except Exception:
+            self._ms_err += 1
+        try:
+            self._MacroResidB1InitHooks()
         except Exception:
             self._ms_err += 1
 
@@ -385,6 +393,8 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
                             self._D2OnBar(tk, et, o, h, l, c)
                         if getattr(self, "cg_macro_a1_enable", False) and hasattr(self, "_MacroA1OnAcceptedBar"):
                             self._MacroA1OnAcceptedBar(tk, et, o, h, l, c)
+                        if getattr(self, "cg_macro_resid_b1_enable", False) and hasattr(self, "_MacroResidB1OnAcceptedBar"):
+                            self._MacroResidB1OnAcceptedBar(tk, et, o, h, l, c)
                     except Exception:
                         self._ms_err += 1
                 if self.cg_maisr_identity_only:
@@ -527,8 +537,9 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
             self._ms_subjects_events.append(bytes(subjects))
         try:
             macro = bool(getattr(self, "cg_macro_a1_enable", False))
+            resid = bool(getattr(self, "cg_macro_resid_b1_enable", False))
             if (getattr(self, "cg_maisr_label_only", False) or getattr(self, "_d2_mode", False)
-                    or d4 or macro):
+                    or d4 or macro or resid):
                 if d4:
                     self._d4_last_subjects = bytes(subjects)
                 self._D2OnEval(kind, tod, bytes(states), feat)
@@ -536,6 +547,8 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
                     self._D4RuntimeOnEval(kind, tod, bytes(states), bytes(subjects), feat)
                 if macro and hasattr(self, "_MacroA1OnEval"):
                     self._MacroA1OnEval(kind, tod, bytes(states), feat)
+                if resid and hasattr(self, "_MacroResidB1OnEval"):
+                    self._MacroResidB1OnEval(kind, tod, bytes(states), feat)
         except Exception:
             self._ms_err += 1
         if kind == "PRE":
@@ -1021,7 +1034,8 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
         try:
             n = len(msg) + 1
             # Macro A1 owns a separate EOA/artifact budget; do not starve it with P1 lines.
-            if str(msg).startswith("CG_MACRO_A1_") or str(msg).startswith("CG_MAISR_CLOSEOUT"):
+            if (str(msg).startswith("CG_MACRO_A1_") or str(msg).startswith("CG_MACRO_RESID_B1_")
+                    or str(msg).startswith("CG_MACRO_A1_CLOSEOUT") or str(msg).startswith("CG_MAISR_CLOSEOUT")):
                 self.log(msg)
                 return
             # P1 console budget target <45 KB; leave headroom for FINAL lines.
@@ -1043,52 +1057,6 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
             f"false_broad_exits=NA,missed_systemic=NA,CAGR_2bps=NA,MaxDD_2bps=NA,neighbor_stable=NO,"
             f"reason={reason}"
         )
-
-    def _MsWriteCsv(self, rows):
-        key = f"cg_maisr_d0_policies_{self._MsBid()}.csv"
-        try:
-            headers = ["id", "clf_id", "h", "router", "persist", "timing", "CAGR", "MaxDD",
-                       "annual_stddev", "Sharpe", "worst_5pct_day_mean", "recovery_days_max",
-                       "oos_sharpe", "crisis_maxdd", "y2020_maxdd", "y2022_maxdd",
-                       "risk_efficiency", "turnover", "false_broad", "missed_sys",
-                       "CAGR_cost2", "MaxDD_cost2", "neighbor_stable", "STRICT_PASS", "invalid"]
-            lines = [",".join(headers)]
-            for r in rows:
-                lines.append(",".join(str(r.get(h, "NA")) for h in headers))
-            self.object_store.save(key, "\n".join(lines))
-            return key
-        except Exception as exc:
-            return f"NONE:{type(exc).__name__}"
-
-    def _MsWriteAttributionCsv(self, chosen, rows):
-        key = f"cg_maisr_d0_attribution_{self._MsBid()}.csv"
-        try:
-            headers = ["clf_id", "h", "false_broad_total", "missed_sys_total",
-                       "policies_n", "strict_pass_n"]
-            lines = [",".join(headers)]
-            for r in chosen:
-                sub = [x for x in rows if x.get("clf_id") == r["id"]]
-                fb = sum(int(x.get("false_broad", 0) or 0) for x in sub)
-                ms = sum(int(x.get("missed_sys", 0) or 0) for x in sub)
-                sp = sum(1 for x in sub if x.get("STRICT_PASS"))
-                lines.append(",".join(str(v) for v in (r["id"], r["h"], fb, ms, len(sub), sp)))
-            self.object_store.save(key, "\n".join(lines))
-            return key
-        except Exception as exc:
-            return f"NONE:{type(exc).__name__}"
-
-    def _MsWriteClassifiersCsv(self, scored):
-        key = f"cg_maisr_d0_classifiers_{self._MsBid()}.csv"
-        try:
-            headers = ["id", "s", "a", "b", "h", "score", "macro_f1", "sys_fn",
-                       "broad_fp", "loc_to_broad", "sys_to_loc", "n"]
-            lines = [",".join(headers)]
-            for r in scored:
-                lines.append(",".join(str(r.get(h, "NA")) for h in headers))
-            self.object_store.save(key, "\n".join(lines))
-            return key
-        except Exception as exc:
-            return f"NONE:{type(exc).__name__}"
 
     def CgMaisrOnEndOfAlgorithm(self, parity_ok) -> None:
         if getattr(self, "_ms_emitted", False):
@@ -1115,6 +1083,17 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
                             "reason=shadow_replay_parity_failed")
                 return
 
+            if getattr(self, "cg_macro_resid_b1_enable", False):
+                try:
+                    if self.CgMacroResidB1OnEndOfAlgorithm(parity_ok):
+                        return
+                except Exception as e:
+                    self._ms_err += 1
+                    try:
+                        self._MsLog(f"CG_MACRO_RESID_B1_RECOMMENDATION,result=FAILED,reason=EOA_EXCEPTION:{type(e).__name__}:{e},research_conclusion=NOT_REACHED,next=FIX_MACRO_RESID_B1_IMPLEMENTATION")
+                    except Exception:
+                        pass
+                return
             if getattr(self, "cg_macro_a1_enable", False):
                 try:
                     if self.CgMacroA1OnEndOfAlgorithm(parity_ok):

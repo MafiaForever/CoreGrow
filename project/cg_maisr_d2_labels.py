@@ -406,6 +406,15 @@ class CgMaisrD2LabelMixin:
                 )
             except Exception:
                 self._d2_err += 1
+        if getattr(self, "cg_macro_resid_b1_enable", False) and hasattr(self, "_MacroResidB1StoreFromFinalize"):
+            try:
+                self._MacroResidB1StoreFromFinalize(
+                    p, stats, spy, dur_mae, gold_mae, dur_ok, gold_ok,
+                    infl_ret if infl_ret is not None else 0.0, infl_rel,
+                    held_feat, br_maes, gold_source,
+                )
+            except Exception:
+                self._d2_err += 1
 
         outcomes = {}
         for pname, pack in _D2_PACKS.items():
