@@ -125,7 +125,10 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
         self._ms_emitted = False
 
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_", "CG_MAISR_D3_", "CG_MAISR_D4_"):
+        for pref in (
+            "CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_", "CG_MAISR_D3_", "CG_MAISR_D4_",
+            "CG_MAISR_CLOSEOUT", "CG_MACRO_A1_",
+        ):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
@@ -1017,6 +1020,10 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
     def _MsLog(self, msg):
         try:
             n = len(msg) + 1
+            # Macro A1 owns a separate EOA/artifact budget; do not starve it with P1 lines.
+            if str(msg).startswith("CG_MACRO_A1_") or str(msg).startswith("CG_MAISR_CLOSEOUT"):
+                self.log(msg)
+                return
             # P1 console budget target <45 KB; leave headroom for FINAL lines.
             if self._ms_log_used + n > 44000:
                 return
