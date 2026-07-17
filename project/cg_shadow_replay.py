@@ -565,18 +565,29 @@ class CgShadowReplayMixin:
             m = max(0.0, min(1.0, float(mult)))
             if m >= 1.0 - 1e-15:
                 continue
-            # No same-day re-risk / no increase
-            if led.get("same_day_cut") and m > float(getattr(led, "_last_mult_" + t, 1.0) or 1.0):
-                continue
+            # No same-day re-risk / no increase — dictionary cut ceiling
+            ceil_map = led.setdefault("cut_ceiling_qty", {})
+            last_map = led.setdefault("last_cut_mult", {})
+            if led.get("same_day_cut"):
+                last_m = float(last_map.get(t, 1.0) or 1.0)
+                if m > last_m + 1e-15:
+                    continue
             w1 = w0 * m
             reduced += (w0 - w1)
             new_w[t] = w1
             changed = True
             led.setdefault("cut_syms", set()).add(t)
+            # record ceiling at post-cut weight*nav/price approx via weight ratio
+            last_map[t] = min(float(last_map.get(t, 1.0) or 1.0), m)
         if not changed:
             return False, 0.0
         # Released weight stays in cash ledger (do not park into BIL)
         self._SrApplyWeights(led, new_w, px)
+        # After apply, store quantity ceilings
+        for t in (led.get("cut_syms") or set()):
+            q = float((led.get("qty") or {}).get(t, 0) or 0)
+            prev = (led.get("cut_ceiling_qty") or {}).get(t)
+            led.setdefault("cut_ceiling_qty", {})[t] = q if prev is None else min(float(prev), q)
         led["same_day_cut"] = True
         led["sum_risk_red"] = float(led.get("sum_risk_red", 0.0)) + reduced
         led["max_risk_red"] = max(float(led.get("max_risk_red", 0.0)), reduced)
@@ -676,6 +687,11 @@ class CgShadowReplayMixin:
             self._SrNoteCashDiverg("FILL", t, None, notional_delta + fee_delta, signed)
             for ild in (self._sr_identity_leds or {}).values():
                 self._SrApplyFill(ild, t, signed, px, fee)
+            try:
+                if getattr(self, "cg_maisr_d4_enable", False) and hasattr(self, "CgMaisrD4OnProductionFill"):
+                    self.CgMaisrD4OnProductionFill(t, signed, px, fee, meta)
+            except Exception:
+                pass
 
             if not self._sr_grid_on:
                 return
@@ -1007,6 +1023,11 @@ class CgShadowReplayMixin:
             try:
                 if hasattr(self, "CgMaisrOnMark"):
                     self.CgMaisrOnMark(today, px)
+            except Exception:
+                pass
+            try:
+                if getattr(self, "cg_maisr_d4_enable", False) and hasattr(self, "CgMaisrD4OnReplayMark"):
+                    self.CgMaisrD4OnReplayMark(today, px)
             except Exception:
                 pass
         except Exception:
