@@ -829,16 +829,23 @@ class CgMaisrD4OverlayMixin:
         sel.append(f"TRAIN_B_TOTAL,{len(hp_b)},,,{len({tk for _, tk in hp_b})},")
         sel.append(f"TRAIN_TOTAL,{len(hp_a | hp_b)},,,{len(sym_exp)},")
         arts[f"cg_maisr_d4_subject_exposure_{bid}.csv"] = "\n".join(sel)
-        ph = ["id,pass,support_ok,stability_ok,mono_ok,support_reason,broad_family_episodes,broad_family_episode_min,"
-              "broad_family_episode_max,broad_family_days,broad_family_day_min,broad_family_day_max,"
-              "local_sector_episodes,local_sector_episode_min,local_sector_episode_max,"
-              "local_sector_held_days,local_sector_day_min,local_sector_day_max,"
-              "defensive_episodes,defensive_episode_min,defensive_episode_max,dist_score,selected"]
+        ph = [
+            "id", "pass", "support_ok", "stability_ok", "mono_ok", "support_reason",
+            "broad_family_episodes", "broad_family_episode_min", "broad_family_episode_max",
+            "broad_family_days", "broad_family_day_min", "broad_family_day_max",
+            "local_sector_episodes", "local_sector_episode_min", "local_sector_episode_max",
+            "local_sector_held_days", "local_sector_day_min", "local_sector_day_max",
+            "defensive_episodes", "defensive_episode_min", "defensive_episode_max",
+            "dist_score", "selected",
+        ]
         pl = [",".join(ph)]
         chosen_id = getattr(self, "_d4_selected_pack", None)
         for p in _D4_PACKS:
             s = pack_stats[p["id"]]
-            pl.append(",".join(str(s.get(h) if h != "selected" else int(p["id"] == chosen_id)) for h in ph))
+            pl.append(",".join(
+                str(int(p["id"] == chosen_id) if h == "selected" else s.get(h, ""))
+                for h in ph
+            ))
         arts[f"cg_maisr_d4_pack_stats_{bid}.csv"] = "\n".join(pl)
         ml = ["dimension,fixed,less_severe,more_severe,metric,lhs,rhs,pass"]
         for r in mono_rows:
