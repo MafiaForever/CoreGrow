@@ -326,9 +326,51 @@ class CgMaisrD2LabelMixin:
         gold_mae = sum(gold_vals) / len(gold_vals) if gold_ok else 0.0
         # ATR-normalized relative returns (raw 0.15–0.25 in 60m is impossible).
         infl_vals = [stats[t]["ret"] for t in _D2_INFL if t in stats]
-        infl_rel = (sum(infl_vals) / len(infl_vals) - spy["ret"]) if infl_vals else 0.0
+        infl_ret = (sum(infl_vals) / len(infl_vals)) if infl_vals else None
+        infl_rel = (infl_ret - spy["ret"]) if infl_ret is not None else 0.0
         def_vals = [stats[t]["ret"] - spy["ret"] for t in _D2_DEF if t in stats]
         def_rel = max(def_vals) if def_vals else 0.0
+        br_maes = {t: stats[t]["mae"] for t in _D2_BREADTH if t in stats}
+
+        held_feat = {}
+        for tk, w in p["held"].items():
+            own = stats.get(tk)
+            if not own:
+                continue
+            proxy = _D2_PROXY.get(tk, None)
+            proxy_ok = proxy is not None and proxy in stats
+            proxy_mae = stats[proxy]["mae"] if proxy_ok else None
+            vs_spy = own["mae"] - spy_mae
+            vs_proxy = (own["mae"] - proxy_mae) if proxy_ok and proxy_mae is not None else None
+            held_feat[tk] = {
+                "mae": own["mae"], "ret": own["ret"], "w": float(w),
+                "spy_mae": spy_mae, "vs_spy": vs_spy, "vs_proxy": vs_proxy,
+                "proxy_ok": proxy_ok, "proxy_mae": proxy_mae,
+            }
+            ac = self._d2_asset.setdefault(tk, {
+                "evals": 0, "days": set(), "wsum": 0.0, "wlist": [],
+                "first": None, "last": None, "proxy": proxy if proxy else "NONE",
+            })
+            ac["evals"] += 1
+            ac["days"].add(p["do"])
+            ac["wsum"] += float(w)
+            ac["wlist"].append(float(w))
+            ac["first"] = ac["first"] or p["do"]
+            ac["last"] = p["do"]
+            self._d2_held_days.add((p["do"], tk))
+            self._d2_held_rows += 1
+
+        # D3 raw feature snapshot (all eras; TRAIN filtered at EOA).
+        if getattr(self, "cg_maisr_final_d3_enable", False) and hasattr(self, "_D3StoreRaw"):
+            try:
+                blocks = self._D3Blocks(stats, spy["ret"])
+                self._D3StoreRaw(
+                    p, stats, spy, dur_mae, gold_mae, dur_ok, gold_ok,
+                    infl_ret if infl_ret is not None else 0.0, infl_rel, blocks,
+                    held_feat, br_maes,
+                )
+            except Exception:
+                self._d2_err += 1
 
         outcomes = {}
         for pname, pack in _D2_PACKS.items():
@@ -338,31 +380,11 @@ class CgMaisrD2LabelMixin:
             mlab, _ = self._D2MacroLabel(pack, spy_mae, breadth, dur_mae, gold_mae,
                                          infl_rel, def_rel, dur_ok, gold_ok)
             held_labs = {}
-            for tk, w in p["held"].items():
-                own = stats.get(tk)
-                if not own:
-                    continue
-                proxy = _D2_PROXY.get(tk, None)
-                proxy_ok = proxy is not None and proxy in stats
-                proxy_mae = stats[proxy]["mae"] if proxy_ok else None
-                vs_spy = own["mae"] - spy_mae
-                hlab, _ = self._D2HeldLabel(pack, own["mae"], vs_spy, proxy_mae, proxy_ok,
-                                            mlab == "BROAD_EQUITY_STRESS"
-                                            or mlab == "SYSTEMIC_LIQUIDITY_STRESS")
+            for tk, hf in held_feat.items():
+                hlab, _ = self._D2HeldLabel(
+                    pack, hf["mae"], hf["vs_spy"], hf["proxy_mae"], hf["proxy_ok"],
+                    mlab == "BROAD_EQUITY_STRESS" or mlab == "SYSTEMIC_LIQUIDITY_STRESS")
                 held_labs[tk] = hlab
-                # asset coverage
-                ac = self._d2_asset.setdefault(tk, {
-                    "evals": 0, "days": set(), "wsum": 0.0, "wlist": [],
-                    "first": None, "last": None, "proxy": proxy if proxy else "NONE",
-                })
-                ac["evals"] += 1
-                ac["days"].add(p["do"])
-                ac["wsum"] += float(w)
-                ac["wlist"].append(float(w))
-                ac["first"] = ac["first"] or p["do"]
-                ac["last"] = p["do"]
-                self._d2_held_days.add((p["do"], tk))
-                self._d2_held_rows += 1
             outcomes[pname] = (mlab, held_labs, breadth)
 
         self._d2_n_fin += 1
