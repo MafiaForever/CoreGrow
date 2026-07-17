@@ -380,6 +380,8 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
                     try:
                         if getattr(self, "cg_maisr_label_only", False) or getattr(self, "_d2_mode", False):
                             self._D2OnBar(tk, et, o, h, l, c)
+                        if getattr(self, "cg_macro_a1_enable", False) and hasattr(self, "_MacroA1OnAcceptedBar"):
+                            self._MacroA1OnAcceptedBar(tk, et, o, h, l, c)
                     except Exception:
                         self._ms_err += 1
                 if self.cg_maisr_identity_only:
@@ -1110,8 +1112,12 @@ class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3
                 try:
                     if self.CgMacroA1OnEndOfAlgorithm(parity_ok):
                         return
-                except Exception:
+                except Exception as e:
                     self._ms_err += 1
+                    try:
+                        self._MsLog(f"CG_MACRO_A1_RECOMMENDATION,result=FAILED,reason=EOA_EXCEPTION:{type(e).__name__}:{e},research_conclusion=NOT_REACHED,next=FIX_MACRO_A1_IMPLEMENTATION")
+                    except Exception:
+                        pass
                 return
             if getattr(self, "cg_maisr_d4_enable", False):
                 try:
