@@ -64,8 +64,9 @@ _D2_BREADTH = ("XLE", "XLB", "XLV", "XLU")
 _D2_INFL = ("DBC", "XLE")
 _D2_DEF = ("BND", "TIP", "GLD", "GLDM", "SH", "BIL", "SGOV", "USFR")
 # SPYG has no minute feed -> no SECTOR proxy for growth names.
-_D2_PROXY = {"XLE": "XLE", "XLB": "XLB", "XLV": "XLV", "XLU": "XLU", "DBC": "DBC",
+_D2_PROXY = {"XLE": None, "XLB": None, "XLV": None, "XLU": None, "DBC": None,
              "MU": None, "NVDA": None, "AVGO": None}
+_D4_SECTOR_ASSETS = frozenset(("XLE", "XLB", "XLV", "XLU", "DBC"))
 
 _D2_TRAIN0 = _date(2012, 1, 1).toordinal()
 _D2_TRAIN1 = _date(2018, 12, 31).toordinal()
@@ -157,11 +158,13 @@ class CgMaisrD2LabelMixin:
         if ring is None:
             ring = deque(maxlen=90)
             self._d2_bars[tk] = ring
-        try:
-            ring.append((et, float(o), float(h), float(l), float(c)))
-            self._D2TryFinalize()
-        except Exception:
-            self._d2_err += 1
+            try:
+                ring.append((et, float(o), float(h), float(l), float(c)))
+                self._D2TryFinalize()
+                if getattr(self, "cg_maisr_d4_enable", False) and hasattr(self, "_D4TryFillPending"):
+                    self._D4TryFillPending(tk, et, float(o))
+            except Exception:
+                self._d2_err += 1
 
     def _D2HeldEligible(self, tk, weight) -> bool:
         try:
@@ -232,7 +235,7 @@ class CgMaisrD2LabelMixin:
         if "SPY" not in origin:
             return
         held = {tk: w for tk, w in self._D2HeldWeights().items() if tk in origin}
-        self._d2_pending.append({
+        entry = {
             "t": sig, "do": do, "tod": tod,
             "preds": bytes(states_bytes) if states_bytes is not None else b"\x00" * 54,
             "origin": origin,
@@ -241,7 +244,11 @@ class CgMaisrD2LabelMixin:
             "rg": str(getattr(self, "current_regime", None) or "NEUTRAL").upper(),
             "w2": 1 if getattr(self, "_cg_w2_last_active", False) else 0,
             "ids": str(getattr(self, "_ids_state", None) or "NORMAL"),
-        })
+        }
+        if getattr(self, "cg_maisr_d4_enable", False):
+            entry["subjects"] = getattr(self, "_d4_last_subjects", None) or (b"\x00" * 54)
+            entry["kind"] = kind
+        self._d2_pending.append(entry)
         while len(self._d2_pending) > 128:
             self._d2_pending.popleft()
             self._d2_n_drop += 1
@@ -320,10 +327,18 @@ class CgMaisrD2LabelMixin:
         spy = stats["SPY"]
         spy_mae = spy["mae"]
         dur_vals = [stats[t]["mae"] for t in _D2_DUR if t in stats]
-        gold_vals = [stats[t]["mae"] for t in _D2_GOLD if t in stats]
-        dur_ok, gold_ok = bool(dur_vals), bool(gold_vals)
+        dur_ok = bool(dur_vals)
         dur_mae = sum(dur_vals) / len(dur_vals) if dur_ok else 0.0
-        gold_mae = sum(gold_vals) / len(gold_vals) if gold_ok else 0.0
+        # Gold continuity: primary GLD then fallback GLDM; never average.
+        primary = getattr(self, "_ms_gold_primary", None) or "GLD"
+        fallback = getattr(self, "_ms_gold_fallback", None) or "GLDM"
+        gold_stat = stats.get(primary) or stats.get(fallback)
+        gold_ok = gold_stat is not None
+        gold_mae = gold_stat["mae"] if gold_ok else 0.0
+        gold_ret = gold_stat["ret"] if gold_ok else 0.0
+        gold_source = primary if primary in stats else (fallback if fallback in stats else "NONE")
+        self._d2_gold_double_count_used = 0
+        self._d2_last_gold_source = gold_source
         # ATR-normalized relative returns (raw 0.15–0.25 in 60m is impossible).
         infl_vals = [stats[t]["ret"] for t in _D2_INFL if t in stats]
         infl_ret = (sum(infl_vals) / len(infl_vals)) if infl_vals else None
@@ -368,6 +383,15 @@ class CgMaisrD2LabelMixin:
                     p, stats, spy, dur_mae, gold_mae, dur_ok, gold_ok,
                     infl_ret if infl_ret is not None else 0.0, infl_rel, blocks,
                     held_feat, br_maes,
+                )
+            except Exception:
+                self._d2_err += 1
+        if getattr(self, "cg_maisr_d4_enable", False) and hasattr(self, "_D4StoreFromFinalize"):
+            try:
+                self._D4StoreFromFinalize(
+                    p, stats, spy, dur_mae, gold_mae, dur_ok, gold_ok,
+                    infl_ret if infl_ret is not None else 0.0, infl_rel,
+                    held_feat, br_maes, gold_source,
                 )
             except Exception:
                 self._d2_err += 1

@@ -5,14 +5,10 @@ from collections import deque
 from cg_maisr_p1_diag import CgMaisrP1Mixin, _P1_CANARY_CFG, _P1_CANARY_STATES
 from cg_maisr_d2_diag import CgMaisrD2DiagMixin
 from cg_maisr_final_d3 import CgMaisrFinalD3Mixin
+from cg_maisr_d4_overlay import CgMaisrD4OverlayMixin
+from cg_maisr_ms_classify import ms_classify
 # endregion
-# cg_maisr_diag.py -- CG-MAISR-D0/P1/D2: multi-asset independent stress router.
-# Sensors classify panel stress via a 54-config grid (3 sensitivities x
-# 2 active-component minimums x 3 breadth thresholds x 3 SH-confirm modes).
-# TRAIN (2012-2018) selects up to 6 classifiers (2 per SH mode); those
-# expand into 324 router policies (6 clf x 6 router profiles x 3 persist
-# x 3 timing). EOA reconstructs every policy from a stored intraday event
-# log. This mixin never calls set_holdings/liquidate; diagnostic only.
+# cg_maisr_diag.py -- CG-MAISR-D0/P1/D2 multi-asset stress router (diagnostic only).
 
 _STATES = ("SYSTEMIC_LIQUIDITY_STRESS", "RATE_INFLATION_STRESS", "BROAD_EQUITY_STRESS",
            "SECTOR_STRESS", "LOCAL_ASSET_STRESS", "DEFENSIVE_ROTATION",
@@ -26,8 +22,8 @@ _ROLES = {
     "DUR": ("BND", "TIP"), "INFL": ("DBC", "XLE"),
     "PARK": ("BIL", "SGOV", "USFR"),
 }
-_PROXY = {"XLE": "XLE", "XLB": "XLB", "XLV": "XLV", "XLU": "XLU", "DBC": "DBC",
-          "MU": "SPYG", "NVDA": "SPYG", "AVGO": "SPYG"}
+_PROXY = {"XLE": None, "XLB": None, "XLV": None, "XLU": None, "DBC": None,
+          "MU": None, "NVDA": None, "AVGO": None}
 _RISK_UNIV = ("SPY", "MU", "NVDA", "AVGO")
 _IDS_CODE = {"NORMAL": 0, "WATCH": 1, "STRESS": 2, "PANIC_SHORT": 3}
 _IDS_ELEV = ("WATCH", "STRESS", "PANIC_SHORT")
@@ -83,7 +79,7 @@ def _f(x, d=4):
         return "NA"
 
 
-class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
+class CgMaisrDiagMixin(CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
     """CG-MAISR-D0: multi-asset stress classifier grid + 324-policy router sim."""
 
     def CgMaisrInit(self) -> None:
@@ -111,8 +107,12 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
         self.cg_maisr_identity_debug = _bool("cg_maisr_identity_debug", "0")
         self._D2ReadParams(_p, _bool)
         self._D3ReadParams(_p, _bool)
+        self._D4ReadParams(_p, _bool)
         self._ms_cost_bps = _float("cg_maisr_cost_bps", 0.0)
         self._ms_on = bool(self.cg_maisr_diag_enable)
+        if getattr(self, "cg_maisr_d4_enable", False):
+            self._ms_on = True
+            self.cg_maisr_diag_enable = True
         self._ms_grid_on = bool(self._ms_on and self.cg_maisr_grid_enable)
         self._ms_emit = bool(self._ms_on and self.cg_maisr_emit_events)
         self._ms_log_used = 0
@@ -120,7 +120,7 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
         self._ms_emitted = False
 
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_", "CG_MAISR_D3_"):
+        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_", "CG_MAISR_D3_", "CG_MAISR_D4_"):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
@@ -217,12 +217,16 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
             self._D3InitHooks()
         except Exception:
             self._ms_err += 1
+        try:
+            self._D4InitHooks()
+        except Exception:
+            self._ms_err += 1
 
     def _MsAuditSubscriptions(self) -> None:
         want = set()
         for grp in _ROLES.values():
             want.update(grp)
-        want.add("GLDM")
+        want.update(("GLD", "GLDM"))
         per_tk = {}
         rows = []
         try:
@@ -278,10 +282,10 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                 continue
         avail = {tk for tk, rec in per_tk.items()
                  if (rec["minute"] + rec["daily"] + rec["other"]) >= 1}
+        usable_tb = {tk for tk, rec in per_tk.items()
+                     if rec.get("minute", 0) >= 1 and rec.get("tradebar", 0) >= 1}
         classes = {}
         for tk, rec in per_tk.items():
-            # MIXED_RESOLUTION only when both minute AND daily configs exist.
-            # m=2,d=0 (e.g. TradeBar+QuoteBar) is NORMAL_MULTI_CONFIG, not mixed.
             if rec["minute"] >= 1 and rec["daily"] >= 1:
                 classes[tk] = "MIXED_RESOLUTION"
             elif rec["tradebar"] > 1:
@@ -294,7 +298,9 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
         self._ms_sub_classes = classes
         self._ms_mixed = sorted(tk for tk, c in classes.items() if c == "MIXED_RESOLUTION")
         self._ms_dup_cfg = sorted(tk for tk, c in classes.items() if c == "DUPLICATE_TRADEBAR_CONFIG")
-        self._ms_gold = "GLD" if "GLD" in avail else ("GLDM" if "GLDM" in avail else "GLD")
+        self._ms_gold_primary = "GLD" if "GLD" in usable_tb else None
+        self._ms_gold_fallback = "GLDM" if "GLDM" in usable_tb else None
+        self._ms_gold = self._ms_gold_primary or self._ms_gold_fallback or "GLD"
         roles = {}
         for name, grp in _ROLES.items():
             roles[name] = tuple(t for t in grp if t in avail)
@@ -448,78 +454,11 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
         return tuple(out)
 
     def _MsClassify(self, feat, cl, thr, amin, bthr, hmode, s):
-        roles = self._ms_roles
-        park = roles.get("PARK", ())
-
-        def stressed(tk):
-            if tk in park:
-                return False
-            c = cl.get(tk)
-            if c is None:
-                return False
-            score = sum(w * v for w, v in zip(_W5, c))
-            active = sum(1 for v in c if v >= thr)
-            return bool(score >= thr and active >= amin)
-
-        def mv(tk):
-            f = feat.get(tk)
-            return f["mv"] if f else 0.0
-
-        def dd_raw(tk):
-            f = feat.get(tk)
-            return f["raw"][3] if f else 0.0
-
-        broad = roles.get("BROAD", ())
-        spy_str = any(stressed(t) for t in broad)
-        breadth = roles.get("BREADTH", ())
-        n_b = sum(1 for t in breadth if stressed(t))
-        breadth_frac = (n_b / len(breadth)) if breadth else 0.0
-        dur = roles.get("DUR", ())
-        bond_str = any(stressed(t) for t in dur)
-        dur_mv = (sum(mv(t) for t in dur) / len(dur)) if dur else 0.0
-        infl = roles.get("INFL", ())
-        infl_mv = (sum(mv(t) for t in infl) / len(infl)) if infl else 0.0
-        sh_role = roles.get("SH", ())
-        gold_str = stressed(self._ms_gold)
-        gold_mv = mv(self._ms_gold)
-
-        blocks = int(spy_str) + int(breadth_frac >= bthr) + int(bond_str) + int(gold_str)
-        if spy_str and blocks >= 3:
-            return "SYSTEMIC_LIQUIDITY_STRESS"
-
-        if (spy_str or breadth_frac >= bthr) and bond_str and infl_mv > 0:
-            return "RATE_INFLATION_STRESS"
-
-        if spy_str and breadth_frac >= bthr:
-            if hmode == "H2":
-                ids_now = str(getattr(self, "_ids_state", "NORMAL") or "NORMAL")
-                sh_ok = bool(sh_role and stressed(sh_role[0]))
-                if not (sh_ok or ids_now in _IDS_ELEV):
-                    return "SECTOR_STRESS"
-            return "BROAD_EQUITY_STRESS"
-
-        held = self._ms_current_risk - set(broad)
-        if held and breadth_frac < bthr:
-            proxies = {_PROXY.get(t, t) for t in held}
-            if any(stressed(p) for p in proxies if p):
-                return "SECTOR_STRESS"
-            res_thr = _RESID_THR.get(s, 0.75)
-            resid = 0.0
-            for p in proxies:
-                if p and p in feat:
-                    resid = max(resid, dd_raw(p) - dd_raw("SPY"))
-            if resid >= res_thr:
-                return "LOCAL_ASSET_STRESS"
-
-        if breadth_frac >= bthr:
-            return "SECTOR_STRESS"
-
-        xlv_mv, xlu_mv = mv("XLV"), mv("XLU")
-        if spy_str and gold_mv > 0 and dur_mv > 0 and (xlv_mv > 0 or xlu_mv > 0):
-            return "DEFENSIVE_ROTATION"
-        if spy_str:
-            return "UNCONFIRMED_NOISE"
-        return "NORMAL"
+        return ms_classify(
+            feat, cl, thr, amin, bthr, hmode, s,
+            self._ms_roles, getattr(self, "_ms_current_risk", set()) or set(),
+            getattr(self, "_ids_state", "NORMAL"), self._ms_gold,
+        )
 
     def _MsEval(self, kind) -> None:
         self._ms_eval_seen += 1
@@ -537,6 +476,7 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
         if not feat:
             return
         states = bytearray(54)
+        subjects = bytearray(54)
         clip_cache = {}
         for sname in ("S1", "S2", "S3"):
             scale, thr = _SENS[sname]
@@ -544,9 +484,16 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
             for tk, f in feat.items():
                 cl[tk] = [max(0.0, min(1.0, v / scale)) for v in f["raw"]]
             clip_cache[sname] = (cl, thr)
+        d4 = bool(getattr(self, "cg_maisr_d4_enable", False))
         for i, (s, a, b, h) in enumerate(_ALL_CFG):
             cl, thr = clip_cache[s]
-            states[i] = _SIX[self._MsClassify(feat, cl, thr, a, b, h, s)]
+            if d4 and hasattr(self, "_D4ClassifyPair"):
+                st, subj = self._D4ClassifyPair(feat, cl, thr, a, b, h, s)
+                states[i] = _SIX.get(st, _SIX["NORMAL"])
+                subjects[i] = int(subj) & 0xFF
+            else:
+                states[i] = _SIX[self._MsClassify(feat, cl, thr, a, b, h, s)]
+                subjects[i] = 0
         d = self.time.date()
         tod = self.time.hour * 60 + self.time.minute
         ids_code = _IDS_CODE.get(getattr(self, "_ids_state", None), 0)
@@ -561,9 +508,17 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                 riskbyte |= (1 << bit)
         px = self._MsPx(("SPY", "SH", self._ms_gold, "BND"))
         self._ms_events.append((d.toordinal(), tod, bytes(states), meta, riskbyte, px))
+        if d4:
+            self._ms_subjects_events = getattr(self, "_ms_subjects_events", [])
+            self._ms_subjects_events.append(bytes(subjects))
         try:
-            if getattr(self, "cg_maisr_label_only", False) or getattr(self, "_d2_mode", False):
+            if (getattr(self, "cg_maisr_label_only", False) or getattr(self, "_d2_mode", False)
+                    or d4):
+                if d4:
+                    self._d4_last_subjects = bytes(subjects)
                 self._D2OnEval(kind, tod, bytes(states), feat)
+                if d4 and hasattr(self, "_D4RuntimeOnEval"):
+                    self._D4RuntimeOnEval(kind, tod, bytes(states), bytes(subjects), feat)
         except Exception:
             self._ms_err += 1
         if kind == "PRE":
@@ -1139,6 +1094,12 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                             "reason=shadow_replay_parity_failed")
                 return
 
+            if getattr(self, "cg_maisr_d4_enable", False):
+                try:
+                    self.CgMaisrD4OnEndOfAlgorithm(parity_ok)
+                except Exception:
+                    self._ms_err += 1
+                return
             try:
                 if self.CgMaisrD3OnEndOfAlgorithm(parity_ok):
                     return
@@ -1149,7 +1110,6 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                     return
             except Exception:
                 self._ms_err += 1
-            # Suppress redundant D2 finals when D3 owns the run.
             if not getattr(self, "cg_maisr_final_d3_enable", False):
                 try:
                     if self.CgMaisrD2OnEndOfAlgorithm(parity_ok):
@@ -1162,7 +1122,7 @@ class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                 except Exception:
                     self._ms_err += 1
             elif getattr(self, "_d3_econ_ready", False) or getattr(self, "_d2_econ_ready", False):
-                pass  # continue into frozen economic policy simulation
+                pass
             else:
                 return
 
