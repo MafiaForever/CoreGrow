@@ -6,6 +6,7 @@ from cg_maisr_p1_diag import CgMaisrP1Mixin, _P1_CANARY_CFG, _P1_CANARY_STATES
 from cg_maisr_d2_diag import CgMaisrD2DiagMixin
 from cg_maisr_final_d3 import CgMaisrFinalD3Mixin
 from cg_maisr_d4_overlay import CgMaisrD4OverlayMixin
+from cg_macro_a1_diag import CgMacroA1DiagMixin
 from cg_maisr_ms_classify import ms_classify
 # endregion
 # cg_maisr_diag.py -- CG-MAISR-D0/P1/D2 multi-asset stress router (diagnostic only).
@@ -79,7 +80,7 @@ def _f(x, d=4):
         return "NA"
 
 
-class CgMaisrDiagMixin(CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
+class CgMaisrDiagMixin(CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
     """CG-MAISR-D0: multi-asset stress classifier grid + 324-policy router sim."""
 
     def CgMaisrInit(self) -> None:
@@ -108,9 +109,13 @@ class CgMaisrDiagMixin(CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2Diag
         self._D2ReadParams(_p, _bool)
         self._D3ReadParams(_p, _bool)
         self._D4ReadParams(_p, _bool)
+        self._MacroA1ReadParams(_p, _bool)
         self._ms_cost_bps = _float("cg_maisr_cost_bps", 0.0)
         self._ms_on = bool(self.cg_maisr_diag_enable)
         if getattr(self, "cg_maisr_d4_enable", False):
+            self._ms_on = True
+            self.cg_maisr_diag_enable = True
+        if getattr(self, "cg_macro_a1_enable", False):
             self._ms_on = True
             self.cg_maisr_diag_enable = True
         self._ms_grid_on = bool(self._ms_on and self.cg_maisr_grid_enable)
@@ -219,6 +224,10 @@ class CgMaisrDiagMixin(CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2Diag
             self._ms_err += 1
         try:
             self._D4InitHooks()
+        except Exception:
+            self._ms_err += 1
+        try:
+            self._MacroA1InitHooks()
         except Exception:
             self._ms_err += 1
 
@@ -512,13 +521,16 @@ class CgMaisrDiagMixin(CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2Diag
             self._ms_subjects_events = getattr(self, "_ms_subjects_events", [])
             self._ms_subjects_events.append(bytes(subjects))
         try:
+            macro = bool(getattr(self, "cg_macro_a1_enable", False))
             if (getattr(self, "cg_maisr_label_only", False) or getattr(self, "_d2_mode", False)
-                    or d4):
+                    or d4 or macro):
                 if d4:
                     self._d4_last_subjects = bytes(subjects)
                 self._D2OnEval(kind, tod, bytes(states), feat)
                 if d4 and hasattr(self, "_D4RuntimeOnEval"):
                     self._D4RuntimeOnEval(kind, tod, bytes(states), bytes(subjects), feat)
+                if macro and hasattr(self, "_MacroA1OnEval"):
+                    self._MacroA1OnEval(kind, tod, bytes(states), feat)
         except Exception:
             self._ms_err += 1
         if kind == "PRE":
@@ -1094,6 +1106,13 @@ class CgMaisrDiagMixin(CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2Diag
                             "reason=shadow_replay_parity_failed")
                 return
 
+            if getattr(self, "cg_macro_a1_enable", False):
+                try:
+                    if self.CgMacroA1OnEndOfAlgorithm(parity_ok):
+                        return
+                except Exception:
+                    self._ms_err += 1
+                return
             if getattr(self, "cg_maisr_d4_enable", False):
                 try:
                     self.CgMaisrD4OnEndOfAlgorithm(parity_ok)

@@ -137,10 +137,13 @@ def macro_apply_gate(mapped_state, gate, vix_stress, rv_stress, down_eff_ok,
         return mapped_state
     if not vix_avail and not rv_avail:
         return "UNAVAILABLE"
+    # SYSTEMIC / RATE: accept direct state (no extra VIX/RV stress req).
+    if mapped_state in ("SYSTEMIC_LIQUIDITY_STRESS", "RATE_INFLATION_STRESS"):
+        return mapped_state
     vol_confirm = bool((vix_avail and vix_stress) or (rv_avail and rv_stress))
     if gate == "G1_VOL":
         return mapped_state if vol_confirm else "UNCONFIRMED_NOISE"
-    # G2_VOL_PATH
+    # G2_VOL_PATH: BROAD / DEFENSIVE need G1 vol confirm AND down-efficiency.
     if not path_avail:
         return "UNAVAILABLE"
     if vol_confirm and bool(down_eff_ok):
@@ -178,9 +181,13 @@ def macro_vix_snapshot(history_rows, session_date, lookback=252):
     pct_change_1d = None
     if prev_val is not None and prev_val != 0:
         pct_change_1d = (latest_val - prev_val) / prev_val
-    window = rows[-lookback:] if lookback and lookback > 0 else rows
+    # Percentile uses only earlier completed daily values (exclude latest).
+    prior = rows[:-1]
+    window = prior[-lookback:] if lookback and lookback > 0 else prior
     window_vals = [v for _, v in window]
-    percentile_252 = _macro_percentile_rank(window_vals, latest_val) if len(window_vals) >= 2 else None
+    percentile_252 = (
+        _macro_percentile_rank(window_vals, latest_val) if len(window_vals) >= 60 else None
+    )
     return {
         "value": latest_val, "source_date": latest_date, "age_sessions": 1,
         "valid": True, "pct_change_1d": pct_change_1d, "percentile_252": percentile_252,
@@ -192,7 +199,7 @@ def macro_vix_snapshot(history_rows, session_date, lookback=252):
 # ---------------------------------------------------------------------------
 
 def macro_rv30(closes):
-    """30 closes -> annualized realized vol, or None if insufficient/invalid."""
+    """sqrt(sum of squared 1-minute log returns) over last 30 completed closes."""
     xs = list(closes or [])
     if len(xs) < 30:
         return None
@@ -203,18 +210,17 @@ def macro_rv30(closes):
         if p0 is None or p1 is None or p0 <= 0 or p1 <= 0:
             return None
         rets.append(math.log(p1 / p0))
-    if len(rets) < 2:
+    if len(rets) < 29:
         return None
-    mean = sum(rets) / len(rets)
-    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
-    return math.sqrt(var) * math.sqrt(252.0)
+    return math.sqrt(sum(r * r for r in rets))
 
 
 def macro_path_efficiency(closes):
-    """0..1 net-displacement / total-absolute-movement, or None."""
+    """0..1 net-displacement / total-absolute-movement over >=30 closes."""
     xs = [c for c in (closes or []) if c is not None]
-    if len(xs) < 2:
+    if len(xs) < 30:
         return None
+    xs = xs[-30:]
     net = abs(xs[-1] - xs[0])
     total = sum(abs(xs[i] - xs[i - 1]) for i in range(1, len(xs)))
     if total <= 0:
@@ -223,11 +229,11 @@ def macro_path_efficiency(closes):
 
 
 def macro_down_efficiency(closes):
-    """Signed variant: only rewards efficient DOWN moves; 0.0 if net move is
-    up or flat; None if total movement is zero (undefined)."""
+    """path_efficiency when last < first, else 0; requires >=30 closes."""
     xs = [c for c in (closes or []) if c is not None]
-    if len(xs) < 2:
+    if len(xs) < 30:
         return None
+    xs = xs[-30:]
     net = xs[-1] - xs[0]
     total = sum(abs(xs[i] - xs[i - 1]) for i in range(1, len(xs)))
     if total <= 0:
@@ -326,18 +332,14 @@ def macro_precision_recall_f1(tp, fp, fn):
     return precision, recall, f1
 
 
-def macro_score_variant(f1_train_a, f1_train_b, n_train_a, n_train_b, min_n=5):
-    """TRAIN-selection score: exposure-gated, stability-penalized average F1
-    (mirrors D4's exposure/stability-normalized selection philosophy)."""
-    if n_train_a < min_n or n_train_b < min_n:
-        return 0.0, "INSUFFICIENT_N"
-    if f1_train_a <= 0 or f1_train_b <= 0:
-        return 0.0, "ZERO_F1"
-    lo, hi = min(f1_train_a, f1_train_b), max(f1_train_a, f1_train_b)
-    ratio = hi / lo if lo > 0 else None
-    penalty = 0.5 if (ratio is not None and ratio > 3.0) else 0.0
-    score = (0.5 * f1_train_a + 0.5 * f1_train_b) * (1.0 - penalty)
-    return score, "OK"
+def macro_score_variant(mean_f1, broad_fp_rate, def_fp_rate, systemic_fn_rate=None):
+    """TRAIN score = mean F1 - 1.5*broad_FP - 1.0*def_FP - 1.0*sys_FN (if avail)."""
+    score = float(mean_f1 or 0.0)
+    score -= 1.5 * float(broad_fp_rate or 0.0)
+    score -= 1.0 * float(def_fp_rate or 0.0)
+    if systemic_fn_rate is not None:
+        score -= 1.0 * float(systemic_fn_rate)
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -356,20 +358,24 @@ def macro_event_benefit(basket_ret, action=0.20, cost_bps_per_side=0):
 # Stage A value gate
 # ---------------------------------------------------------------------------
 
-_MACRO_VALUE_WINDOWS_REQUIRED = ("TRAIN", "OOS", "CRISIS")
+_MACRO_VALUE_WINDOWS_REQUIRED = ("OOS", "CRISIS")
 _MACRO_VALUE_ALL_WINDOWS = ("TRAIN", "OOS", "CRISIS", "Y2020", "Y2022", "RUN")
-_MACRO_FALSE_CUT_MAX = 0.40
-_MACRO_VALUE_MIN_N = 5
+_MACRO_FALSE_CUT_MAX = 0.50
+_MACRO_VALUE_MIN_N = {"TRAIN": 20, "OOS": 8, "CRISIS": 12}
 
 
 def macro_stage_a_value_pass(metrics_by_window, neighbor_ok):
-    """metrics_by_window keys: TRAIN, OOS, CRISIS, Y2020, Y2022, RUN; each a
-    dict with n, mean_2bps, median_2bps, false_cut_rate, total_2bps,
-    total_5bps, year_pos_shares. Required windows (TRAIN/OOS/CRISIS) must
-    each show n>=min, positive mean/median 2bps benefit, and an acceptable
-    false-cut rate; neighbor_ok (parameter-neighborhood stability) required."""
+    """Stage-A soft gate. TRAIN requires count only; OOS/CRISIS require
+    positive mean, non-negative median, and false-cut <=0.50. Neighbor
+    stability is required separately."""
     reasons = []
     windows_checked = {}
+    mtrain = (metrics_by_window or {}).get("TRAIN")
+    if not mtrain or mtrain.get("n", 0) < _MACRO_VALUE_MIN_N["TRAIN"]:
+        reasons.append("TRAIN_N_LOW")
+        windows_checked["TRAIN"] = False
+    else:
+        windows_checked["TRAIN"] = True
     for w in _MACRO_VALUE_WINDOWS_REQUIRED:
         m = (metrics_by_window or {}).get(w)
         if not m:
@@ -377,26 +383,29 @@ def macro_stage_a_value_pass(metrics_by_window, neighbor_ok):
             windows_checked[w] = False
             continue
         ok = True
-        if m.get("n", 0) < _MACRO_VALUE_MIN_N:
+        if m.get("n", 0) < _MACRO_VALUE_MIN_N[w]:
             ok = False
             reasons.append(f"{w}_N_LOW")
         if m.get("mean_2bps") is None or m["mean_2bps"] <= 0:
             ok = False
             reasons.append(f"{w}_MEAN_NONPOS")
-        if m.get("median_2bps") is None or m["median_2bps"] <= 0:
+        if m.get("median_2bps") is None or m["median_2bps"] < 0:
             ok = False
-            reasons.append(f"{w}_MEDIAN_NONPOS")
+            reasons.append(f"{w}_MEDIAN_NEG")
         if m.get("false_cut_rate") is None or m["false_cut_rate"] > _MACRO_FALSE_CUT_MAX:
             ok = False
             reasons.append(f"{w}_FALSE_CUT_HIGH")
         windows_checked[w] = ok
-    all_required_ok = all(windows_checked.get(w) for w in _MACRO_VALUE_WINDOWS_REQUIRED)
+    all_required_ok = (
+        windows_checked.get("TRAIN")
+        and all(windows_checked.get(w) for w in _MACRO_VALUE_WINDOWS_REQUIRED)
+    )
     if not neighbor_ok:
         reasons.append("NEIGHBOR_UNSTABLE")
     passed = all_required_ok and bool(neighbor_ok)
     return {
         "pass": passed, "reasons": reasons, "windows_checked": windows_checked,
-        "windows_required": _MACRO_VALUE_WINDOWS_REQUIRED,
+        "windows_required": ("TRAIN",) + _MACRO_VALUE_WINDOWS_REQUIRED,
     }
 
 
@@ -421,7 +430,8 @@ def macro_finalize_result(tech_ok, art_ok, truth_ok, pred_ok, value_pass_n):
         return {"result": "STOP_MACRO_A1", "reason": "NO_STABLE_MACRO_EVENT_VALUE",
                 "next": "STOP_MACRO_A1", "research_conclusion": "STOP_MACRO_A1"}
     return {"result": "MACRO_A1_PASS", "reason": "OK",
-            "next": "BUILD_MACRO_A2_EXECUTION_SHADOW", "research_conclusion": "NOT_REACHED"}
+            "next": "BUILD_MACRO_A2_EXECUTION_SHADOW",
+            "research_conclusion": "BUILD_MACRO_A2_EXECUTION_SHADOW"}
 
 
 # ---------------------------------------------------------------------------
@@ -590,43 +600,47 @@ def run_macro_a1_static_tests():
        and macro_map_prediction("  broad_equity_stress  ") == "BROAD_EQUITY_STRESS"
        and macro_map_prediction(None) == "UNCONFIRMED_NOISE")
 
-    # 11 gate G0 stress passthrough
+    # 11 G0 leaves macro state unchanged
     ok(11, "macro_apply_gate_g0_stress_passthrough",
        macro_apply_gate("BROAD_EQUITY_STRESS", "G0_BASE", False, False, False, False, False, False)
-       == "BROAD_EQUITY_STRESS")
+       == "BROAD_EQUITY_STRESS"
+       and macro_apply_gate("SYSTEMIC_LIQUIDITY_STRESS", "G0_BASE", False, False, False, False, False, False)
+       == "SYSTEMIC_LIQUIDITY_STRESS")
 
-    # 12 gate G0 normal/noise unchanged regardless of gate mode
+    # 12 normal/noise unchanged regardless of gate mode
     ok(12, "macro_apply_gate_g0_normal_noise_unchanged",
        macro_apply_gate("NORMAL", "G2_VOL_PATH", False, False, False, False, False, False) == "NORMAL"
        and macro_apply_gate("UNCONFIRMED_NOISE", "G1_VOL", False, False, False, False, False, False)
        == "UNCONFIRMED_NOISE")
 
-    # 13 gate G1 confirmed by VIX
+    # 13 G1 confirmed by VIX
     ok(13, "macro_apply_gate_g1_confirmed_by_vix",
        macro_apply_gate("BROAD_EQUITY_STRESS", "G1_VOL", True, False, False, True, False, False)
        == "BROAD_EQUITY_STRESS")
 
-    # 14 gate G1 confirmed by RV
+    # 14 G1 confirmed by RV
     ok(14, "macro_apply_gate_g1_confirmed_by_rv",
        macro_apply_gate("BROAD_EQUITY_STRESS", "G1_VOL", False, True, False, False, True, False)
        == "BROAD_EQUITY_STRESS")
 
-    # 15 gate G1 unconfirmed -> noise
+    # 15 G1 suppresses unconfirmed BROAD
     ok(15, "macro_apply_gate_g1_unconfirmed_noise",
        macro_apply_gate("BROAD_EQUITY_STRESS", "G1_VOL", False, False, False, True, True, False)
        == "UNCONFIRMED_NOISE")
 
-    # 16 gate G1 both vol sources unavailable -> UNAVAILABLE
+    # 16 G1 both unavailable -> UNAVAILABLE; G1 retains SYSTEMIC without vol stress
     ok(16, "macro_apply_gate_g1_both_unavailable",
        macro_apply_gate("BROAD_EQUITY_STRESS", "G1_VOL", False, False, False, False, False, True)
-       == "UNAVAILABLE")
+       == "UNAVAILABLE"
+       and macro_apply_gate("SYSTEMIC_LIQUIDITY_STRESS", "G1_VOL", False, False, False, True, True, False)
+       == "SYSTEMIC_LIQUIDITY_STRESS")
 
-    # 17 gate G2 confirmed (vol + path) -> pass
+    # 17 G2 confirmed (vol + path) -> pass
     ok(17, "macro_apply_gate_g2_confirmed_pass",
        macro_apply_gate("BROAD_EQUITY_STRESS", "G2_VOL_PATH", True, False, True, True, False, True)
        == "BROAD_EQUITY_STRESS")
 
-    # 18 gate G2 path fail -> noise
+    # 18 G2 requires down efficiency for BROAD
     ok(18, "macro_apply_gate_g2_path_fail_noise",
        macro_apply_gate("BROAD_EQUITY_STRESS", "G2_VOL_PATH", True, False, False, True, False, True)
        == "UNCONFIRMED_NOISE")
@@ -662,10 +676,11 @@ def run_macro_a1_static_tests():
     ok(23, "macro_vix_snapshot_valid_pct_change_age",
        snap23["valid"] and abs(snap23["pct_change_1d"] - 0.2) < 1e-9 and snap23["age_sessions"] == 1)
 
-    # 24 vix snapshot percentile rank
-    hist24 = [(date(2020, 1, 1) + timedelta(days=i), float(i + 1)) for i in range(40)]  # 1..40
-    snap24 = macro_vix_snapshot(hist24, date(2020, 3, 1), lookback=252)
-    ok(24, "macro_vix_snapshot_percentile_rank", abs(snap24["percentile_252"] - 100.0) < 1e-9)
+    # 24 vix snapshot percentile uses prior observations only (>=60)
+    hist24 = [(date(2020, 1, 1) + timedelta(days=i), float(i + 1)) for i in range(80)]  # 1..80
+    snap24 = macro_vix_snapshot(hist24, date(2020, 6, 1), lookback=252)
+    ok(24, "macro_vix_snapshot_percentile_rank",
+       snap24["percentile_252"] is not None and abs(snap24["percentile_252"] - 100.0) < 1e-9)
 
     # 25 vix snapshot empty -> invalid
     snap25 = macro_vix_snapshot([], date(2020, 3, 16))
@@ -677,16 +692,16 @@ def run_macro_a1_static_tests():
     rv_zero = macro_rv30([100.0] * 30)
     ok(26, "macro_rv30_insufficient_and_constant", rv_none is None and rv_zero == 0.0)
 
-    # 27 path efficiency straight line and insufficient
-    pe_full = macro_path_efficiency([float(i) for i in range(1, 11)])
-    pe_none = macro_path_efficiency([5.0])
+    # 27 path efficiency requires 30 bars; straight line -> 1.0
+    pe_full = macro_path_efficiency([float(i) for i in range(1, 31)])
+    pe_none = macro_path_efficiency([float(i) for i in range(1, 20)])
     ok(27, "macro_path_efficiency_straight_and_insufficient",
        pe_full is not None and abs(pe_full - 1.0) < 1e-9 and pe_none is None)
 
-    # 28 down efficiency decline/incline/flat
-    de_decline = macro_down_efficiency([float(i) for i in range(10, 0, -1)])
-    de_incline = macro_down_efficiency([float(i) for i in range(1, 11)])
-    de_flat = macro_down_efficiency([5.0, 5.0, 5.0])
+    # 28 down efficiency decline/incline/flat (30 bars)
+    de_decline = macro_down_efficiency([float(i) for i in range(30, 0, -1)])
+    de_incline = macro_down_efficiency([float(i) for i in range(1, 31)])
+    de_flat = macro_down_efficiency([5.0] * 30)
     ok(28, "macro_down_efficiency_decline_incline_flat",
        abs(de_decline - 1.0) < 1e-9 and de_incline == 0.0 and de_flat is None)
 
@@ -767,14 +782,16 @@ def run_macro_a1_static_tests():
     ok(37, "macro_event_benefit_with_cost", abs(b37 - (-0.0102)) < 1e-12)
 
     # 38 stage A value pass -- passing scenario
-    good_win = {"n": 10, "mean_2bps": 0.001, "median_2bps": 0.0008, "false_cut_rate": 0.2,
+    good_oos = {"n": 12, "mean_2bps": 0.001, "median_2bps": 0.0008, "false_cut_rate": 0.2,
                 "total_2bps": 0.01, "total_5bps": 0.02, "year_pos_shares": 0.6}
-    metrics38 = {"TRAIN": good_win, "OOS": good_win, "CRISIS": good_win}
+    good_train = {"n": 25, "mean_2bps": -0.001, "median_2bps": -0.001, "false_cut_rate": 0.55,
+                  "total_2bps": -0.01, "total_5bps": -0.02, "year_pos_shares": 0.6}
+    metrics38 = {"TRAIN": good_train, "OOS": good_oos, "CRISIS": good_oos}
     v38 = macro_stage_a_value_pass(metrics38, True)
     ok(38, "macro_stage_a_value_pass_passes", v38["pass"] and v38["reasons"] == [])
 
     # 39 stage A value pass -- missing window and neighbor-unstable fail
-    metrics39 = {"TRAIN": good_win, "CRISIS": good_win}  # OOS missing
+    metrics39 = {"TRAIN": good_train, "CRISIS": good_oos}  # OOS missing
     v39a = macro_stage_a_value_pass(metrics39, True)
     v39b = macro_stage_a_value_pass(metrics38, False)
     ok(39, "macro_stage_a_value_pass_fails_missing_and_neighbor",
@@ -795,7 +812,9 @@ def run_macro_a1_static_tests():
                         "next": "STOP_MACRO_A1", "research_conclusion": "STOP_MACRO_A1"}
        and f_pred["reason"] == "INSUFFICIENT_MACRO_PREDICTOR_DIVERSITY"
        and f_val0["reason"] == "NO_STABLE_MACRO_EVENT_VALUE"
-       and f_pass["result"] == "MACRO_A1_PASS" and f_pass["next"] == "BUILD_MACRO_A2_EXECUTION_SHADOW")
+       and f_pass["result"] == "MACRO_A1_PASS" and f_pass["next"] == "BUILD_MACRO_A2_EXECUTION_SHADOW"
+       and f_pass["research_conclusion"] == "BUILD_MACRO_A2_EXECUTION_SHADOW"
+       and MAISR_D4_CLOSEOUT["decision"] != "CALIBRATION_PASS")
 
     # 41 artifact schemas shape
     schemas41 = macro_a1_artifact_schemas()

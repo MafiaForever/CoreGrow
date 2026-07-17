@@ -248,6 +248,8 @@ class CgMaisrD2LabelMixin:
         if getattr(self, "cg_maisr_d4_enable", False):
             entry["subjects"] = getattr(self, "_d4_last_subjects", None) or (b"\x00" * 54)
             entry["kind"] = kind
+        if getattr(self, "cg_macro_a1_enable", False):
+            entry["kind"] = kind
         self._d2_pending.append(entry)
         while len(self._d2_pending) > 128:
             self._d2_pending.popleft()
@@ -389,6 +391,15 @@ class CgMaisrD2LabelMixin:
         if getattr(self, "cg_maisr_d4_enable", False) and hasattr(self, "_D4StoreFromFinalize"):
             try:
                 self._D4StoreFromFinalize(
+                    p, stats, spy, dur_mae, gold_mae, dur_ok, gold_ok,
+                    infl_ret if infl_ret is not None else 0.0, infl_rel,
+                    held_feat, br_maes, gold_source,
+                )
+            except Exception:
+                self._d2_err += 1
+        if getattr(self, "cg_macro_a1_enable", False) and hasattr(self, "_MacroA1StoreFromFinalize"):
+            try:
+                self._MacroA1StoreFromFinalize(
                     p, stats, spy, dur_mae, gold_mae, dur_ok, gold_ok,
                     infl_ret if infl_ret is not None else 0.0, infl_rel,
                     held_feat, br_maes, gold_source,
