@@ -4,6 +4,7 @@ from datetime import date as _date
 from collections import deque
 from cg_maisr_p1_diag import CgMaisrP1Mixin, _P1_CANARY_CFG, _P1_CANARY_STATES
 from cg_maisr_d2_diag import CgMaisrD2DiagMixin
+from cg_maisr_final_d3 import CgMaisrFinalD3Mixin
 # endregion
 # cg_maisr_diag.py -- CG-MAISR-D0/P1/D2: multi-asset independent stress router.
 # Sensors classify panel stress via a 54-config grid (3 sensitivities x
@@ -82,7 +83,7 @@ def _f(x, d=4):
         return "NA"
 
 
-class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
+class CgMaisrDiagMixin(CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
     """CG-MAISR-D0: multi-asset stress classifier grid + 324-policy router sim."""
 
     def CgMaisrInit(self) -> None:
@@ -109,6 +110,7 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
         self.cg_maisr_identity_only = _bool("cg_maisr_identity_only", "0")
         self.cg_maisr_identity_debug = _bool("cg_maisr_identity_debug", "0")
         self._D2ReadParams(_p, _bool)
+        self._D3ReadParams(_p, _bool)
         self._ms_cost_bps = _float("cg_maisr_cost_bps", 0.0)
         self._ms_on = bool(self.cg_maisr_diag_enable)
         self._ms_grid_on = bool(self._ms_on and self.cg_maisr_grid_enable)
@@ -118,7 +120,7 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
         self._ms_emitted = False
 
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_"):
+        for pref in ("CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_", "CG_MAISR_D3_"):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
@@ -209,6 +211,10 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
             )
         try:
             self._D2InitHooks()
+        except Exception:
+            self._ms_err += 1
+        try:
+            self._D3InitHooks()
         except Exception:
             self._ms_err += 1
 
@@ -1134,15 +1140,31 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                 return
 
             try:
-                if self.CgMaisrD2OnEndOfAlgorithm(parity_ok):
+                if self.CgMaisrD3OnEndOfAlgorithm(parity_ok):
                     return
             except Exception:
                 self._ms_err += 1
             try:
-                if self.CgMaisrD2EconomicGate(parity_ok):
+                if self.CgMaisrD3EconomicGate(parity_ok):
                     return
             except Exception:
                 self._ms_err += 1
+            # Suppress redundant D2 finals when D3 owns the run.
+            if not getattr(self, "cg_maisr_final_d3_enable", False):
+                try:
+                    if self.CgMaisrD2OnEndOfAlgorithm(parity_ok):
+                        return
+                except Exception:
+                    self._ms_err += 1
+                try:
+                    if self.CgMaisrD2EconomicGate(parity_ok):
+                        return
+                except Exception:
+                    self._ms_err += 1
+            elif getattr(self, "_d3_econ_ready", False) or getattr(self, "_d2_econ_ready", False):
+                pass  # continue into frozen economic policy simulation
+            else:
+                return
 
             id_results = self._MsIdentityFinals()
             all_id_pass = bool(id_results) and all(r.get("pass") for r in id_results.values())
@@ -1152,10 +1174,11 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
             )
             all_id_pass = bool(all_id_pass and data_ok)
             canary_result = self._MsCanaryFinal()
-            try:
-                self._MsExportP1Artifacts(id_results, canary_result)
-            except Exception:
-                self._ms_err += 1
+            if not getattr(self, "cg_maisr_final_d3_enable", False):
+                try:
+                    self._MsExportP1Artifacts(id_results, canary_result)
+                except Exception:
+                    self._ms_err += 1
 
             if getattr(self, "cg_maisr_identity_only", False):
                 self._MsLog(
@@ -1331,6 +1354,8 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                 reason = "no_strict_pass"
 
             for i, r in enumerate(top15):
+                if getattr(self, "cg_maisr_final_d3_enable", False):
+                    break
                 self._MsLog(
                     f"CG_MAISR_P1_TOP,rank={i+1},id={r['id']},clf={r['clf_id']},"
                     f"router={r['router']},persist={r['persist']},timing={r['timing']},"
@@ -1360,39 +1385,47 @@ class CgMaisrDiagMixin(CgMaisrD2DiagMixin, CgMaisrP1Mixin):
                 sh_incr = (sum(h_scores["H2"]) / len(h_scores["H2"])) - \
                           (sum(h_scores["H0"]) / len(h_scores["H0"]))
 
-            self._MsLog(
-                f"CG_MAISR_P1_VALIDATION_FINAL,parity=PASS,identity_recheck={'PASS' if identity_ok else 'FAIL'},"
-                f"configs_scored=54,classifiers_selected={len(chosen)},policies_defined={len(metas)},"
-                f"policies_evaluated={len(rows)},strict_pass_count={len(strict_rows)},"
-                f"local_vs_broad_separation={_f(local_broad_sep,4)},"
-                f"local_vs_broad_true_local_count={local_den},"
-                f"local_vs_broad_true_broad_count={broad_den},"
-                f"local_vs_broad_error_count={local_err},"
-                f"SH_incremental_value={_f(sh_incr,4)},"
-                f"policies_csv={csv_key},attribution_csv={attrib_key},classifiers_csv={clf_key},"
-                f"runtime_errors={self._ms_err}"
-            )
-            self._MsLog(
-                f"CG_MAISR_P1_GATE_FINAL,full_grid_authorized={'YES' if gate_ok else 'NO'},"
-                f"policies_evaluated={len(rows)},identity_only=0,"
-                f"identity_recheck={'PASS' if identity_ok else 'FAIL'}"
-            )
-            if best is not None:
-                self._MsLog(
-                    f"CG_MAISR_P1_RECOMMENDATION,apply=YES,policy={best['id']},"
-                    f"classifier={best['clf_id']},router={best['router']},persistence={best['persist']},"
-                    f"timing={best['timing']},SH_mode={best.get('h','NA')},"
-                    f"CAGR={_f(best.get('CAGR'))},MaxDD={_f(best.get('MaxDD'))},"
-                    f"StdDev={_f(best.get('annual_stddev'))},OOS_Sharpe={_f(best.get('oos_sharpe'))},"
-                    f"CRISIS_MaxDD={_f(best.get('crisis_maxdd'))},Y2020_MaxDD={_f(best.get('y2020_maxdd'))},"
-                    f"Y2022_MaxDD={_f(best.get('y2022_maxdd'))},worst5={_f(best.get('worst_5pct_day_mean'))},"
-                    f"recovery={best.get('recovery_days_max','NA')},turnover={_f(best.get('turnover'))},"
-                    f"false_broad_exits={best.get('false_broad',0)},missed_systemic={best.get('missed_sys',0)},"
-                    f"CAGR_2bps={_f(best.get('CAGR_cost2'))},MaxDD_2bps={_f(best.get('MaxDD_cost2'))},"
-                    f"neighbor_stable=YES,reason={reason}"
-                )
+            if getattr(self, "cg_maisr_final_d3_enable", False):
+                try:
+                    self._D3EmitEconFinals(
+                        top15, best, rows, ctrl_m, c_oos, c_cri, identity_ok,
+                        reason, strict_rows, gate_ok)
+                except Exception:
+                    self._ms_err += 1
             else:
-                self._MsNoRec(reason)
+                self._MsLog(
+                    f"CG_MAISR_P1_VALIDATION_FINAL,parity=PASS,identity_recheck={'PASS' if identity_ok else 'FAIL'},"
+                    f"configs_scored=54,classifiers_selected={len(chosen)},policies_defined={len(metas)},"
+                    f"policies_evaluated={len(rows)},strict_pass_count={len(strict_rows)},"
+                    f"local_vs_broad_separation={_f(local_broad_sep,4)},"
+                    f"local_vs_broad_true_local_count={local_den},"
+                    f"local_vs_broad_true_broad_count={broad_den},"
+                    f"local_vs_broad_error_count={local_err},"
+                    f"SH_incremental_value={_f(sh_incr,4)},"
+                    f"policies_csv={csv_key},attribution_csv={attrib_key},classifiers_csv={clf_key},"
+                    f"runtime_errors={self._ms_err}"
+                )
+                self._MsLog(
+                    f"CG_MAISR_P1_GATE_FINAL,full_grid_authorized={'YES' if gate_ok else 'NO'},"
+                    f"policies_evaluated={len(rows)},identity_only=0,"
+                    f"identity_recheck={'PASS' if identity_ok else 'FAIL'}"
+                )
+                if best is not None:
+                    self._MsLog(
+                        f"CG_MAISR_P1_RECOMMENDATION,apply=YES,policy={best['id']},"
+                        f"classifier={best['clf_id']},router={best['router']},persistence={best['persist']},"
+                        f"timing={best['timing']},SH_mode={best.get('h','NA')},"
+                        f"CAGR={_f(best.get('CAGR'))},MaxDD={_f(best.get('MaxDD'))},"
+                        f"StdDev={_f(best.get('annual_stddev'))},OOS_Sharpe={_f(best.get('oos_sharpe'))},"
+                        f"CRISIS_MaxDD={_f(best.get('crisis_maxdd'))},Y2020_MaxDD={_f(best.get('y2020_maxdd'))},"
+                        f"Y2022_MaxDD={_f(best.get('y2022_maxdd'))},worst5={_f(best.get('worst_5pct_day_mean'))},"
+                        f"recovery={best.get('recovery_days_max','NA')},turnover={_f(best.get('turnover'))},"
+                        f"false_broad_exits={best.get('false_broad',0)},missed_systemic={best.get('missed_sys',0)},"
+                        f"CAGR_2bps={_f(best.get('CAGR_cost2'))},MaxDD_2bps={_f(best.get('MaxDD_cost2'))},"
+                        f"neighbor_stable=YES,reason={reason}"
+                    )
+                else:
+                    self._MsNoRec(reason)
         except Exception as exc:
             self._ms_err += 1
             try:
