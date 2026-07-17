@@ -521,12 +521,21 @@ class CgMaisrD4OverlayMixin:
             def_ok, dda, ddb, dratio, drsn = d4_stability_defensive(def_a, def_b)
             stab_ok = broad_ok and sub_ok and def_ok
             stab_rows.append({
-                "pack": pack["id"], "broad_ok": int(broad_ok), "subject_ok": int(sub_ok),
-                "defensive_ok": int(def_ok), "broad_reason": brsn, "subject_reason": srsn,
-                "defensive_reason": drsn, "held_days_a": len(hp_a), "held_days_b": len(hp_b),
-                "dens_broad_a": _d4f(da), "dens_broad_b": _d4f(db), "broad_ratio": _d4f(bratio),
-                "dens_subj_a": _d4f(sda), "dens_subj_b": _d4f(sdb), "subj_ratio": _d4f(sratio),
-                "dens_def_a": _d4f(dda), "dens_def_b": _d4f(ddb), "def_ratio": _d4f(dratio),
+                "pack": pack["id"],
+                "broad_ep_a": ep_a, "broad_ep_b": ep_b,
+                "broad_years_a": 4.0, "broad_years_b": 3.0,
+                "broad_density_a": _d4f(da), "broad_density_b": _d4f(db),
+                "broad_ratio": _d4f(bratio), "broad_reason": brsn,
+                "subject_ep_a": ls_a, "subject_ep_b": ls_b,
+                "eligible_held_symbol_days_a": len(hp_a),
+                "eligible_held_symbol_days_b": len(hp_b),
+                "subject_density_a": _d4f(sda), "subject_density_b": _d4f(sdb),
+                "subject_ratio": _d4f(sratio), "subject_reason": srsn,
+                "defensive_ep_a": def_a, "defensive_ep_b": def_b,
+                "defensive_density_a": _d4f(dda), "defensive_density_b": _d4f(ddb),
+                "defensive_ratio": _d4f(dratio), "defensive_reason": drsn,
+                "stability_ok": int(stab_ok),
+                "broad_ok": int(broad_ok), "subject_ok": int(sub_ok), "defensive_ok": int(def_ok),
             })
             raw_by[pack["id"]] = raw_acc
             pack_stats[pack["id"]] = {
@@ -538,7 +547,8 @@ class CgMaisrD4OverlayMixin:
             }
             self._MsLog(
                 f"CG_MAISR_D4_1_PACK_FINAL,id={pack['id']},support={int(support_ok)},"
-                f"stable={int(stab_ok)},bf={bf_ep},ls={ls},def={deff},sys={sys_},rate={rate}"
+                f"support_reason={support_reason},stable={int(stab_ok)},"
+                f"bf={bf_ep},ls={ls},def={deff},sys={sys_},rate={rate}"
             )
 
         mono_rows = d4_monotonicity_checks(raw_by)
@@ -588,17 +598,18 @@ class CgMaisrD4OverlayMixin:
 
         bid = self._MsBid() if hasattr(self, "_MsBid") else "NA"
         self._d4_selected_pack = chosen_pack
-        mhash, art_hashes = self._D4ExportCalib(
+        rc = "STOP_MAISR" if result == "STOP_MAISR" else "NOT_REACHED"
+        mhash, arts = self._D4ExportCalib(
             bid, src, id_results, pack_stats, mono_rows, stab_rows, scored, chosen,
             eps_by.get(chosen_pack, ([], [])), cov, gold_cov, result, reason)
+        ph_n = sum(1 for t in arts.values() if d4_is_placeholder_csv(t))
         self._MsLog(
-            f"CG_MAISR_D4_1_ARTIFACT_FINAL,artifacts={len(art_hashes)},"
-            f"manifest_sha256={mhash},placeholder_count="
-            f"placeholder_count={sum(1 for t in arts.values() if d4_is_placeholder_csv(t))}"
+            f"CG_MAISR_D4_1_ARTIFACT_FINAL,artifacts={len(arts)},"
+            f"manifest_sha256={mhash},placeholder_count={ph_n}"
         )
         self._MsLog(
             f"CG_MAISR_D4_1_CALIBRATION_FINAL,result={result},reason={reason},next={nxt},"
-            f"research_conclusion=NOT_REACHED,selected_pack={chosen_pack or 'NONE'},"
+            f"research_conclusion={rc},selected_pack={chosen_pack or 'NONE'},"
             f"classifiers={len(chosen)},h_sigs={len(set(sigs.values()))},manifest_sha256={mhash},"
             f"frozen_classifiers={','.join(r['id'] for r in chosen)}"
         )
@@ -802,14 +813,21 @@ class CgMaisrD4OverlayMixin:
             sym_exp[tk]["a"] += 1
         for d, tk in hp_b:
             sym_exp[tk]["b"] += 1
-        sel = ["split,held_symbol_days,symbols_with_exposure"]
-        sel.append(f"TRAIN_A,{len(hp_a)},{len({tk for _, tk in hp_a})}")
-        sel.append(f"TRAIN_B,{len(hp_b)},{len({tk for _, tk in hp_b})}")
-        sel.append(f"TRAIN_TOTAL,{len(hp_a | hp_b)},{len(sym_exp)}")
-        sel.append("symbol,held_days_a,held_days_b,held_days_total")
+        first_last = {}
+        for d, tk in (hp_a | hp_b):
+            fl = first_last.setdefault(tk, [d, d])
+            if d < fl[0]:
+                fl[0] = d
+            if d > fl[1]:
+                fl[1] = d
+        sel = ["symbol,held_days_a,held_days_b,held_days_total,first_eligible_date,last_eligible_date"]
         for tk in sorted(sym_exp.keys()):
             a, b = sym_exp[tk]["a"], sym_exp[tk]["b"]
-            sel.append(f"{tk},{a},{b},{a + b}")
+            f0, f1 = first_last.get(tk, [0, 0])
+            sel.append(f"{tk},{a},{b},{a + b},{f0},{f1}")
+        sel.append(f"TRAIN_A_TOTAL,{len(hp_a)},,,{len({tk for _, tk in hp_a})},")
+        sel.append(f"TRAIN_B_TOTAL,{len(hp_b)},,,{len({tk for _, tk in hp_b})},")
+        sel.append(f"TRAIN_TOTAL,{len(hp_a | hp_b)},,,{len(sym_exp)},")
         arts[f"cg_maisr_d4_subject_exposure_{bid}.csv"] = "\n".join(sel)
         ph = ["id,pass,support_ok,stability_ok,mono_ok,support_reason,broad_family_episodes,broad_family_episode_min,"
               "broad_family_episode_max,broad_family_days,broad_family_day_min,broad_family_day_max,"
@@ -827,9 +845,14 @@ class CgMaisrD4OverlayMixin:
             ml.append(",".join(str(r[k]) for k in
                                ("dimension", "fixed", "less_severe", "more_severe", "metric", "lhs", "rhs", "pass")))
         arts[f"cg_maisr_d4_monotonicity_{bid}.csv"] = "\n".join(ml)
-        sk_cols = ["pack", "broad_ok", "subject_ok", "defensive_ok", "broad_reason", "subject_reason",
-                   "defensive_reason", "held_days_a", "held_days_b", "dens_broad_a", "dens_broad_b",
-                   "broad_ratio", "dens_subj_a", "dens_subj_b", "subj_ratio", "dens_def_a", "dens_def_b", "def_ratio"]
+        sk_cols = [
+            "pack", "broad_ep_a", "broad_ep_b", "broad_years_a", "broad_years_b",
+            "broad_density_a", "broad_density_b", "broad_ratio", "broad_reason",
+            "subject_ep_a", "subject_ep_b", "eligible_held_symbol_days_a", "eligible_held_symbol_days_b",
+            "subject_density_a", "subject_density_b", "subject_ratio", "subject_reason",
+            "defensive_ep_a", "defensive_ep_b", "defensive_density_a", "defensive_density_b",
+            "defensive_ratio", "defensive_reason", "stability_ok",
+        ]
         sl = [",".join(sk_cols)]
         for r in stab_rows:
             sl.append(",".join(str(r.get(k, "NA")) for k in sk_cols))
@@ -848,12 +871,27 @@ class CgMaisrD4OverlayMixin:
         if len(el) == 1:
             el.append("NONE,NO_SELECTED_PACK,NONE,NA,NA,0,0")
         arts[f"cg_maisr_d4_selected_episodes_{bid}.csv"] = "\n".join(el)
-        kw = ["pack,window,window_start,window_end,total_rows,subject_rows,status"]
+        kw = ["pack,window,broad_family_episodes,systemic_episodes,rate_episodes,"
+              "defensive_episodes,local_episodes,sector_episodes,eligible_held_symbol_days,"
+              "first_signal,last_signal,status"]
         for pack in _D4_PACKS:
             for wname, w0, w1 in _D4_KNOWN_WINDOWS:
-                tot = sum(1 for r in self._d4_raw if w0 <= r["do"] <= w1)
-                sub = sum(1 for r in self._d4_raw if w0 <= r["do"] <= w1 and d4_is_subject_row(r))
-                kw.append(f"{pack['id']},{wname},{w0},{w1},{tot},{sub},AUDIT")
+                wrows = [r for r in self._d4_raw if w0 <= r["do"] <= w1]
+                _, _, me_w, he_w = self._D4LabelPack(pack, wrows)
+                bf = d4_broad_family_count(me_w)
+                sys_w = sum(1 for e in me_w if e["label"] == "SYSTEMIC_LIQUIDITY_STRESS")
+                rate_w = sum(1 for e in me_w if e["label"] == "RATE_INFLATION_STRESS")
+                def_w = sum(1 for e in me_w if e["label"] == "DEFENSIVE_ROTATION")
+                loc_w = sum(1 for e in he_w if e["label"] == "LOCAL_ASSET_STRESS")
+                sec_w = sum(1 for e in he_w if e["label"] == "SECTOR_STRESS")
+                held_w = len(d4_held_pairs([r for r in wrows if d4_is_subject_row(r)]))
+                days = [e["day"] for e in list(me_w) + list(he_w)]
+                first_s = min(days) if days else "NA"
+                last_s = max(days) if days else "NA"
+                kw.append(
+                    f"{pack['id']},{wname},{bf},{sys_w},{rate_w},{def_w},{loc_w},{sec_w},"
+                    f"{held_w},{first_s},{last_s},AUDIT"
+                )
         arts[f"cg_maisr_d4_known_windows_{bid}.csv"] = "\n".join(kw)
         cl = ["id,s,a,b,h,score,macro_f1,valid,validity_reason,selected,sig_hash,macro_sig_hash,subject_sig_hash,"
               "combined_sig_hash,n,f1_BROAD,f1_LOCAL,f1_SECTOR,f1_DEF"]
@@ -884,10 +922,24 @@ class CgMaisrD4OverlayMixin:
         mjson = json.dumps({**manifest, "manifest_sha256": mhash}, sort_keys=True, separators=(",", ":"))
         arts[f"cg_maisr_d4_manifest_{bid}.json"] = mjson
         art_hashes[f"cg_maisr_d4_manifest_{bid}.json"] = _d4_sha(mjson)
-        vl = ["artifact,sha256,rows,placeholder"]
+        vl = ["artifact,bytes,rows,expected_rows,sha256,exists,schema_ok,row_count_ok,placeholder_only,pass"]
+        expected = {
+            f"cg_maisr_d4_known_windows_{bid}.csv": 48,
+            f"cg_maisr_d4_distributions_{bid}.csv": 39,
+            f"cg_maisr_d4_pack_stats_{bid}.csv": 12,
+            f"cg_maisr_d4_stability_{bid}.csv": 12,
+        }
         for name, text in sorted(arts.items()):
             rows_n = max(0, len(text.splitlines()) - 1) if text else 0
-            vl.append(f"{name},{art_hashes.get(name, _d4_sha(text))},{rows_n},{int(d4_is_placeholder_csv(text))}")
+            exp = expected.get(name, rows_n)
+            ph = int(d4_is_placeholder_csv(text))
+            schema_ok = 1 if text and "," in text.splitlines()[0] else 0
+            row_ok = 1 if rows_n == exp or name not in expected else 0
+            passed = int(schema_ok and row_ok and not ph and len(text.encode("utf-8")) > 0)
+            vl.append(
+                f"{name},{len(text.encode('utf-8'))},{rows_n},{exp},"
+                f"{art_hashes.get(name, _d4_sha(text))},1,{schema_ok},{row_ok},{ph},{passed}"
+            )
         arts[f"cg_maisr_d4_artifact_validation_{bid}.csv"] = "\n".join(vl)
         art_hashes[f"cg_maisr_d4_artifact_validation_{bid}.csv"] = _d4_sha(arts[f"cg_maisr_d4_artifact_validation_{bid}.csv"])
         self._d4_art_used = 0
