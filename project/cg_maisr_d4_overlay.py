@@ -410,6 +410,9 @@ class CgMaisrD4OverlayMixin:
         if not parity_ok or self._d4_err:
             self._MsLog("CG_MAISR_D4_CALIBRATION_FINAL,result=FAILED,reason=parity_or_static")
             return True
+        if not self._d4_raw:
+            self._MsLog("CG_MAISR_D4_CALIBRATION_FINAL,result=FAILED,reason=empty_d4_raw")
+            return True
 
         id_results = self._D4Identity()
         id_ok = all(r.get("pass") for r in id_results.values())

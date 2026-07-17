@@ -36,12 +36,15 @@ class CgMaisrD2DiagMixin(CgMaisrD2LabelMixin):
             or bool(getattr(self, "cg_maisr_selected_classifiers", None))
             or (str(getattr(self, "cg_maisr_label_pack", "AUTO")) not in ("AUTO", "", "0")
                 and getattr(self, "_ms_grid_on", False))
+            or bool(getattr(self, "cg_maisr_d4_enable", False))
+            or bool(getattr(self, "cg_maisr_final_d3_enable", False))
         )
         self._MsLog(
             f"CG_MAISR_D2_INIT,label_only={int(self.cg_maisr_label_only)},"
             f"label_pack={self.cg_maisr_label_pack},"
             f"selected_classifiers={','.join(self.cg_maisr_selected_classifiers) or 'NONE'},"
-            f"export_detail={int(getattr(self,'cg_maisr_export_detail',1))}"
+            f"export_detail={int(getattr(self,'cg_maisr_export_detail',1))},"
+            f"d2_mode={int(self._d2_mode)}"
         )
         self._MsLog(f"CG_MAISR_D2_ROOT_CAUSE,{_D2_ROOT_CAUSE}")
 

@@ -158,13 +158,13 @@ class CgMaisrD2LabelMixin:
         if ring is None:
             ring = deque(maxlen=90)
             self._d2_bars[tk] = ring
-            try:
-                ring.append((et, float(o), float(h), float(l), float(c)))
-                self._D2TryFinalize()
-                if getattr(self, "cg_maisr_d4_enable", False) and hasattr(self, "_D4TryFillPending"):
-                    self._D4TryFillPending(tk, et, float(o))
-            except Exception:
-                self._d2_err += 1
+        try:
+            ring.append((et, float(o), float(h), float(l), float(c)))
+            self._D2TryFinalize()
+            if getattr(self, "cg_maisr_d4_enable", False) and hasattr(self, "_D4TryFillPending"):
+                self._D4TryFillPending(tk, et, float(o))
+        except Exception:
+            self._d2_err += 1
 
     def _D2HeldEligible(self, tk, weight) -> bool:
         try:
