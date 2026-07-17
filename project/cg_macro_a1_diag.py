@@ -36,8 +36,14 @@ _Y2022 = (date(2022, 1, 1).toordinal(), date(2022, 12, 31).toordinal())
 
 
 def _mf(x, d=4):
+    if x is None:
+        return "NA"
     try:
-        return f"{float(x):.{d}f}"
+        v = float(x)
+    except Exception:
+        return "NA"
+    try:
+        return f"{v:.{d}f}"
     except Exception:
         return "NA"
 
