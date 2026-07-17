@@ -550,26 +550,34 @@ def d4_manifest_hash(obj):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest(), raw
 
 
-_BLANK_TOKENS = frozenset({"", "null", "nan", "na", "n/a"})
-
-
 def d4_is_blank_token(v):
-    """Case-insensitive: '', None, null, nan, NA, N/A are blank."""
+    """Case-insensitive blank for required fields.
+
+    Blank: '', Python None, null, nan, NA, N/A.
+    Intentional sentinel 'NONE' (all-caps) is NOT blank.
+    Python's str(None) == 'None' IS blank.
+    """
     if v is None:
         return True
     s = str(v).strip()
     if not s:
         return True
-    return s.lower() in _BLANK_TOKENS
+    if s == "None":
+        return True
+    return s.lower() in {"null", "nan", "na", "n/a"}
 
 
 def _d4_cell_token_kind(v):
+    """Flag only true invalid tokens: Python None / 'None' / null / nan.
+
+    All-caps 'NONE' is an intentional sentinel and must not fail the gate.
+    """
     if v is None:
         return "none"
-    s = str(v).strip().lower()
-    if s in ("null", "none"):
+    s = str(v).strip()
+    if s == "None" or s.lower() == "null":
         return "none"
-    if s == "nan":
+    if s.lower() == "nan":
         return "nan"
     return None
 
