@@ -19,6 +19,14 @@ _D3_EPISODE_ROOT = (
 _D3_Q = (0.005, 0.01, 0.025, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.975, 0.99, 0.995)
 _D3_TRAINA0, _D3_TRAINA1 = _date(2012, 1, 1).toordinal(), _date(2015, 12, 31).toordinal()
 _D3_TRAINB0, _D3_TRAINB1 = _date(2016, 1, 1).toordinal(), _date(2018, 12, 31).toordinal()
+_D3_WINDOWS = (
+    ("W2015_08", _date(2015, 8, 17), _date(2015, 9, 4)),
+    ("W2018_01", _date(2018, 1, 29), _date(2018, 2, 16)),
+    ("W2018_Q4", _date(2018, 10, 1), _date(2018, 12, 31)),
+    ("W2020", _date(2020, 2, 20), _date(2020, 4, 15)),
+    ("W2022", _date(2022, 4, 1), _date(2022, 10, 31)),
+    ("W2023", _date(2023, 7, 20), _date(2023, 11, 10)),
+)
 _D3_KEEP_ORDS = set()
 for _wid, _d0, _d1 in _D3_WINDOWS:
     for _o in range(_d0.toordinal(), _d1.toordinal() + 1):
@@ -27,6 +35,8 @@ for _wid, _d0, _d1 in _D3_WINDOWS:
 
 def _D3KeepRaw(do):
     return (_D2_TRAIN0 <= do <= _D2_TRAIN1) or (do in _D3_KEEP_ORDS)
+
+
 _D3_DEF_SECTOR = ("XLV", "XLU")
 _D3_SAT = frozenset(("AVGO", "MU", "NVDA"))
 _D3_DEF_TK = frozenset(("BND", "TIP", "GLD", "GLDM", "SH", "BIL", "SGOV", "USFR", "XLV", "XLU"))
