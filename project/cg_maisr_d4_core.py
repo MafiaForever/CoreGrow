@@ -2,7 +2,9 @@
 # No AlgorithmImports. No LEAN types.
 
 from __future__ import annotations
+import csv
 import hashlib
+import io
 import json
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -548,6 +550,307 @@ def d4_manifest_hash(obj):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest(), raw
 
 
+_BLANK_TOKENS = frozenset({"", "null", "nan", "na", "n/a"})
+
+
+def d4_is_blank_token(v):
+    """Case-insensitive: '', None, null, nan, NA, N/A are blank."""
+    if v is None:
+        return True
+    s = str(v).strip()
+    if not s:
+        return True
+    return s.lower() in _BLANK_TOKENS
+
+
+def _d4_cell_token_kind(v):
+    if v is None:
+        return "none"
+    s = str(v).strip().lower()
+    if s in ("null", "none"):
+        return "none"
+    if s == "nan":
+        return "nan"
+    return None
+
+
+def d4_validate_csv_artifact(name, text, schema, expected_rows,
+                             required_nonblank, unique_key=None,
+                             optional_blank=None):
+    """Validate CSV artifact via csv module. Never manual split(',')."""
+    optional_blank = set(optional_blank or ())
+    out = {
+        "name": name,
+        "parse_ok": False,
+        "header_exact": False,
+        "row_count": 0,
+        "row_count_ok": False,
+        "column_count": len(schema),
+        "required_nonblank_ok": False,
+        "unique_key_ok": True,
+        "none_token_count": 0,
+        "nan_token_count": 0,
+        "placeholder_only": False,
+        "pass": False,
+        "reason": "",
+    }
+    try:
+        reader = csv.reader(io.StringIO(str(text or "")))
+        rows = list(reader)
+    except Exception as exc:
+        out["reason"] = f"parse_error:{exc}"
+        return out
+    if not rows:
+        out["reason"] = "empty"
+        return out
+    header = rows[0]
+    out["parse_ok"] = True
+    out["header_exact"] = header == list(schema)
+    if not out["header_exact"]:
+        out["reason"] = "header_mismatch"
+    data = rows[1:]
+    out["row_count"] = len(data)
+    if expected_rows is None:
+        out["row_count_ok"] = True
+    else:
+        out["row_count_ok"] = out["row_count"] == int(expected_rows)
+        if not out["row_count_ok"] and not out["reason"]:
+            out["reason"] = f"row_count:{out['row_count']}!={expected_rows}"
+    none_c = nan_c = 0
+    for row in rows:
+        for cell in row:
+            kind = _d4_cell_token_kind(cell)
+            if kind == "none":
+                none_c += 1
+            elif kind == "nan":
+                nan_c += 1
+    out["none_token_count"] = none_c
+    out["nan_token_count"] = nan_c
+    out["placeholder_only"] = d4_is_placeholder_csv(text)
+    req_ok = True
+    if out["header_exact"] and data:
+        idx = {c: i for i, c in enumerate(header)}
+        for col in required_nonblank:
+            if col not in idx:
+                req_ok = False
+                break
+            ci = idx[col]
+            for row in data:
+                if len(row) <= ci:
+                    req_ok = False
+                    break
+                if col not in optional_blank and d4_is_blank_token(row[ci]):
+                    req_ok = False
+                    break
+            if not req_ok:
+                break
+    out["required_nonblank_ok"] = req_ok
+    if not req_ok and not out["reason"]:
+        out["reason"] = "required_blank"
+    uk_ok = True
+    if unique_key and out["header_exact"] and data:
+        idx = {c: i for i, c in enumerate(header)}
+        keys = [unique_key] if isinstance(unique_key, str) else list(unique_key)
+        if all(k in idx for k in keys):
+            seen = set()
+            for row in data:
+                tup = tuple(row[idx[k]] if len(row) > idx[k] else "" for k in keys)
+                if tup in seen:
+                    uk_ok = False
+                    break
+                seen.add(tup)
+        else:
+            uk_ok = False
+    out["unique_key_ok"] = uk_ok
+    if not uk_ok and not out["reason"]:
+        out["reason"] = "duplicate_key"
+    gates = (
+        out["parse_ok"] and out["header_exact"] and out["row_count_ok"]
+        and out["required_nonblank_ok"] and out["unique_key_ok"]
+        and none_c == 0 and nan_c == 0 and not out["placeholder_only"]
+    )
+    out["pass"] = gates
+    if gates:
+        out["reason"] = "OK"
+    elif not out["reason"]:
+        out["reason"] = "gate_fail"
+    return out
+
+
+def d4_calibration_artifact_schemas():
+    """Artifact kind -> exact header column list (order matters)."""
+    return {
+        "identity": [
+            "id", "pass", "n", "nav_diff_pct", "maxdd_diff_pp", "corr",
+            "peak", "trough", "recovery",
+        ],
+        "symbol_roles": ["symbol", "role", "source"],
+        "gold_continuity": ["metric", "value"],
+        "distributions": [
+            "feature", "scope", "available_count", "total_count", "availability_ratio",
+            "min", "p01", "p05", "p10", "p25", "p50", "p75", "p90", "p95", "p99", "max", "status",
+        ],
+        "subject_exposure": [
+            "symbol", "held_days_a", "held_days_b", "held_days_total",
+            "first_eligible_date", "last_eligible_date",
+        ],
+        "pack_stats": [
+            "id", "pass", "support_ok", "stability_ok", "mono_ok", "support_reason",
+            "broad_family_episodes", "broad_family_episode_min", "broad_family_episode_max",
+            "broad_family_days", "broad_family_day_min", "broad_family_day_max",
+            "local_sector_episodes", "local_sector_episode_min", "local_sector_episode_max",
+            "local_sector_held_days", "local_sector_day_min", "local_sector_day_max",
+            "defensive_episodes", "defensive_episode_min", "defensive_episode_max",
+            "dist_score", "selected",
+        ],
+        "monotonicity": [
+            "dimension", "fixed", "less_severe", "more_severe", "metric", "lhs", "rhs", "pass",
+        ],
+        "stability": [
+            "pack", "broad_ep_a", "broad_ep_b", "broad_years_a", "broad_years_b",
+            "broad_density_a", "broad_density_b", "broad_ratio", "broad_reason",
+            "subject_ep_a", "subject_ep_b", "eligible_held_symbol_days_a", "eligible_held_symbol_days_b",
+            "subject_density_a", "subject_density_b", "subject_ratio", "subject_reason",
+            "defensive_ep_a", "defensive_ep_b", "defensive_density_a", "defensive_density_b",
+            "defensive_ratio", "defensive_reason", "stability_ok",
+        ],
+        "episode_summary": ["pack", "state", "subject", "episode_count", "window"],
+        "selected_episodes": ["pack", "state", "subject", "start", "end", "n", "day"],
+        "known_windows": [
+            "pack", "window", "broad_family_episodes", "systemic_episodes", "rate_episodes",
+            "defensive_episodes", "local_episodes", "sector_episodes", "eligible_held_symbol_days",
+            "first_signal", "last_signal", "status",
+        ],
+        "classifiers": [
+            "id", "s", "a", "b", "h", "score", "macro_f1", "valid", "validity_reason", "selected",
+            "sig_hash", "macro_sig_hash", "subject_sig_hash", "combined_sig_hash", "n",
+            "f1_BROAD", "f1_LOCAL", "f1_SECTOR", "f1_DEF",
+        ],
+    }
+
+
+def d4_calibration_artifact_expected_rows(kind):
+    fixed = {
+        "distributions": 39,
+        "pack_stats": 12,
+        "stability": 12,
+        "known_windows": 48,
+        "classifiers": 54,
+        "episode_summary": 36,
+        "gold_continuity": 4,
+        "identity": 3,
+    }
+    return fixed.get(kind)
+
+
+def d4_validate_distributions_csv(text):
+    """Require 13 features x 3 scopes coverage."""
+    schemas = d4_calibration_artifact_schemas()
+    schema = schemas["distributions"]
+    base = d4_validate_csv_artifact(
+        "distributions", text, schema, 39,
+        ["feature", "scope", "status"],
+        unique_key=("feature", "scope"),
+    )
+    if not base["parse_ok"] or not base["header_exact"]:
+        return base
+    reader = csv.DictReader(io.StringIO(str(text or "")))
+    seen = {(r.get("feature"), r.get("scope")) for r in reader}
+    expected = {(f, sc) for f in _DIST_FEATURES for sc in ("TRAIN_ALL", "TRAIN_A", "TRAIN_B")}
+    missing = expected - seen
+    extra = seen - expected - {(None, None), ("", "")}
+    if missing or extra:
+        base["pass"] = False
+        base["reason"] = "feature_scope_coverage"
+    return base
+
+
+def d4_validate_manifest_json(text, expected_sha=None):
+    out = {
+        "pass": False,
+        "reason": "",
+        "parse_ok": False,
+        "keys_ok": False,
+        "hash_ok": False,
+        "manifest_sha256": None,
+    }
+    required = (
+        "schema_version", "source_commit", "selected_pack", "selected_classifiers",
+        "calibration_result", "calibration_reason", "artifact_sha256", "pack_support",
+        "pack_stability", "gold_train_coverage", "coverage_ratio", "mono_ok", "manifest_sha256",
+    )
+    try:
+        obj = json.loads(str(text or ""))
+        out["parse_ok"] = True
+    except Exception as exc:
+        out["reason"] = f"json_parse:{exc}"
+        return out
+    out["keys_ok"] = all(k in obj for k in required)
+    if not out["keys_ok"]:
+        out["reason"] = "missing_keys"
+        return out
+    saved = str(obj.get("manifest_sha256") or "")
+    out["manifest_sha256"] = saved
+    body = {k: v for k, v in obj.items() if k != "manifest_sha256"}
+    recomputed, _ = d4_manifest_hash(body)
+    out["hash_ok"] = saved == recomputed
+    if expected_sha is not None and saved != expected_sha:
+        out["hash_ok"] = False
+    if not out["hash_ok"]:
+        out["reason"] = "hash_mismatch"
+        return out
+    out["pass"] = True
+    out["reason"] = "OK"
+    return out
+
+
+def d4_finalize_calibration_result(gates_ok, chosen_pack, clf_ok, artifacts_ok):
+    """Pure finalize helper; artifact failure never returns STOP_MAISR."""
+    if not artifacts_ok:
+        return {
+            "result": "FAILED",
+            "reason": "ARTIFACT_VALIDATION_FAIL",
+            "next": "FIX_D4_ARTIFACTS",
+            "research_conclusion": "NOT_REACHED",
+        }
+    if gates_ok and chosen_pack and clf_ok:
+        return {
+            "result": "CALIBRATION_PASS",
+            "reason": "OK",
+            "next": "BUILD_D4_2_EXECUTION_ENGINE",
+            "research_conclusion": "NOT_REACHED",
+        }
+    if gates_ok and not chosen_pack:
+        return {
+            "result": "STOP_MAISR",
+            "reason": "NO_SUPPORTED_SUBJECT_PACK",
+            "next": "STOP_MAISR",
+            "research_conclusion": "STOP_MAISR",
+        }
+    if gates_ok and chosen_pack and not clf_ok:
+        return {
+            "result": "STOP_MAISR",
+            "reason": "INSUFFICIENT_CLASSIFIER_DIVERSITY",
+            "next": "STOP_MAISR",
+            "research_conclusion": "STOP_MAISR",
+        }
+    return {
+        "result": "FAILED",
+        "reason": "calibration_gate_fail",
+        "next": "FIX_D4_1_CALIBRATION",
+        "research_conclusion": "NOT_REACHED",
+    }
+
+
+def d4_artifact_validation_self_contract():
+    """Self-validation row is excluded from recursive hash (no sha256 column)."""
+    return {
+        "artifact": "ARTIFACT_VALIDATION_SELF",
+        "sha256": "SELF_EXCLUDED",
+        "recursive_hash": False,
+    }
+
+
 def d4_select_subject(held_residuals):
     """held_residuals: {symbol: residual}; strongest (most negative) wins; lexical tiebreak."""
     if not held_residuals:
@@ -780,6 +1083,116 @@ def run_d4_static_tests():
     # 34 economic placeholder cannot emit STOP
     ok(34, "econ_placeholder_no_stop", True)  # enforced in overlay fail-closed path
 
+    schemas = d4_calibration_artifact_schemas()
+    ps_schema = schemas["pack_stats"]
+    ps_req = [c for c in ps_schema if c != "support_reason"]
+
+    def _ps_row(pid, **kw):
+        base = {
+            "id": pid, "pass": 1, "support_ok": 1, "stability_ok": 1, "mono_ok": 1,
+            "support_reason": "OK",
+            "broad_family_episodes": 50, "broad_family_episode_min": 20,
+            "broad_family_episode_max": 200, "broad_family_days": 40,
+            "broad_family_day_min": 15, "broad_family_day_max": 150,
+            "local_sector_episodes": 30, "local_sector_episode_min": 20,
+            "local_sector_episode_max": 60, "local_sector_held_days": 30,
+            "local_sector_day_min": 15, "local_sector_day_max": 60,
+            "defensive_episodes": 20, "defensive_episode_min": 10,
+            "defensive_episode_max": 150, "dist_score": 5, "selected": 0,
+        }
+        base.update(kw)
+        return ",".join(str(base[c]) for c in ps_schema)
+
+    # 35 pack_stats with None rows fails
+    none_lines = [",".join(ps_schema)] + ["None"] * 12
+    v35 = d4_validate_csv_artifact(
+        "pack_stats", "\n".join(none_lines), ps_schema, 12, ps_req, unique_key="id")
+    ok(35, "pack_stats_none_rows_fail", not v35["pass"] and v35["none_token_count"] >= 12)
+
+    # 36 blank required field fails
+    bad_lines = [",".join(ps_schema)]
+    for p in _D4_PACKS:
+        bad_lines.append(_ps_row(p["id"], **{"pass": ""}))
+    v36 = d4_validate_csv_artifact(
+        "pack_stats", "\n".join(bad_lines), ps_schema, 12, ps_req, unique_key="id")
+    ok(36, "pack_stats_blank_required_fail", not v36["pass"])
+
+    # 37 valid 12 populated rows passes
+    good_lines = [",".join(ps_schema)]
+    for i, p in enumerate(_D4_PACKS):
+        good_lines.append(_ps_row(p["id"], selected=int(i == 0)))
+    v37 = d4_validate_csv_artifact(
+        "pack_stats", "\n".join(good_lines), ps_schema, 12, ps_req, unique_key="id")
+    ok(37, "pack_stats_valid_12_pass", v37["pass"])
+
+    # 38 duplicate pack ID fails
+    dup_lines = [",".join(ps_schema), _ps_row(_D4_PACKS[0]["id"]), _ps_row(_D4_PACKS[0]["id"])]
+    for p in _D4_PACKS[1:]:
+        dup_lines.append(_ps_row(p["id"]))
+    v38 = d4_validate_csv_artifact(
+        "pack_stats", "\n".join(dup_lines[:13]), ps_schema, 12, ps_req, unique_key="id")
+    ok(38, "pack_stats_duplicate_id_fail", not v38["pass"] and not v38["unique_key_ok"])
+
+    # 39 classifiers 53 rows fails
+    clf_schema = schemas["classifiers"]
+    clf_lines = [",".join(clf_schema)]
+    for i in range(53):
+        clf_lines.append(
+            f"CLF{i:02d},S1,2,50,H0,0.5,0.5,1,OK,0,abc,abc,abc,abc,100,0.1,0.1,0.1,0.1"
+        )
+    v39 = d4_validate_csv_artifact(
+        "classifiers", "\n".join(clf_lines), clf_schema, 54, ["id"], unique_key="id")
+    ok(39, "classifiers_53_rows_fail", not v39["pass"] and not v39["row_count_ok"])
+
+    # 40 known_windows 47 rows fails
+    kw_schema = schemas["known_windows"]
+    kw_lines = [",".join(kw_schema)]
+    for i in range(47):
+        kw_lines.append(
+            f"D4_B40_BR2_L50,W2015,1,0,0,0,0,0,10,1,2,AUDIT"
+        )
+    v40 = d4_validate_csv_artifact(
+        "known_windows", "\n".join(kw_lines), kw_schema, 48, ["pack", "window"],
+        unique_key=("pack", "window"))
+    ok(40, "known_windows_47_rows_fail", not v40["pass"])
+
+    # 41 distributions wrong feature/scope coverage fails
+    dist_schema = schemas["distributions"]
+    dist_lines = [",".join(dist_schema)]
+    for f in _DIST_FEATURES:
+        for sc in ("TRAIN_ALL", "TRAIN_A"):
+            dist_lines.append(
+                f"{f},{sc},10,100,0.1,0,0,0,0,0,0,0,0,0,0,0,OK"
+            )
+    v41 = d4_validate_distributions_csv("\n".join(dist_lines))
+    ok(41, "distributions_coverage_fail", not v41["pass"])
+
+    # 42 manifest hash mismatch fails
+    mobj = {
+        "schema_version": "D4.2A", "source_commit": "a" * 40,
+        "selected_pack": None, "selected_classifiers": [],
+        "calibration_result": "TENTATIVE", "calibration_reason": "OK",
+        "artifact_sha256": {}, "pack_support": {}, "pack_stability": [],
+        "gold_train_coverage": 1.0, "coverage_ratio": 1.0, "mono_ok": 1,
+    }
+    mh, _ = d4_manifest_hash(mobj)
+    bad_json = json.dumps({**mobj, "manifest_sha256": "b" * 64}, sort_keys=True, separators=(",", ":"))
+    v42 = d4_validate_manifest_json(bad_json)
+    ok(42, "manifest_hash_mismatch_fail", not v42["pass"] and v42["reason"] == "hash_mismatch")
+
+    # 43 artifact failure cannot return STOP_MAISR
+    fin43 = d4_finalize_calibration_result(True, None, False, False)
+    ok(43, "artifact_fail_not_stop_maisr",
+       fin43["result"] == "FAILED" and fin43["reason"] == "ARTIFACT_VALIDATION_FAIL"
+       and fin43["result"] != "STOP_MAISR")
+
+    # 44 validation self-row contract
+    self_c = d4_artifact_validation_self_contract()
+    ok(44, "validation_self_no_recursive_hash",
+       self_c["artifact"] == "ARTIFACT_VALIDATION_SELF"
+       and self_c["sha256"] == "SELF_EXCLUDED"
+       and self_c["recursive_hash"] is False)
+
     aud = d4_support_audit(5, 10, 5, 10, 5)
     z_ok, _, _, _, zrsn = d4_stability_subject(0, 0, 50, 60)
     ok(15, "exposure_normalized_stability",
@@ -790,7 +1203,7 @@ def run_d4_static_tests():
     by_n = {}
     for r in results:
         by_n[r["n"]] = r
-    uniq = [by_n[i] for i in range(1, 35) if i in by_n]
+    uniq = [by_n[i] for i in range(1, 45) if i in by_n]
     passed = sum(1 for r in uniq if r["pass"])
     return uniq, passed, len(uniq)
 

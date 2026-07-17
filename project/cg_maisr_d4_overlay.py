@@ -18,6 +18,9 @@ from cg_maisr_d4_core import (
     d4_assert_no_self_proxy, d4_apply_cut_fill, d4_cut_ceiling_apply,
     d4_is_subject_row, d4_validate_source_commit, d4_held_pairs, d4_dist_stats,
     d4_is_placeholder_csv, run_d4_static_tests, _ROUTER_ADJ,
+    d4_validate_csv_artifact, d4_validate_distributions_csv, d4_validate_manifest_json,
+    d4_calibration_artifact_schemas, d4_calibration_artifact_expected_rows,
+    d4_finalize_calibration_result, d4_artifact_validation_self_contract,
 )
 from cg_maisr_d2_labels import _ALL_CFG, _clfid, _D2PeakTroughMaxDD, _D2_FWD, _D2_DUR, _D2_INFL
 
@@ -33,6 +36,15 @@ def _d4f(x, d=4):
         return f"{float(x):.{d}f}"
     except Exception:
         return "NA"
+
+
+def _d4f0(x, d=4):
+    if x is None:
+        return "0"
+    try:
+        return f"{float(x):.{d}f}"
+    except Exception:
+        return "0"
 
 
 def _d4_sha(text):
@@ -106,13 +118,13 @@ class CgMaisrD4OverlayMixin:
         proxy_ok, bad = d4_assert_no_self_proxy(_D4_PROXY)
         static_rows, p, n = run_d4_static_tests()
         self._MsLog(
-            f"CG_MAISR_D4_1_INIT,phase={self.cg_maisr_d4_phase or 'NA'},"
+            f"CG_MAISR_D42_CAL_INIT,phase={self.cg_maisr_d4_phase or 'NA'},"
             f"pack={self.cg_maisr_d4_selected_pack or 'AUTO'},"
             f"source_commit={getattr(self,'cg_maisr_d4_source_commit','') or 'NONE'},"
             f"classifiers={','.join(self.cg_maisr_d4_selected_classifiers) or 'NONE'}"
         )
         self._MsLog(
-            f"CG_MAISR_D4_1_STATIC_FINAL,tests={p}/{n},self_proxy_ok={int(proxy_ok)},"
+            f"CG_MAISR_D42_STATIC_FINAL,tests={p}/{n},self_proxy_ok={int(proxy_ok)},"
             f"self_proxy_bad={','.join(bad) or 'NONE'},"
             f"gold_primary={getattr(self,'_ms_gold_primary',None)},"
             f"gold_fallback={getattr(self,'_ms_gold_fallback',None)}"
@@ -420,7 +432,7 @@ class CgMaisrD4OverlayMixin:
                 "peak": peak, "trough": trough, "recovery": recovery,
             }
             self._MsLog(
-                f"CG_MAISR_D4_1_IDENTITY_FINAL,id={label},pass={'YES' if passed else 'NO'},"
+                f"CG_MAISR_D42_IDENTITY_FINAL,id={label},pass={'YES' if passed else 'NO'},"
                 f"n={cmp.get('n',0)},nav_diff_pct={_d4f(cmp.get('nav_d'),6)},"
                 f"maxdd_diff_pp={_d4f(cmp.get('dd_d'),6)},corr={_d4f(cmp.get('corr'),6)}"
             )
@@ -448,19 +460,19 @@ class CgMaisrD4OverlayMixin:
         self._D4HarvestFromD2Finalize()
         if not src_ok:
             self._MsLog(
-                f"CG_MAISR_D4_1_CALIBRATION_FINAL,result=FAILED,reason=invalid_source_commit,"
+                f"CG_MAISR_D42_CALIBRATION_FINAL,result=FAILED,reason=invalid_source_commit,"
                 f"detail={src_rsn},research_conclusion=NOT_REACHED"
             )
             return True
         if not parity_ok or self._d4_err:
             self._MsLog(
-                "CG_MAISR_D4_1_CALIBRATION_FINAL,result=FAILED,reason=parity_or_static,"
+                "CG_MAISR_D42_CALIBRATION_FINAL,result=FAILED,reason=parity_or_static,"
                 "research_conclusion=NOT_REACHED,next=FIX_D4_1_CALIBRATION"
             )
             return True
         if not self._d4_raw:
             self._MsLog(
-                "CG_MAISR_D4_1_CALIBRATION_FINAL,result=FAILED,reason=empty_d4_raw,"
+                "CG_MAISR_D42_CALIBRATION_FINAL,result=FAILED,reason=empty_d4_raw,"
                 "research_conclusion=NOT_REACHED,next=FIX_D4_1_CALIBRATION"
             )
             return True
@@ -470,7 +482,7 @@ class CgMaisrD4OverlayMixin:
         cov = self._D2CoverageReport() if hasattr(self, "_D2CoverageReport") else {}
         gold_cov = (self._d4_gold_avail / max(self._d4_gold_n, 1)) if self._d4_gold_n else 0.0
         self._MsLog(
-            f"CG_MAISR_D4_1_GOLD_FINAL,train_coverage={_d4f(gold_cov,4)},"
+            f"CG_MAISR_D42_GOLD_FINAL,train_coverage={_d4f(gold_cov,4)},"
             f"double_count_used=0,primary={getattr(self,'_ms_gold_primary',None)},"
             f"fallback={getattr(self,'_ms_gold_fallback',None)}"
         )
@@ -479,7 +491,7 @@ class CgMaisrD4OverlayMixin:
         macro_n = sum(1 for r in train if _d4_macro_eligible(r))
         subject_n = sum(1 for r in train if d4_is_subject_row(r))
         self._MsLog(
-            f"CG_MAISR_D4_1_SCOPE_FINAL,macro_rows={macro_n},subject_rows={subject_n},"
+            f"CG_MAISR_D42_SCOPE_FINAL,macro_rows={macro_n},subject_rows={subject_n},"
             f"pre_subject_rows_used=0,post_subject_rows_used={subject_n}"
         )
         ta_sub = [r for r in train if _TRAINA0 <= r["do"] <= _TRAINA1 and d4_is_subject_row(r)]
@@ -487,7 +499,7 @@ class CgMaisrD4OverlayMixin:
         hp_a, hp_b = d4_held_pairs(ta_sub), d4_held_pairs(tb_sub)
         hp_all = hp_a | hp_b
         self._MsLog(
-            f"CG_MAISR_D4_1_EXPOSURE_FINAL,held_symbol_days_a={len(hp_a)},"
+            f"CG_MAISR_D42_EXPOSURE_FINAL,held_symbol_days_a={len(hp_a)},"
             f"held_symbol_days_b={len(hp_b)},held_symbol_days_total={len(hp_all)},"
             f"symbols_with_exposure={len({tk for _, tk in hp_all})}"
         )
@@ -524,16 +536,16 @@ class CgMaisrD4OverlayMixin:
                 "pack": pack["id"],
                 "broad_ep_a": ep_a, "broad_ep_b": ep_b,
                 "broad_years_a": 4.0, "broad_years_b": 3.0,
-                "broad_density_a": _d4f(da), "broad_density_b": _d4f(db),
-                "broad_ratio": _d4f(bratio), "broad_reason": brsn,
+                "broad_density_a": _d4f0(da), "broad_density_b": _d4f0(db),
+                "broad_ratio": _d4f0(bratio), "broad_reason": brsn,
                 "subject_ep_a": ls_a, "subject_ep_b": ls_b,
                 "eligible_held_symbol_days_a": len(hp_a),
                 "eligible_held_symbol_days_b": len(hp_b),
-                "subject_density_a": _d4f(sda), "subject_density_b": _d4f(sdb),
-                "subject_ratio": _d4f(sratio), "subject_reason": srsn,
+                "subject_density_a": _d4f0(sda), "subject_density_b": _d4f0(sdb),
+                "subject_ratio": _d4f0(sratio), "subject_reason": srsn,
                 "defensive_ep_a": def_a, "defensive_ep_b": def_b,
-                "defensive_density_a": _d4f(dda), "defensive_density_b": _d4f(ddb),
-                "defensive_ratio": _d4f(dratio), "defensive_reason": drsn,
+                "defensive_density_a": _d4f0(dda), "defensive_density_b": _d4f0(ddb),
+                "defensive_ratio": _d4f0(dratio), "defensive_reason": drsn,
                 "stability_ok": int(stab_ok),
                 "broad_ok": int(broad_ok), "subject_ok": int(sub_ok), "defensive_ok": int(def_ok),
             })
@@ -546,7 +558,7 @@ class CgMaisrD4OverlayMixin:
                 "pass": 0, "mono_ok": 0,
             }
             self._MsLog(
-                f"CG_MAISR_D4_1_PACK_FINAL,id={pack['id']},support={int(support_ok)},"
+                f"CG_MAISR_D42_PACK_FINAL,id={pack['id']},support={int(support_ok)},"
                 f"support_reason={support_reason},stable={int(stab_ok)},"
                 f"bf={bf_ep},ls={ls},def={deff},sys={sys_},rate={rate}"
             )
@@ -562,7 +574,7 @@ class CgMaisrD4OverlayMixin:
                                  0 if "B60" in s["id"] else 1, 0 if "L75" in s["id"] else 1, s["id"]))
         chosen_pack = pool[0]["id"] if pool else None
         self._MsLog(
-            f"CG_MAISR_D4_1_SELECTED_PACK,id={chosen_pack or 'NONE'},"
+            f"CG_MAISR_D42_SELECTED_PACK,id={chosen_pack or 'NONE'},"
             f"mono={'PASS' if mono_ok else 'FAIL'},gold_ok={int(gold_ok)}"
         )
 
@@ -572,43 +584,48 @@ class CgMaisrD4OverlayMixin:
                 chosen_pack, labeled_by[chosen_pack], eps_by[chosen_pack], pack_stats[chosen_pack])
             for r in chosen[:6]:
                 self._MsLog(
-                    f"CG_MAISR_D4_1_CLASSIFIER_SELECTED,id={r['id']},H={r['h']},"
+                    f"CG_MAISR_D42_CLASSIFIER_SELECTED,id={r['id']},H={r['h']},"
                     f"score={_d4f(r['score'],4)},sig={r.get('sig_hash','')[:12]}"
                 )
         else:
             scored = [{"id": _clfid(s, a, b, h), "s": s, "a": a, "b": b, "h": h,
                        "valid": 0, "score": 0, "validity_reason": "no_pack",
-                       "macro_f1": 0, "f1": {}, "sig_hash": "NA", "n": 0}
+                       "macro_f1": 0, "f1": {}, "sig_hash": "NONE", "n": 0,
+                       "macro_sig_hash": "NONE", "subject_sig_hash": "NONE",
+                       "combined_sig_hash": "NONE"}
                       for s, a, b, h in _ALL_CFG]
 
         clf_ok = len(chosen) >= 3 and len(set(sigs.values())) >= 2
         data_ok = int(getattr(self, "_ms_bd_conflict", 0) or 0) == 0
         cov_ok = cov.get("coverage_ratio", 0) >= 0.99
         gates_ok = id_ok and gold_ok and mono_ok and data_ok and cov_ok
-        cal_pass = bool(gates_ok and chosen_pack and clf_ok)
 
-        if cal_pass:
-            result, reason, nxt = "CALIBRATION_PASS", "OK", "BUILD_D4_2_EXECUTION_ENGINE"
+        if gates_ok and chosen_pack and clf_ok:
+            tent_result, tent_reason = "CALIBRATION_PASS", "OK"
         elif gates_ok and not chosen_pack:
-            result, reason, nxt = "STOP_MAISR", "NO_SUPPORTED_SUBJECT_PACK", "STOP_MAISR"
+            tent_result, tent_reason = "STOP_MAISR", "NO_SUPPORTED_SUBJECT_PACK"
         elif gates_ok and chosen_pack and not clf_ok:
-            result, reason, nxt = "STOP_MAISR", "INSUFFICIENT_CLASSIFIER_DIVERSITY", "STOP_MAISR"
+            tent_result, tent_reason = "STOP_MAISR", "INSUFFICIENT_CLASSIFIER_DIVERSITY"
         else:
-            result, reason, nxt = "FAILED", "calibration_gate_fail", "FIX_D4_1_CALIBRATION"
+            tent_result, tent_reason = "FAILED", "calibration_gate_fail"
 
         bid = self._MsBid() if hasattr(self, "_MsBid") else "NA"
         self._d4_selected_pack = chosen_pack
-        rc = "STOP_MAISR" if result == "STOP_MAISR" else "NOT_REACHED"
-        mhash, arts = self._D4ExportCalib(
+        mhash, arts, all_pass, fail_reason = self._D4ExportCalib(
             bid, src, id_results, pack_stats, mono_rows, stab_rows, scored, chosen,
-            eps_by.get(chosen_pack, ([], [])), cov, gold_cov, result, reason)
+            eps_by.get(chosen_pack, ([], [])), cov, gold_cov, tent_result, tent_reason)
+        fin = d4_finalize_calibration_result(gates_ok, chosen_pack, clf_ok, all_pass)
+        result, reason, nxt = fin["result"], fin["reason"], fin["next"]
+        rc = fin["research_conclusion"]
+        if not all_pass:
+            result, reason, nxt, rc = "FAILED", fail_reason, "FIX_D4_ARTIFACTS", "NOT_REACHED"
         ph_n = sum(1 for t in arts.values() if d4_is_placeholder_csv(t))
         self._MsLog(
-            f"CG_MAISR_D4_1_ARTIFACT_FINAL,artifacts={len(arts)},"
-            f"manifest_sha256={mhash},placeholder_count={ph_n}"
+            f"CG_MAISR_D42_ARTIFACT_FINAL,artifacts={len(arts)},"
+            f"manifest_sha256={mhash},placeholder_count={ph_n},validation_pass={int(all_pass)}"
         )
         self._MsLog(
-            f"CG_MAISR_D4_1_CALIBRATION_FINAL,result={result},reason={reason},next={nxt},"
+            f"CG_MAISR_D42_CALIBRATION_FINAL,result={result},reason={reason},next={nxt},"
             f"research_conclusion={rc},selected_pack={chosen_pack or 'NONE'},"
             f"classifiers={len(chosen)},h_sigs={len(set(sigs.values()))},manifest_sha256={mhash},"
             f"frozen_classifiers={','.join(r['id'] for r in chosen)}"
@@ -765,13 +782,17 @@ class CgMaisrD4OverlayMixin:
     def _D4ExportCalib(self, bid, src, id_results, pack_stats, mono_rows, stab_rows, scored, chosen,
                        eps, cov, gold_cov, cal_result, cal_reason):
         arts = {}
-        il = ["id,pass,n,nav_diff_pct,maxdd_diff_pp,corr,peak,trough,recovery"]
+        schemas = d4_calibration_artifact_schemas()
+        chosen_id = getattr(self, "_d4_selected_pack", None)
+
+        il = [",".join(schemas["identity"])]
         for k, r in id_results.items():
             il.append(f"{k},{'YES' if r['pass'] else 'NO'},{r['n']},"
                       f"{_d4f(r.get('nav_d'),6)},{_d4f(r.get('dd_d'),6)},{_d4f(r.get('corr'),6)},"
                       f"{r.get('peak','NA')},{r.get('trough','NA')},{r.get('recovery','NA')}")
         arts[f"cg_maisr_d4_identity_{bid}.csv"] = "\n".join(il)
-        rl = ["symbol,role,source"]
+
+        rl = [",".join(schemas["symbol_roles"])]
         for tk in sorted(getattr(self, "_ms_all", set()) or []):
             if tk in ("AVGO", "MU", "NVDA"):
                 role, src_r = "INACTIVE_TRADING_PATH", "spyg_sat_trade_enable=0"
@@ -787,24 +808,25 @@ class CgMaisrD4OverlayMixin:
                 role, src_r = "ACTIVE_HELD_RISK", "panel"
             rl.append(f"{tk},{role},{src_r}")
         arts[f"cg_maisr_d4_symbol_roles_{bid}.csv"] = "\n".join(rl)
+
         arts[f"cg_maisr_d4_gold_continuity_{bid}.csv"] = (
             "metric,value\ntrain_coverage," + _d4f(gold_cov, 4) +
             "\ndouble_count_used,0\nprimary," + str(getattr(self, "_ms_gold_primary", "NA")) +
             "\nfallback," + str(getattr(self, "_ms_gold_fallback", "NA")))
+
         train = [r for r in self._d4_raw if r.get("train")]
         scopes = [("TRAIN_ALL", train),
                   ("TRAIN_A", [r for r in train if _TRAINA0 <= r["do"] <= _TRAINA1]),
                   ("TRAIN_B", [r for r in train if _TRAINB0 <= r["do"] <= _TRAINB1])]
-        dl = ["feature,scope,available_count,total_count,availability_ratio,min,p01,p05,p10,p25,p50,p75,p90,p95,p99,max,status"]
+        dl = [",".join(schemas["distributions"])]
         for sc, srows in scopes:
             tc = len(srows)
             for feat in _DIST_FEATURES:
                 vals = [float(_d4_row_feature(r, feat)) for r in srows if _d4_row_feature(r, feat) is not None]
                 st = d4_dist_stats(vals, tc, sc, feat)
-                dl.append(",".join(str(st[k]) if st[k] is not None else "NA" for k in
-                                   ("feature", "scope", "available_count", "total_count", "availability_ratio",
-                                    "min", "p01", "p05", "p10", "p25", "p50", "p75", "p90", "p95", "p99", "max", "status")))
+                dl.append(",".join(str(st[k]) if st[k] is not None else "NA" for k in schemas["distributions"]))
         arts[f"cg_maisr_d4_distributions_{bid}.csv"] = "\n".join(dl)
+
         ta_sub = [r for r in train if _TRAINA0 <= r["do"] <= _TRAINA1 and d4_is_subject_row(r)]
         tb_sub = [r for r in train if _TRAINB0 <= r["do"] <= _TRAINB1 and d4_is_subject_row(r)]
         hp_a, hp_b = d4_held_pairs(ta_sub), d4_held_pairs(tb_sub)
@@ -820,26 +842,28 @@ class CgMaisrD4OverlayMixin:
                 fl[0] = d
             if d > fl[1]:
                 fl[1] = d
-        sel = ["symbol,held_days_a,held_days_b,held_days_total,first_eligible_date,last_eligible_date"]
+        a_n, b_n = len(hp_a), len(hp_b)
+        do_a = [d for d, _ in hp_a]
+        do_b = [d for d, _ in hp_b]
+        min_do_a = min(do_a) if do_a else 0
+        max_do_a = max(do_a) if do_a else 0
+        min_do_b = min(do_b) if do_b else 0
+        max_do_b = max(do_b) if do_b else 0
+        min_do_all = min(do_a + do_b) if (do_a or do_b) else 0
+        max_do_all = max(do_a + do_b) if (do_a or do_b) else 0
+        sel = [",".join(schemas["subject_exposure"])]
         for tk in sorted(sym_exp.keys()):
             a, b = sym_exp[tk]["a"], sym_exp[tk]["b"]
             f0, f1 = first_last.get(tk, [0, 0])
             sel.append(f"{tk},{a},{b},{a + b},{f0},{f1}")
-        sel.append(f"TRAIN_A_TOTAL,{len(hp_a)},,,{len({tk for _, tk in hp_a})},")
-        sel.append(f"TRAIN_B_TOTAL,{len(hp_b)},,,{len({tk for _, tk in hp_b})},")
-        sel.append(f"TRAIN_TOTAL,{len(hp_a | hp_b)},,,{len(sym_exp)},")
+        sel.append(f"TRAIN_A_TOTAL,{a_n},0,{a_n},{min_do_a},{max_do_a}")
+        sel.append(f"TRAIN_B_TOTAL,0,{b_n},{b_n},{min_do_b},{max_do_b}")
+        sel.append(f"TRAIN_TOTAL,{a_n},{b_n},{a_n + b_n},{min_do_all},{max_do_all}")
         arts[f"cg_maisr_d4_subject_exposure_{bid}.csv"] = "\n".join(sel)
-        ph = [
-            "id", "pass", "support_ok", "stability_ok", "mono_ok", "support_reason",
-            "broad_family_episodes", "broad_family_episode_min", "broad_family_episode_max",
-            "broad_family_days", "broad_family_day_min", "broad_family_day_max",
-            "local_sector_episodes", "local_sector_episode_min", "local_sector_episode_max",
-            "local_sector_held_days", "local_sector_day_min", "local_sector_day_max",
-            "defensive_episodes", "defensive_episode_min", "defensive_episode_max",
-            "dist_score", "selected",
-        ]
+
+        ph = schemas["pack_stats"]
+        ps_req = [c for c in ph if c != "support_reason"]
         pl = [",".join(ph)]
-        chosen_id = getattr(self, "_d4_selected_pack", None)
         for p in _D4_PACKS:
             s = pack_stats[p["id"]]
             pl.append(",".join(
@@ -847,40 +871,35 @@ class CgMaisrD4OverlayMixin:
                 for h in ph
             ))
         arts[f"cg_maisr_d4_pack_stats_{bid}.csv"] = "\n".join(pl)
-        ml = ["dimension,fixed,less_severe,more_severe,metric,lhs,rhs,pass"]
+
+        ml = [",".join(schemas["monotonicity"])]
         for r in mono_rows:
-            ml.append(",".join(str(r[k]) for k in
-                               ("dimension", "fixed", "less_severe", "more_severe", "metric", "lhs", "rhs", "pass")))
+            ml.append(",".join(str(r[k]) for k in schemas["monotonicity"]))
         arts[f"cg_maisr_d4_monotonicity_{bid}.csv"] = "\n".join(ml)
-        sk_cols = [
-            "pack", "broad_ep_a", "broad_ep_b", "broad_years_a", "broad_years_b",
-            "broad_density_a", "broad_density_b", "broad_ratio", "broad_reason",
-            "subject_ep_a", "subject_ep_b", "eligible_held_symbol_days_a", "eligible_held_symbol_days_b",
-            "subject_density_a", "subject_density_b", "subject_ratio", "subject_reason",
-            "defensive_ep_a", "defensive_ep_b", "defensive_density_a", "defensive_density_b",
-            "defensive_ratio", "defensive_reason", "stability_ok",
-        ]
+
+        sk_cols = schemas["stability"]
         sl = [",".join(sk_cols)]
         for r in stab_rows:
-            sl.append(",".join(str(r.get(k, "NA")) for k in sk_cols))
+            sl.append(",".join(str(r.get(k, "0")) for k in sk_cols))
         arts[f"cg_maisr_d4_stability_{bid}.csv"] = "\n".join(sl)
-        es = ["pack,state,subject,episode_count,window"]
+
+        es = [",".join(schemas["episode_summary"])]
         for pid in [p["id"] for p in _D4_PACKS]:
             s = pack_stats[pid]
             es.append(f"{pid},BROAD_FAMILY,MACRO,{s['broad_family_episodes']},TRAIN")
             es.append(f"{pid},LOCAL_SECTOR,HELD,{s['local_sector_episodes']},TRAIN")
             es.append(f"{pid},DEFENSIVE,MACRO,{s['defensive_episodes']},TRAIN")
         arts[f"cg_maisr_d4_episode_summary_{bid}.csv"] = "\n".join(es)
+
         me, he = eps
-        el = ["pack,state,subject,start,end,n,day"]
+        el = [",".join(schemas["selected_episodes"])]
         for e in list(me) + list(he):
             el.append(f"{chosen_id or 'NONE'},{e['label']},{e['subject']},{e['start']},{e['end']},{e['n']},{e['day']}")
         if len(el) == 1:
-            el.append("NONE,NO_SELECTED_PACK,NONE,NA,NA,0,0")
+            el.append("NONE,NO_SELECTED_PACK,NONE,0,0,0,0")
         arts[f"cg_maisr_d4_selected_episodes_{bid}.csv"] = "\n".join(el)
-        kw = ["pack,window,broad_family_episodes,systemic_episodes,rate_episodes,"
-              "defensive_episodes,local_episodes,sector_episodes,eligible_held_symbol_days,"
-              "first_signal,last_signal,status"]
+
+        kw = [",".join(schemas["known_windows"])]
         for pack in _D4_PACKS:
             for wname, w0, w1 in _D4_KNOWN_WINDOWS:
                 wrows = [r for r in self._d4_raw if w0 <= r["do"] <= w1]
@@ -893,17 +912,17 @@ class CgMaisrD4OverlayMixin:
                 sec_w = sum(1 for e in he_w if e["label"] == "SECTOR_STRESS")
                 held_w = len(d4_held_pairs([r for r in wrows if d4_is_subject_row(r)]))
                 days = [e["day"] for e in list(me_w) + list(he_w)]
-                first_s = min(days) if days else "NA"
-                last_s = max(days) if days else "NA"
+                first_s = min(days) if days else 0
+                last_s = max(days) if days else 0
                 kw.append(
                     f"{pack['id']},{wname},{bf},{sys_w},{rate_w},{def_w},{loc_w},{sec_w},"
                     f"{held_w},{first_s},{last_s},AUDIT"
                 )
         arts[f"cg_maisr_d4_known_windows_{bid}.csv"] = "\n".join(kw)
-        cl = ["id,s,a,b,h,score,macro_f1,valid,validity_reason,selected,sig_hash,macro_sig_hash,subject_sig_hash,"
-              "combined_sig_hash,n,f1_BROAD,f1_LOCAL,f1_SECTOR,f1_DEF"]
+
+        cl = schemas["classifiers"]
         sel_ids = {r["id"] for r in chosen}
-        clines = [cl[0]]
+        clines = [",".join(cl)]
         for r in scored:
             f1 = r.get("f1") or {}
             clines.append(",".join(str(x) for x in [
@@ -915,44 +934,141 @@ class CgMaisrD4OverlayMixin:
                 _d4f(f1.get("SECTOR_STRESS"), 4), _d4f(f1.get("DEFENSIVE_ROTATION"), 4),
             ]))
         arts[f"cg_maisr_d4_classifiers_{bid}.csv"] = "\n".join(clines)
-        art_hashes = {k: _d4_sha(v) for k, v in arts.items()}
+
+        kind_map = {
+            f"cg_maisr_d4_identity_{bid}.csv": "identity",
+            f"cg_maisr_d4_symbol_roles_{bid}.csv": "symbol_roles",
+            f"cg_maisr_d4_gold_continuity_{bid}.csv": "gold_continuity",
+            f"cg_maisr_d4_distributions_{bid}.csv": "distributions",
+            f"cg_maisr_d4_subject_exposure_{bid}.csv": "subject_exposure",
+            f"cg_maisr_d4_pack_stats_{bid}.csv": "pack_stats",
+            f"cg_maisr_d4_monotonicity_{bid}.csv": "monotonicity",
+            f"cg_maisr_d4_stability_{bid}.csv": "stability",
+            f"cg_maisr_d4_episode_summary_{bid}.csv": "episode_summary",
+            f"cg_maisr_d4_selected_episodes_{bid}.csv": "selected_episodes",
+            f"cg_maisr_d4_known_windows_{bid}.csv": "known_windows",
+            f"cg_maisr_d4_classifiers_{bid}.csv": "classifiers",
+        }
+        req_nb = {
+            "identity": ["id", "pass", "n", "nav_diff_pct", "maxdd_diff_pp", "corr"],
+            "symbol_roles": ["symbol", "role", "source"],
+            "gold_continuity": ["metric", "value"],
+            "subject_exposure": ["symbol", "held_days_a", "held_days_b", "held_days_total",
+                                 "first_eligible_date", "last_eligible_date"],
+            "pack_stats": list(schemas["pack_stats"]),
+            "monotonicity": ["dimension", "fixed", "less_severe", "more_severe", "metric", "lhs", "rhs", "pass"],
+            "stability": list(schemas["stability"]),
+            "episode_summary": ["pack", "state", "subject", "episode_count", "window"],
+            "selected_episodes": ["pack", "state", "subject", "n", "day"],
+            "known_windows": ["pack", "window", "broad_family_episodes", "systemic_episodes",
+                              "rate_episodes", "defensive_episodes", "local_episodes",
+                              "sector_episodes", "eligible_held_symbol_days", "status"],
+            "classifiers": ["id", "s", "a", "b", "h", "score", "macro_f1", "valid",
+                            "validity_reason", "selected", "sig_hash", "macro_sig_hash",
+                            "subject_sig_hash", "combined_sig_hash", "n"],
+        }
+        opt_blank = {
+            "identity": {"peak", "trough", "recovery"},
+            "distributions": {"min", "p01", "p05", "p10", "p25", "p50", "p75", "p90", "p95", "p99", "max"},
+            "selected_episodes": {"start", "end"},
+            "known_windows": {"first_signal", "last_signal"},
+            "classifiers": {"f1_BROAD", "f1_LOCAL", "f1_SECTOR", "f1_DEF"},
+            "stability": {"subject_density_a", "subject_density_b", "subject_ratio",
+                          "broad_density_a", "broad_density_b", "broad_ratio",
+                          "defensive_density_a", "defensive_density_b", "defensive_ratio"},
+        }
+        ukeys = {
+            "pack_stats": "id",
+            "known_windows": ("pack", "window"),
+            "classifiers": "id",
+            "symbol_roles": "symbol",
+        }
+        val_rows = []
+        all_pass = True
+        fail_reason = ""
+        art_hashes = {}
+        for name in sorted(arts.keys()):
+            text = arts[name]
+            kind = kind_map[name]
+            schema = schemas[kind]
+            exp = d4_calibration_artifact_expected_rows(kind)
+            if exp is None:
+                exp = max(0, len(text.splitlines()) - 1)
+            if kind == "distributions":
+                vr = d4_validate_distributions_csv(text)
+            else:
+                vr = d4_validate_csv_artifact(
+                    name, text, schema, exp, req_nb.get(kind, schema[:1]),
+                    unique_key=ukeys.get(kind),
+                    optional_blank=opt_blank.get(kind))
+            passed = int(vr["pass"])
+            if not vr["pass"] and all_pass:
+                all_pass = False
+                fail_reason = f"ARTIFACT_VALIDATION_FAIL:{name}:{vr['reason']}"
+            sha = _d4_sha(text)
+            art_hashes[name] = sha
+            val_rows.append({
+                "artifact": name,
+                "bytes": len(text.encode("utf-8")),
+                "rows": vr["row_count"],
+                "expected_rows": exp,
+                "sha256": sha,
+                "exists": 1,
+                "schema_ok": int(vr["header_exact"]),
+                "row_count_ok": int(vr["row_count_ok"]),
+                "placeholder_only": int(vr["placeholder_only"]),
+                "pass": passed,
+            })
+
         manifest = {
-            "schema_version": "D4.1A", "source_commit": src,
+            "schema_version": "D4.2A", "source_commit": src,
             "selected_pack": chosen_id, "selected_classifiers": [r["id"] for r in chosen],
             "calibration_result": cal_result, "calibration_reason": cal_reason,
-            "artifact_sha256": art_hashes, "pack_support": pack_stats, "pack_stability": stab_rows,
+            "artifact_sha256": dict(art_hashes), "pack_support": pack_stats, "pack_stability": stab_rows,
             "gold_train_coverage": gold_cov, "coverage_ratio": cov.get("coverage_ratio"),
             "mono_ok": int(all(r["pass"] for r in mono_rows)),
         }
-        mhash, mraw = d4_manifest_hash(manifest)
+        mhash, _ = d4_manifest_hash(manifest)
         manifest["manifest_sha256"] = mhash
         mjson = json.dumps({**manifest, "manifest_sha256": mhash}, sort_keys=True, separators=(",", ":"))
-        arts[f"cg_maisr_d4_manifest_{bid}.json"] = mjson
-        art_hashes[f"cg_maisr_d4_manifest_{bid}.json"] = _d4_sha(mjson)
+        mname = f"cg_maisr_d4_manifest_{bid}.json"
+        arts[mname] = mjson
+        art_hashes[mname] = _d4_sha(mjson)
+        mvr = d4_validate_manifest_json(mjson, expected_sha=mhash)
+        m_pass = int(mvr["pass"])
+        if not mvr["pass"] and all_pass:
+            all_pass = False
+            fail_reason = f"ARTIFACT_VALIDATION_FAIL:{mname}:{mvr['reason']}"
+        val_rows.append({
+            "artifact": mname,
+            "bytes": len(mjson.encode("utf-8")),
+            "rows": 0,
+            "expected_rows": 0,
+            "sha256": art_hashes[mname],
+            "exists": 1,
+            "schema_ok": int(mvr["parse_ok"] and mvr["keys_ok"]),
+            "row_count_ok": 1,
+            "placeholder_only": 0,
+            "pass": m_pass,
+        })
+
+        self_c = d4_artifact_validation_self_contract()
         vl = ["artifact,bytes,rows,expected_rows,sha256,exists,schema_ok,row_count_ok,placeholder_only,pass"]
-        expected = {
-            f"cg_maisr_d4_known_windows_{bid}.csv": 48,
-            f"cg_maisr_d4_distributions_{bid}.csv": 39,
-            f"cg_maisr_d4_pack_stats_{bid}.csv": 12,
-            f"cg_maisr_d4_stability_{bid}.csv": 12,
-        }
-        for name, text in sorted(arts.items()):
-            rows_n = max(0, len(text.splitlines()) - 1) if text else 0
-            exp = expected.get(name, rows_n)
-            ph = int(d4_is_placeholder_csv(text))
-            schema_ok = 1 if text and "," in text.splitlines()[0] else 0
-            row_ok = 1 if rows_n == exp or name not in expected else 0
-            passed = int(schema_ok and row_ok and not ph and len(text.encode("utf-8")) > 0)
-            vl.append(
-                f"{name},{len(text.encode('utf-8'))},{rows_n},{exp},"
-                f"{art_hashes.get(name, _d4_sha(text))},1,{schema_ok},{row_ok},{ph},{passed}"
-            )
-        arts[f"cg_maisr_d4_artifact_validation_{bid}.csv"] = "\n".join(vl)
-        art_hashes[f"cg_maisr_d4_artifact_validation_{bid}.csv"] = _d4_sha(arts[f"cg_maisr_d4_artifact_validation_{bid}.csv"])
+        for vr in val_rows:
+            vl.append(",".join(str(vr[k]) for k in (
+                "artifact", "bytes", "rows", "expected_rows", "sha256", "exists",
+                "schema_ok", "row_count_ok", "placeholder_only", "pass")))
+        vl.append(",".join([
+            self_c["artifact"], 0, len(val_rows), len(val_rows), self_c["sha256"],
+            1, 1, 1, 0, int(all_pass),
+        ]))
+        vname = f"cg_maisr_d4_artifact_validation_{bid}.csv"
+        arts[vname] = "\n".join(vl)
+
         self._d4_art_used = 0
         for name, text in arts.items():
             self._D4Emit(name, text)
-        return mhash, arts
+        return mhash, arts, all_pass, fail_reason
 
     def _D4ExecutionProofEOA(self, parity_ok) -> bool:
         self._MsLog(
@@ -964,7 +1080,7 @@ class CgMaisrD4OverlayMixin:
     def _D4CompareLedIdentity(self, led, label):
         if led is None:
             self._MsLog(
-                f"CG_MAISR_D4_1_IDENTITY_FINAL,id={label},pass=NO,identity_observed=NO"
+                f"CG_MAISR_D42_IDENTITY_FINAL,id={label},pass=NO,identity_observed=NO"
             )
             return False
         cmp_fn = getattr(self, "CgShadowIdentityCompare", None)
@@ -974,7 +1090,7 @@ class CgMaisrD4OverlayMixin:
         synth0 = int(led.get("synth_fills", 0) or 0) == 0
         passed = bool(cmp.get("pass")) and synth0
         self._MsLog(
-            f"CG_MAISR_D4_1_IDENTITY_FINAL,id={label},pass={'YES' if passed else 'NO'},"
+            f"CG_MAISR_D42_IDENTITY_FINAL,id={label},pass={'YES' if passed else 'NO'},"
             f"identity_observed=YES,n={cmp.get('n',0)},nav_diff_pct={_d4f(cmp.get('nav_d'),6)},"
             f"synth_fills={led.get('synth_fills',0)}"
         )
