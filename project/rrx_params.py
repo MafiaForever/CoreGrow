@@ -34,6 +34,7 @@ RRX_PARAMS = {
     "cg_maisr_d4_selected_classifiers": "",
     "cg_maisr_d4_manifest_sha256":     "",
     "cg_maisr_d4_export_detail":       "1",
+    "cg_maisr_d4_source_commit":       "",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
