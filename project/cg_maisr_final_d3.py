@@ -688,7 +688,7 @@ class CgMaisrFinalD3Mixin:
         roles = {}
         for tk in sorted(set(panel) | held_seen | set(_D3_SAT) | set(_D3_DEF_TK)):
             src = "panel"
-            if tk in _D3_PARK or tk in ("BIL", "SGOV", "USFR"):
+            if tk in _D2_PARK or tk in ("BIL", "SGOV", "USFR"):
                 role, src = "PARKING", "cash_parking"
             elif tk in _D3_INV:
                 role, src = "INVERSE_CONFIRM", "sh_confirm"
