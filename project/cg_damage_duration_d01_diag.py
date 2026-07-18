@@ -17,6 +17,10 @@ from cg_damage_duration_d02_sensor import (
     PRIOR_ATR_SOURCE, D30_D45_RUNTIME_SOURCE, EXPERIMENT as D02_EXPERIMENT,
     PHASE as D02_PHASE, empty_sensor_counters,
 )
+from cg_damage_duration_d02_features import (
+    FeatureCollector, run_all_d02b_static_tests, SCHEMA_VERSION as D02B_SCHEMA,
+    EXPERIMENT as D02B_EXPERIMENT, PHASE as D02B_PHASE,
+)
 
 _SH_ACTIVE = frozenset(("HEDGED", "ENTRY_PENDING", "EXIT_PENDING"))
 
@@ -49,6 +53,13 @@ class CgDamageDurationD01DiagMixin:
             self._DamageD01OnAcceptedBar(tk, et, o, h, l, c)
         if getattr(self, "cg_damage_duration_d02_enable", False):
             self._DamageD02OnAcceptedBar(tk, et, o, h, l, c)
+            fc = getattr(self, "_dmg_d02_features", None)
+            if fc is not None:
+                try:
+                    t = self.time if isinstance(getattr(self, "time", None), datetime) else None
+                    fc.on_accepted_bar(tk, et, o, h, l, c, decision_time=t)
+                except Exception:
+                    self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1
 
     def _DamageD01WantEval(self):
         return bool(getattr(self, "cg_damage_duration_d01_enable", False)
@@ -118,6 +129,7 @@ class CgDamageDurationD01DiagMixin:
         if getattr(self, "_dmg_ledger", None) is None:
             self._dmg_ledger = DamageEpisodeLedger(confirmation_minutes=CONFIRMATION_WINDOW_MINUTES)
         self._dmg_d02_sensor = DamageD02Sensor()
+        self._dmg_d02_features = FeatureCollector()
         self._dmg_d02_ctr = empty_sensor_counters()
         self._dmg_d02_err = 0
         self._dmg_prev_prot = getattr(self, "_dmg_prev_prot", False)
@@ -126,8 +138,9 @@ class CgDamageDurationD01DiagMixin:
         self._dmg_sub_changes = int(getattr(self, "_dmg_sub_changes", 0) or 0)
         self._dmg_target_mut = int(getattr(self, "_dmg_target_mut", 0) or 0)
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        if "CG_DAMAGE_D02_" not in lp:
-            lp.append("CG_DAMAGE_D02_")
+        for pref in ("CG_DAMAGE_D02_", "CG_DAMAGE_D02B_"):
+            if pref not in lp:
+                lp.append(pref)
         self.log_only_prefixes = lp
         try:
             import inspect
@@ -136,12 +149,21 @@ class CgDamageDurationD01DiagMixin:
             sens_src = ""
         rep = run_damage_d02a_static_tests(D02_FROZEN_DEFAULTS, sens_src, "")
         self._dmg_d02_static = rep
+        try:
+            rep_b = run_all_d02b_static_tests()
+        except Exception:
+            rep_b = {"passed": 0, "failed": 1, "total": 1}
+        self._dmg_d02b_static = rep_b
         self._DamageD01Log(
             f"CG_DAMAGE_D02A_INIT,enable=1,tests={rep['passed']}/{rep['total']},"
             f"atr_source={PRIOR_ATR_SOURCE},runtime_source={D30_D45_RUNTIME_SOURCE},"
             f"macro_resid_b1_required=0,diagnostic_real_orders=0"
         )
-        if rep["failed"]:
+        self._DamageD01Log(
+            f"CG_DAMAGE_D02B_INIT,enable=1,tests={rep_b.get('passed', 0)}/{rep_b.get('total', 0)},"
+            f"schema={D02B_SCHEMA},feature_collector=1,event_memory=1"
+        )
+        if rep["failed"] or int(rep_b.get("failed", 1) or 0):
             self._dmg_d02_err += 1
 
     def _DamageD01Log(self, msg):
@@ -277,10 +299,29 @@ class CgDamageDurationD01DiagMixin:
                     b1_vp = vp
             sens_snap = sens.evaluate(
                 t, atr_map, source_macro_resid_enabled=b1_on, b1_variant_pass=b1_vp)
+            ck = (t.date().toordinal(), int(tod))
             if sens_snap is not None:
-                ck = (t.date().toordinal(), int(tod))
                 sens.attach_to_ledger(led, sens_snap, protection_source=src,
                                       bar_end_times=bars, checkpoint_key=ck)
+            # D0.2B feature collector + event memory (after sensor/ledger)
+            fc = getattr(self, "_dmg_d02_features", None)
+            if fc is not None:
+                ep = led.current_open() if led is not None else None
+                nav = "UNAVAILABLE"
+                try:
+                    nav = float(self.portfolio.total_portfolio_value)
+                except Exception:
+                    try:
+                        nav = float(self.Portfolio.TotalPortfolioValue)
+                    except Exception:
+                        nav = "UNAVAILABLE"
+                # action-eligible: first bar end > t among known ends
+                act = None
+                for et in sorted(bars):
+                    if et is not None and et > t:
+                        act = et
+                        break
+                fc.build_snapshot(t, ck, sens_snap, ep, nav, src, action_eligible_time=act)
             self._dmg_prev_prot = active
             self._dmg_d02_ctr = dict(sens.counters)
             self._dmg_ctr = dict(led.counters)
@@ -349,7 +390,17 @@ class CgDamageDurationD01DiagMixin:
                 f"CG_DAMAGE_D02A_CLOSEOUT,experiment={D02_EXPERIMENT},phase={D02_PHASE},"
                 f"static={rep.get('passed', 0)}/{rep.get('total', 0)},"
                 f"runtime_source={D30_D45_RUNTIME_SOURCE},"
-                f"next=D0.2B_FEATURE_EVENT_MEMORY_COLLECTOR"
+                f"next=D0.2C_CHANGE_POINT_STRUCTURE_FEATURES"
+            )
+            rep_b = getattr(self, "_dmg_d02b_static", None) or {}
+            fc = getattr(self, "_dmg_d02_features", None)
+            n_snap = int(getattr(fc, "counters", {}).get("feature_snapshots", 0) or 0) if fc else 0
+            self._DamageD01Log(
+                f"CG_DAMAGE_D02B_CLOSEOUT,experiment={D02B_EXPERIMENT},phase={D02B_PHASE},"
+                f"static={rep_b.get('passed', 0)}/{rep_b.get('total', 0)},"
+                f"feature_snapshots={n_snap},feature_collector=IMPLEMENTED,"
+                f"event_memory=IMPLEMENTED,recovery_score=NOT_IMPLEMENTED,"
+                f"next=D0.2C_CHANGE_POINT_STRUCTURE_FEATURES"
             )
         except Exception as e:
             self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1

@@ -250,6 +250,14 @@ class DamageD02Sensor:
         self._last_emit_key = None
         self._last_snapshot = None
 
+    def get_last_snapshot(self):
+        """Read-only accessor for D0.2B collector."""
+        return self._last_snapshot
+
+    def get_bars_le(self, decision_time):
+        """Read-only closed bars EndTime<=t for SENSOR_SYMBOLS."""
+        return {tk: self.buf.closes_le(tk, decision_time) for tk in SENSOR_SYMBOLS}
+
     def on_accepted_bar(self, tk, end_time, o, h, l, c, decision_time=None):
         ok = self.buf.accept_bar(tk, end_time, o, h, l, c, decision_time=decision_time)
         # merge buffer counters
