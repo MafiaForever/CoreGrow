@@ -1,8 +1,8 @@
 # cg_macro_resid_b1_diag.py -- CG-MACRO-RESID-B1 LEAN mixin.
 from AlgorithmImports import *
-from collections import defaultdict, deque
+from collections import defaultdict
 from datetime import timedelta, date, datetime, time
-import base64, zlib
+import base64, bisect, zlib
 from cg_macro_resid_b1_core import (
     MACRO_A1_CLOSEOUT, RESID_PXY5, RESID_BREADTH, RESID_VARIANTS, RESID_HORIZONS, RESID_TRUTH_PACK,
     resid_protection_snapshot, resid_stratum, resid_eval_variants, resid_session_peak_dd_atr,
@@ -39,8 +39,14 @@ class CgMacroResidB1DiagMixin:
         self._resid_meta = {}
         self._resid_truth = []
         self._resid_truth_by_key = {}
-        self._resid_rings = {tk: deque(maxlen=500) for tk in RESID_PXY5}
+        # Full-history open series for EOA pricing (bisect); session closes for causal features.
+        self._resid_open_et = {tk: [] for tk in RESID_PXY5}
+        self._resid_open_px = {tk: [] for tk in RESID_PXY5}
+        self._resid_sess_day = None
+        self._resid_sess_closes = {tk: [] for tk in RESID_PXY5}
         self._resid_daily_1555 = {tk: {} for tk in RESID_PXY5}
+        self._resid_spy_days = []
+        self._resid_price_cache = {}
         self._resid_tod_hist = defaultdict(list)
         self._resid_data = {
             tk: {"accepted": 0, "dup": 0, "oo": 0, "first": None, "last": None,
@@ -142,31 +148,42 @@ class CgMacroResidB1DiagMixin:
             d["oos_days"].add(do)
         elif _CR0 <= do <= _CR1:
             d["crisis_days"].add(do)
-        self._resid_rings[tk].append((et, float(o), float(c)))
+        if et is not None and o is not None and float(o) > 0:
+            self._resid_open_et[tk].append(et)
+            self._resid_open_px[tk].append(float(o))
         try:
+            day_ord = et.date().toordinal() if hasattr(et, "date") else do
+            if self._resid_sess_day != day_ord:
+                self._resid_sess_day = day_ord
+                for s in RESID_PXY5:
+                    self._resid_sess_closes[s] = []
+            if c is not None:
+                self._resid_sess_closes[tk].append(float(c))
             if et is not None and (et.hour * 60 + et.minute) >= 955:
-                day_ord = et.date().toordinal() if hasattr(et, "date") else do
                 if day_ord not in self._resid_daily_1555[tk]:
                     self._resid_daily_1555[tk][day_ord] = float(o)
         except Exception:
             self._resid_err += 1
 
+    def _MacroResidB1BuildPriceIndex(self):
+        self._resid_price_cache = {}
+        self._resid_spy_days = sorted(self._resid_daily_1555.get("SPY") or {})
+
     def _MacroResidB1NextOpen(self, tk, after_t):
-        for et, o, _c in self._resid_rings.get(tk) or []:
-            if et is not None and et > after_t and o and float(o) > 0:
-                return float(o), et
+        ets = self._resid_open_et.get(tk) or []
+        if not ets or after_t is None:
+            return None, None
+        i = bisect.bisect_right(ets, after_t)
+        px = self._resid_open_px.get(tk) or []
+        while i < len(ets):
+            o = px[i] if i < len(px) else None
+            if o is not None and float(o) > 0:
+                return float(o), ets[i]
+            i += 1
         return None, None
 
     def _MacroResidB1SessionCloses(self, tk):
-        sess = self.time.date()
-        out = []
-        for et, _o, c in self._resid_rings.get(tk) or []:
-            try:
-                if et.date() == sess and c is not None:
-                    out.append(float(c))
-            except Exception:
-                continue
-        return out
+        return list(self._resid_sess_closes.get(tk) or [])
 
     def _MacroResidB1Vix(self):
         sess = self.time.date()
@@ -308,11 +325,12 @@ class CgMacroResidB1DiagMixin:
         if horizon == "HCLOSE":
             return sig_t.replace(hour=15, minute=55, second=0, microsecond=0)
         sig_day = sig_t.date().toordinal() if hasattr(sig_t, "date") else int(sig_t)
-        days = sorted(d for d in (self._resid_daily_1555.get("SPY") or {}) if d > sig_day)
+        days = self._resid_spy_days or sorted(self._resid_daily_1555.get("SPY") or {})
+        i = bisect.bisect_right(days, sig_day)
         if horizon == "HNEXT":
-            tgt = days[0] if days else None
+            tgt = days[i] if i < len(days) else None
         elif horizon == "H3D":
-            tgt = days[2] if len(days) > 2 else None
+            tgt = days[i + 2] if (i + 2) < len(days) else None
         else:
             return None
         if tgt is None:
@@ -320,8 +338,12 @@ class CgMacroResidB1DiagMixin:
         return datetime.combine(date.fromordinal(int(tgt)), time(15, 55))
 
     def _MacroResidB1PriceEvent(self, sig_t, horizon):
+        cache_key = (sig_t, horizon)
+        if cache_key in self._resid_price_cache:
+            return self._resid_price_cache[cache_key]
         exit_t = self._MacroResidB1ExitThreshold(sig_t, horizon)
         if exit_t is None:
+            self._resid_price_cache[cache_key] = None
             return None
         symbol_prices = {}
         if horizon in ("H60", "HCLOSE"):
@@ -347,18 +369,25 @@ class CgMacroResidB1DiagMixin:
         if br is None:
             if miss:
                 self._resid_missing_price += 1
+            self._resid_price_cache[cache_key] = None
             return None
+        self._resid_price_cache[cache_key] = br
         return br
 
     def _MacroResidB1TruthHit(self, sig_t):
         end = sig_t + timedelta(minutes=60)
-        for ep in self._resid_truth:
-            if ep.get("label") not in _TRUTH_FAMILY:
-                continue
-            ets = ep.get("ts")
-            if ets is not None and sig_t <= ets <= end:
-                return 1
-        return 0
+        idx = getattr(self, "_resid_truth_idx", None)
+        if idx is None:
+            rows = [ep for ep in (self._resid_truth or []) if ep.get("label") in _TRUTH_FAMILY and ep.get("ts") is not None]
+            rows.sort(key=lambda x: x["ts"])
+            self._resid_truth_idx = rows
+            idx = rows
+        if not idx:
+            return 0
+        ts_list = [ep["ts"] for ep in idx]
+        lo = bisect.bisect_left(ts_list, sig_t)
+        hi = bisect.bisect_right(ts_list, end)
+        return 1 if lo < hi else 0
 
     def _MacroResidB1NavByDay(self):
         dates = list(getattr(self, "_sr_dates", []) or [])
@@ -405,10 +434,11 @@ class CgMacroResidB1DiagMixin:
         }
 
     def _MacroResidB1AttachExcess(self, events):
+        bl_by_var = {v["id"]: resid_select_baselines(self._resid_obs, v["id"]) for v in RESID_VARIANTS}
+        bl_by_key = {vid: {b.get("baseline_key"): b for b in rows} for vid, rows in bl_by_var.items()}
         bl_cache = {}
-        for v in RESID_VARIANTS:
-            vid = v["id"]
-            for b in resid_select_baselines(self._resid_obs, vid):
+        for vid, rows in bl_by_var.items():
+            for b in rows:
                 k = b.get("baseline_key")
                 for hz in RESID_HORIZONS:
                     br = self._MacroResidB1PriceEvent(b["t"], hz)
@@ -426,18 +456,19 @@ class CgMacroResidB1DiagMixin:
             sig_day = int(e.get("day", 0))
             e["prod_d1"] = resid_prod_nav_return(nav, sig_day, 1)
             e["prod_d3"] = resid_prod_nav_return(nav, sig_day, 3)
-            bl_row = next((b for b in resid_select_baselines(self._resid_obs, vid)
-                           if b.get("baseline_key") == key), None)
+            bl_row = (bl_by_key.get(vid) or {}).get(key)
             if bl_row is not None:
                 bl_day = int(bl_row.get("day", sig_day))
                 bl_d1 = resid_prod_nav_return(nav, bl_day, 1)
                 bl_d3 = resid_prod_nav_return(nav, bl_day, 3)
+                # production excess loss = baseline return - signal return
                 if e.get("prod_d1") is not None and bl_d1 is not None:
-                    e["prod_d1_excess"] = float(e["prod_d1"]) - float(bl_d1)
+                    e["prod_d1_excess"] = float(bl_d1) - float(e["prod_d1"])
                 if e.get("prod_d3") is not None and bl_d3 is not None:
-                    e["prod_d3_excess"] = float(e["prod_d3"]) - float(bl_d3)
+                    e["prod_d3_excess"] = float(bl_d3) - float(e["prod_d3"])
 
     def _MacroResidB1BuildEvents(self):
+        self._MacroResidB1BuildPriceIndex()
         candidates = []
         vmap = {v["id"]: v for v in RESID_VARIANTS}
         for obs in self._resid_obs:
