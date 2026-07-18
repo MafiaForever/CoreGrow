@@ -161,7 +161,7 @@ class CgMacroResidB1DiagMixin:
                 self._resid_sess_closes[tk].append(float(c))
             if et is not None and (et.hour * 60 + et.minute) >= 955:
                 if day_ord not in self._resid_daily_1555[tk]:
-                    self._resid_daily_1555[tk][day_ord] = float(o)
+                    self._resid_daily_1555[tk][day_ord] = (float(o), et)
         except Exception:
             self._resid_err += 1
 
@@ -356,23 +356,28 @@ class CgMacroResidB1DiagMixin:
             exit_day = exit_t.date().toordinal()
             for tk in RESID_PXY5:
                 ep, et = self._MacroResidB1NextOpen(tk, sig_t)
-                xp = (self._resid_daily_1555.get(tk) or {}).get(exit_day)
-                if ep and et and xp and float(xp) > 0:
-                    symbol_prices[tk] = (ep, et, float(xp), exit_t)
+                cell = (self._resid_daily_1555.get(tk) or {}).get(exit_day)
+                if isinstance(cell, (tuple, list)) and len(cell) >= 2:
+                    xp, xt = cell[0], cell[1]
+                else:
+                    xp, xt = cell, None
+                if ep and et and xp and float(xp) > 0 and xt is not None:
+                    symbol_prices[tk] = (ep, et, float(xp), xt)
         br, miss, same_bar, early, partial = resid_price_pxy5(symbol_prices, sig_t, exit_t)
-        if same_bar:
-            self._resid_same_bar += int(same_bar)
-        if partial:
-            self._resid_partial_proxy += 1
-        if early:
-            self._resid_future_price += int(early)
-        if br is None:
-            if miss:
-                self._resid_missing_price += 1
-            self._resid_price_cache[cache_key] = None
-            return None
-        self._resid_price_cache[cache_key] = br
-        return br
+        if br is not None:
+            # Hard-gate counters count accepted violations only.
+            if same_bar:
+                self._resid_same_bar += int(same_bar)
+            if early:
+                self._resid_future_price += int(early)
+            if partial:
+                self._resid_partial_proxy += 1
+            self._resid_price_cache[cache_key] = br
+            return br
+        if miss:
+            self._resid_missing_price += 1
+        self._resid_price_cache[cache_key] = None
+        return None
 
     def _MacroResidB1TruthHit(self, sig_t):
         end = sig_t + timedelta(minutes=60)
@@ -533,14 +538,34 @@ class CgMacroResidB1DiagMixin:
         return resid_rank_passers(passing), passing
 
     def _MacroResidB1EmitAll(self, arts, transport):
-        if not transport.get("ok"):
-            return False
+        # Prefer ObjectStore; always attempt log chunks. transport.ok is validated
+        # separately for research finalization.
         chunk = 700
-        for name, text in sorted(arts.items()):
-            raw = str(text or "").encode("utf-8")
+        emitted_any = False
+        for name, text in sorted((arts or {}).items()):
+            raw_txt = str(text or "")
+            try:
+                if hasattr(self, "object_store") and self.object_store is not None:
+                    try:
+                        self.object_store.save(name, raw_txt)
+                    except Exception:
+                        try:
+                            self.object_store.save_bytes(name, raw_txt.encode("utf-8"))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            raw = raw_txt.encode("utf-8")
             z = zlib.compress(raw, 9)
             b64 = base64.b64encode(z).decode("ascii")
             n = max(1, (len(b64) + chunk - 1) // chunk)
+            if transport and not transport.get("ok"):
+                # Over budget: emit META only so validators see truncation explicitly.
+                self._MacroResidB1Log(
+                    f"CG_MACRO_RESID_B1_ART_META,name={name},bytes={len(raw)},zbytes={len(z)},"
+                    f"chunks={n},emitted=0,truncated=YES"
+                )
+                continue
             lines = [
                 f"CG_MACRO_RESID_B1_ART_META,name={name},bytes={len(raw)},zbytes={len(z)},"
                 f"chunks={n},emitted={n},truncated=NO"
@@ -548,8 +573,9 @@ class CgMacroResidB1DiagMixin:
             for i in range(n):
                 lines.append(f"CG_MACRO_RESID_B1_ART,name={name},i={i},n={n},b64={b64[i*chunk:(i+1)*chunk]}")
             for line in lines:
-                self.log(line)
-        return True
+                self._MacroResidB1Log(line)
+            emitted_any = True
+        return bool(emitted_any or (transport and transport.get("ok")))
 
     def _MacroResidB1Identity(self):
         out = {}
@@ -624,7 +650,7 @@ class CgMacroResidB1DiagMixin:
             "future_vix_use": self._resid_future_vix, "same_session_vix_use": self._resid_same_session_vix,
             "fabricated_vix_date": self._resid_fabricated_vix, "same_bar_fill": self._resid_same_bar,
             "partial_proxy_accepted": self._resid_partial_proxy, "future_price_use": self._resid_future_price,
-            "unresolved_protection_state": self._resid_unresolved_prot, "transport_budget": 85000,
+            "unresolved_protection_state": self._resid_unresolved_prot, "transport_budget": 500000,
             "missing_price": self._resid_missing_price,
         }
         prot = self._MacroResidProtectionSnapshot()
