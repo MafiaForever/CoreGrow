@@ -8,6 +8,7 @@ from cg_maisr_final_d3 import CgMaisrFinalD3Mixin
 from cg_maisr_d4_overlay import CgMaisrD4OverlayMixin
 from cg_macro_resid_b1_diag import CgMacroResidB1DiagMixin
 from cg_macro_a1_diag import CgMacroA1DiagMixin
+from cg_damage_duration_d01_diag import CgDamageDurationD01DiagMixin as _DD01
 from cg_maisr_ms_classify import ms_classify
 # endregion
 # cg_maisr_diag.py -- CG-MAISR-D0/P1/D2 multi-asset stress router (diagnostic only).
@@ -80,7 +81,7 @@ def _f(x, d=4):
         return "NA"
 
 
-class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
+class CgMaisrDiagMixin(_DD01, CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4OverlayMixin, CgMaisrFinalD3Mixin, CgMaisrD2DiagMixin, CgMaisrP1Mixin):
     """CG-MAISR-D0: multi-asset stress classifier grid + 324-policy router sim."""
 
     def CgMaisrInit(self) -> None:
@@ -111,6 +112,7 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
         self._D4ReadParams(_p, _bool)
         self._MacroA1ReadParams(_p, _bool)
         self._MacroResidB1ReadParams(_p, _bool)
+        self._DamageD01ReadParams(_p, _bool)
         self._ms_cost_bps = _float("cg_maisr_cost_bps", 0.0)
         self._ms_on = bool(self.cg_maisr_diag_enable)
         if getattr(self, "cg_maisr_d4_enable", False):
@@ -122,6 +124,7 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
         if getattr(self, "cg_macro_resid_b1_enable", False):
             self._ms_on = True
             self.cg_maisr_diag_enable = True
+        self._DamageD01MaybeEnableMs()
         self._ms_grid_on = bool(self._ms_on and self.cg_maisr_grid_enable)
         self._ms_emit = bool(self._ms_on and self.cg_maisr_emit_events)
         self._ms_log_used = 0
@@ -241,6 +244,7 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
             self._MacroResidB1InitHooks()
         except Exception:
             self._ms_err += 1
+        self._DamageD01InitHooksSafe()
 
     def _MsAuditSubscriptions(self) -> None:
         want = set()
@@ -395,6 +399,7 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
                             self._MacroA1OnAcceptedBar(tk, et, o, h, l, c)
                         if getattr(self, "cg_macro_resid_b1_enable", False) and hasattr(self, "_MacroResidB1OnAcceptedBar"):
                             self._MacroResidB1OnAcceptedBar(tk, et, o, h, l, c)
+                        self._DamageD01OnAcceptedBarSafe(tk, et, o, h, l, c)
                     except Exception:
                         self._ms_err += 1
                 if self.cg_maisr_identity_only:
@@ -538,8 +543,9 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
         try:
             macro = bool(getattr(self, "cg_macro_a1_enable", False))
             resid = bool(getattr(self, "cg_macro_resid_b1_enable", False))
+            dmg = self._DamageD01WantEval()
             if (getattr(self, "cg_maisr_label_only", False) or getattr(self, "_d2_mode", False)
-                    or d4 or macro or resid):
+                    or d4 or macro or resid or dmg):
                 if d4:
                     self._d4_last_subjects = bytes(subjects)
                 self._D2OnEval(kind, tod, bytes(states), feat)
@@ -549,6 +555,7 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
                     self._MacroA1OnEval(kind, tod, bytes(states), feat)
                 if resid and hasattr(self, "_MacroResidB1OnEval"):
                     self._MacroResidB1OnEval(kind, tod, bytes(states), feat)
+                self._DamageD01OnEvalSafe(kind, tod, bytes(states), feat)
         except Exception:
             self._ms_err += 1
         if kind == "PRE":
@@ -1084,6 +1091,8 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
                             "reason=shadow_replay_parity_failed")
                 return
 
+            if self.CgDamageD01TryEOA(parity_ok):
+                return
             if getattr(self, "cg_macro_resid_b1_enable", False):
                 try:
                     if self.CgMacroResidB1OnEndOfAlgorithm(parity_ok):
