@@ -868,44 +868,17 @@ def run_resid_b1_static_tests():
     ok(58, "artifact_failure_not_stop", f58["fin"]["research_conclusion"] == "NOT_REACHED")
     ok(59, "no_real_order_path", RESID_B1_DEFAULTS["cg_macro_resid_b1_enable"] == 0)
     ok(60, "diagnostic_defaults_off", RESID_B1_DEFAULTS["cg_macro_a1_enable"] == 0 and RESID_B1_DEFAULTS["cg_macro_resid_b1_enable"] == 0)
+    from cg_macro_resid_b11_export import run_resid_b11_extra_tests
+    extra, _ep, _en = run_resid_b11_extra_tests()
+    R.extend(extra)
     by_n = {r["n"]: r for r in R}
-    uniq = [by_n[i] for i in range(1, 61) if i in by_n]
+    uniq = [by_n[i] for i in range(1, 79) if i in by_n]
     return uniq, sum(1 for r in uniq if r["pass"]), len(uniq)
 
 
 def run_resid_b1_eoa_dryrun():
-    idb = {"REPLAY": {"pass": True, "n": 1, "nav_d": 0, "dd_d": 0, "corr": 1},
-           "PIPELINE_OFF": {"pass": True, "n": 1, "nav_d": 0, "dd_d": 0, "corr": 1},
-           "SENSOR": {"pass": True, "n": 1, "nav_d": 0, "dd_d": 0, "corr": 1}}
-    prot = resid_protection_snapshot({"_ids_state": "NORMAL", "_panic_state": "NORMAL"})
-    passed = 0
-    sc = [
-        ("A", {}, [], []),
-        ("B", {}, [], []),
-        ("C", {}, [{"id": "D30_C0_BREADTH", "pass": True}], []),
-        ("D", {}, [{"id": "D30_C0_BREADTH", "pass": True}], [{"holdings": {"SPY": 1.0}, "pass": True}]),
-        ("E", {"SPY": "minute", "XLE": "daily"}, [{"id": "D30_C0_BREADTH", "pass": True}], [{"holdings": {"SPY": 0.5, "XLE": 0.5}, "pass": True}]),
-        ("F", {c: "daily" for c in "ABCDEFGHIJK"}, [{"id": "D30_C0_BREADTH", "pass": True}], [{"holdings": {c: 0.1 for c in "ABCDEFGHIJK"}, "pass": True}]),
-        ("G", {}, [], []),
-    ]
-    for tag, subs, passing, sev in sc:
-        try:
-            p = prot if tag != "G" else resid_protection_snapshot({"_ids_state": "NORMAL"})
-            out = resid_finalize_research([], idb, tag != "G", {"transport_budget": 85000}, {}, "c" * 40, p,
-                                          passing_variants=passing, subscription_events=sev, symbol_sub_types=subs, bid=f"DRY{tag}")
-            if tag == "G":
-                ok_sc = out["fin"].get("reason") == "PROTECTION_STATE_UNRESOLVED"
-            else:
-                ok_sc = isinstance(out.get("fin", {}).get("result"), str) and out.get("manifest_sha256")
-            if tag == "A" and out["fin"].get("research_conclusion") not in ("STOP_MACRO_RESID_B1", "NOT_REACHED"):
-                ok_sc = False
-            if ok_sc:
-                passed += 1
-        except Exception:
-            pass
-    line = f"CG_MACRO_RESID_B1_EOA_DRYRUN_FINAL,scenarios=7,pass={passed},fail={7 - passed}"
-    print(line)
-    return line
+    from cg_macro_resid_b11_export import run_resid_b11_eoa_dryrun
+    return run_resid_b11_eoa_dryrun()
 
 
 if __name__ == "__main__":

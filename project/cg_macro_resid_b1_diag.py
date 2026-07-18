@@ -6,10 +6,14 @@ import base64, bisect, zlib
 from cg_macro_resid_b1_core import (
     MACRO_A1_CLOSEOUT, RESID_PXY5, RESID_BREADTH, RESID_VARIANTS, RESID_HORIZONS, RESID_TRUTH_PACK,
     resid_protection_snapshot, resid_stratum, resid_eval_variants, resid_session_peak_dd_atr,
-    resid_15m_return, resid_vix_stress, resid_decluster_events, resid_price_pxy5, resid_proxy_benefit,
-    resid_finalize_research, resid_pass_gate, resid_rank_passers, resid_neighbor_variant,
+    resid_15m_return, resid_vix_stress, resid_decluster_events, resid_proxy_benefit,
+    resid_pass_gate, resid_rank_passers, resid_neighbor_variant,
     resid_window_for_day, resid_bucket, resid_baseline_keys, resid_prod_nav_return, resid_select_baselines,
     run_resid_b1_static_tests, run_resid_b1_eoa_dryrun, resid_material_symbols, resid_windows,
+)
+from cg_macro_resid_b11_export import (
+    resid_update_close_proxy, resid_exit_threshold, resid_price_pxy5_detail, resid_apply_price_counters,
+    resid_empty_counters, resid_b11_finalize, TIER1_BUDGET,
 )
 from cg_macro_a1_core import (
     macro_vix_snapshot, macro_rv30, macro_path_efficiency, macro_down_efficiency,
@@ -56,8 +60,10 @@ class CgMacroResidB1DiagMixin:
         z = 0
         self._resid_err = self._resid_real_orders = self._resid_art_used = z
         self._resid_future_vix = self._resid_same_session_vix = self._resid_fabricated_vix = z
-        self._resid_vix_ts_unavail = self._resid_same_bar = self._resid_early_restore = z
-        self._resid_partial_proxy = self._resid_future_price = self._resid_missing_price = z
+        self._resid_vix_ts_unavail = z
+        self._resid_ctr = resid_empty_counters()
+        self._resid_coverage_meta = []
+        self._resid_detail_signals = []
         self._resid_unresolved_prot = self._resid_r0 = self._resid_r1 = self._resid_r2 = z
         self._resid_vix_cache = self._resid_vix_cache_day = None
         co = MACRO_A1_CLOSEOUT
@@ -69,17 +75,18 @@ class CgMacroResidB1DiagMixin:
         src = getattr(self, "cg_macro_resid_b1_source_commit", "") or ""
         src_ok, src_rsn = d4_validate_source_commit(src)
         self._MacroResidB1Log(
-            f"CG_MACRO_RESID_B1_INIT,enable=1,source_commit={src or 'NONE'},"
+            f"CG_MACRO_RESID_B11_INIT,enable=1,source_commit={src or 'NONE'},"
             f"source_ok={int(src_ok)},detail={src_rsn},export={int(self.cg_macro_resid_b1_export_detail)}"
         )
         _rows, p, n = run_resid_b1_static_tests()
-        self._MacroResidB1Log(f"CG_MACRO_RESID_B1_STATIC_FINAL,tests={p}/{n}")
+        self._MacroResidB1Log(f"CG_MACRO_RESID_B11_STATIC_FINAL,tests={p}/{n}")
         dry = run_resid_b1_eoa_dryrun()
         self._MacroResidB1Log(str(dry))
-        if p != n or not src_ok or "pass=7,fail=0" not in str(dry):
+        if p != n or not src_ok or "pass=8,fail=0" not in str(dry):
             self._resid_err += 1
+            self._resid_ctr["err"] = int(self._resid_ctr.get("err", 0)) + 1
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_MACRO_RESID_B1_", "CG_MACRO_A1_CLOSEOUT"):
+        for pref in ("CG_MACRO_RESID_B11_", "CG_MACRO_RESID_B1_", "CG_MACRO_A1_CLOSEOUT"):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
@@ -120,6 +127,7 @@ class CgMacroResidB1DiagMixin:
         snap = resid_protection_snapshot(state)
         if not snap.get("valid"):
             self._resid_unresolved_prot += 1
+            self._resid_ctr["unresolved_protection_state"] = int(self._resid_ctr.get("unresolved_protection_state", 0)) + 1
         return snap
 
     def _MacroResidB1OnAcceptedBar(self, tk, et, o, h, l, c):
@@ -159,15 +167,13 @@ class CgMacroResidB1DiagMixin:
                     self._resid_sess_closes[s] = []
             if c is not None:
                 self._resid_sess_closes[tk].append(float(c))
-            if et is not None and (et.hour * 60 + et.minute) >= 955:
-                if day_ord not in self._resid_daily_1555[tk]:
-                    self._resid_daily_1555[tk][day_ord] = (float(o), et)
+            # Designated close-proxy: first EndTime strictly after 15:55 ET.
+            cell, _acc = resid_update_close_proxy(self._resid_daily_1555[tk].get(day_ord), o, et)
+            if cell is not None:
+                self._resid_daily_1555[tk][day_ord] = cell
         except Exception:
             self._resid_err += 1
-
-    def _MacroResidB1BuildPriceIndex(self):
-        self._resid_price_cache = {}
-        self._resid_spy_days = sorted(self._resid_daily_1555.get("SPY") or {})
+            self._resid_ctr["err"] = int(self._resid_ctr.get("err", 0)) + 1
 
     def _MacroResidB1NextOpen(self, tk, after_t):
         ets = self._resid_open_et.get(tk) or []
@@ -320,64 +326,73 @@ class CgMacroResidB1DiagMixin:
             self._resid_truth.append({"day": p["do"], "ts": p["t"], "label": label, "tod": tod})
 
     def _MacroResidB1ExitThreshold(self, sig_t, horizon):
-        if horizon == "H60":
-            return sig_t + timedelta(minutes=60)
-        if horizon == "HCLOSE":
-            return sig_t.replace(hour=15, minute=55, second=0, microsecond=0)
-        sig_day = sig_t.date().toordinal() if hasattr(sig_t, "date") else int(sig_t)
-        days = self._resid_spy_days or sorted(self._resid_daily_1555.get("SPY") or {})
-        i = bisect.bisect_right(days, sig_day)
-        if horizon == "HNEXT":
-            tgt = days[i] if i < len(days) else None
-        elif horizon == "H3D":
-            tgt = days[i + 2] if (i + 2) < len(days) else None
+        thr, rsn = resid_exit_threshold(sig_t, horizon, self._resid_spy_days)
+        return thr, rsn
+
+    def _MacroResidB1ResolveExitPrice(self, tk, sig_t, horizon):
+        """Return entry/exit opens and EndTimes for one symbol/horizon."""
+        out = {"entry_open": None, "entry_bar_end_time": None, "exit_open": None,
+               "exit_bar_end_time": None, "exit_threshold_time": None, "valid": False, "reason": "INIT"}
+        thr, rsn = self._MacroResidB1ExitThreshold(sig_t, horizon)
+        out["exit_threshold_time"] = thr
+        if thr is None:
+            out["reason"] = rsn or "NO_THRESHOLD"
+            return out
+        ep, et = self._MacroResidB1NextOpen(tk, sig_t)
+        out["entry_open"], out["entry_bar_end_time"] = ep, et
+        if ep is None or et is None:
+            out["reason"] = "MISSING_ENTRY"
+            return out
+        if horizon in ("H60", "HCLOSE"):
+            xp, xt = self._MacroResidB1NextOpen(tk, thr)
         else:
-            return None
-        if tgt is None:
-            return None
-        return datetime.combine(date.fromordinal(int(tgt)), time(15, 55))
+            exit_day = thr.date().toordinal()
+            cell = (self._resid_daily_1555.get(tk) or {}).get(exit_day)
+            if isinstance(cell, dict):
+                xp, xt = cell.get("open_price"), cell.get("bar_end_time")
+            elif isinstance(cell, (tuple, list)) and len(cell) >= 2:
+                xp, xt = cell[0], cell[1]
+            else:
+                xp, xt = None, None
+        out["exit_open"], out["exit_bar_end_time"] = xp, xt
+        if xp is None or xt is None:
+            out["reason"] = "MISSING_EXIT"
+            return out
+        if et <= sig_t or xt <= thr:
+            out["reason"] = "EARLY_OR_EQUAL"
+            return out
+        out["valid"] = True
+        out["reason"] = "OK"
+        return out
 
     def _MacroResidB1PriceEvent(self, sig_t, horizon):
         cache_key = (sig_t, horizon)
         if cache_key in self._resid_price_cache:
             return self._resid_price_cache[cache_key]
-        exit_t = self._MacroResidB1ExitThreshold(sig_t, horizon)
-        if exit_t is None:
-            self._resid_price_cache[cache_key] = None
-            return None
+        thr, rsn = self._MacroResidB1ExitThreshold(sig_t, horizon)
+        if thr is None:
+            if rsn == "RIGHT_CENSORED":
+                self._resid_ctr = resid_apply_price_counters(self._resid_ctr, {}, None, right_censored=True)
+            self._resid_ctr.setdefault("rejected_missing_price_by_horizon", {})
+            self._resid_ctr["rejected_missing_price_by_horizon"][horizon] = int(
+                self._resid_ctr["rejected_missing_price_by_horizon"].get(horizon, 0)) + 1
+            self._resid_price_cache[cache_key] = (None, {"censored": rsn == "RIGHT_CENSORED", "miss_exit": 1})
+            return self._resid_price_cache[cache_key]
         symbol_prices = {}
-        if horizon in ("H60", "HCLOSE"):
-            for tk in RESID_PXY5:
-                ep, et = self._MacroResidB1NextOpen(tk, sig_t)
-                xp, xt = self._MacroResidB1NextOpen(tk, exit_t)
-                if ep and xp and et and xt:
-                    symbol_prices[tk] = (ep, et, xp, xt)
-        else:
-            exit_day = exit_t.date().toordinal()
-            for tk in RESID_PXY5:
-                ep, et = self._MacroResidB1NextOpen(tk, sig_t)
-                cell = (self._resid_daily_1555.get(tk) or {}).get(exit_day)
-                if isinstance(cell, (tuple, list)) and len(cell) >= 2:
-                    xp, xt = cell[0], cell[1]
-                else:
-                    xp, xt = cell, None
-                if ep and et and xp and float(xp) > 0 and xt is not None:
-                    symbol_prices[tk] = (ep, et, float(xp), xt)
-        br, miss, same_bar, early, partial = resid_price_pxy5(symbol_prices, sig_t, exit_t)
-        if br is not None:
-            # Hard-gate counters count accepted violations only.
-            if same_bar:
-                self._resid_same_bar += int(same_bar)
-            if early:
-                self._resid_future_price += int(early)
-            if partial:
-                self._resid_partial_proxy += 1
-            self._resid_price_cache[cache_key] = br
-            return br
-        if miss:
-            self._resid_missing_price += 1
-        self._resid_price_cache[cache_key] = None
-        return None
+        for tk in RESID_PXY5:
+            r = self._MacroResidB1ResolveExitPrice(tk, sig_t, horizon)
+            if r.get("valid"):
+                symbol_prices[tk] = (r["entry_open"], r["entry_bar_end_time"], r["exit_open"], r["exit_bar_end_time"])
+        br, info = resid_price_pxy5_detail(symbol_prices, sig_t, thr)
+        self._resid_ctr = resid_apply_price_counters(self._resid_ctr, info, br)
+        if br is None:
+            self._resid_ctr.setdefault("rejected_missing_price_by_horizon", {})
+            self._resid_ctr["rejected_missing_price_by_horizon"][horizon] = int(
+                self._resid_ctr["rejected_missing_price_by_horizon"].get(horizon, 0)) + 1
+        meta = {"censored": False, "miss_entry": int(info.get("miss_entry", 0) > 0),
+                "miss_exit": int(info.get("miss_exit", 0) > 0), "priceable": br is not None}
+        self._resid_price_cache[cache_key] = (br, meta)
+        return br, meta
 
     def _MacroResidB1TruthHit(self, sig_t):
         end = sig_t + timedelta(minutes=60)
@@ -438,6 +453,12 @@ class CgMacroResidB1DiagMixin:
             "_events": list(evs or []),
         }
 
+    def _MacroResidB1BuildPriceIndex(self):
+        self._resid_price_cache = {}
+        self._resid_spy_days = sorted(self._resid_daily_1555.get("SPY") or {})
+        self._resid_coverage_meta = []
+        self._resid_detail_signals = []
+
     def _MacroResidB1AttachExcess(self, events):
         bl_by_var = {v["id"]: resid_select_baselines(self._resid_obs, v["id"]) for v in RESID_VARIANTS}
         bl_by_key = {vid: {b.get("baseline_key"): b for b in rows} for vid, rows in bl_by_var.items()}
@@ -446,7 +467,7 @@ class CgMacroResidB1DiagMixin:
             for b in rows:
                 k = b.get("baseline_key")
                 for hz in RESID_HORIZONS:
-                    br = self._MacroResidB1PriceEvent(b["t"], hz)
+                    br, _meta = self._MacroResidB1PriceEvent(b["t"], hz)
                     if br is not None:
                         bl_cache[(vid, k, hz)] = resid_proxy_benefit(br, 2)
         nav = self._MacroResidB1NavByDay()
@@ -466,7 +487,6 @@ class CgMacroResidB1DiagMixin:
                 bl_day = int(bl_row.get("day", sig_day))
                 bl_d1 = resid_prod_nav_return(nav, bl_day, 1)
                 bl_d3 = resid_prod_nav_return(nav, bl_day, 3)
-                # production excess loss = baseline return - signal return
                 if e.get("prod_d1") is not None and bl_d1 is not None:
                     e["prod_d1_excess"] = float(bl_d1) - float(e["prod_d1"])
                 if e.get("prod_d3") is not None and bl_d3 is not None:
@@ -496,18 +516,36 @@ class CgMacroResidB1DiagMixin:
         events = []
         for cand in decl:
             sig_t = cand["signal_time"]
+            wn = resid_window_for_day(cand["day"])
+            wide = {
+                "variant": cand["variant"], "stratum": cand.get("stratum"), "day": cand["day"],
+                "signal_time": str(sig_t), "regime": cand.get("regime"), "w2": cand.get("w2"),
+                "ids": cand.get("ids"), "panic": cand.get("panic"), "equity_gross": cand.get("equity_gross"),
+                "h60_b2": "NA", "hclose_b2": "NA", "hnext_b2": "NA", "h3d_b2": "NA",
+                "h60_ok": 0, "hclose_ok": 0, "hnext_ok": 0, "h3d_ok": 0,
+            }
             for hz in RESID_HORIZONS:
-                br = self._MacroResidB1PriceEvent(sig_t, hz)
-                if br is None:
-                    continue
-                b0 = resid_proxy_benefit(br, 0)
-                b2 = resid_proxy_benefit(br, 2)
-                b5 = resid_proxy_benefit(br, 5)
-                events.append({
-                    **cand, "horizon": hz, "window": resid_window_for_day(cand["day"]),
-                    "benefit_0bps": b0, "benefit_2bps": b2, "benefit_5bps": b5,
-                    "false_cut": int(br > 0), "truth_hit": self._MacroResidB1TruthHit(sig_t),
+                br, meta = self._MacroResidB1PriceEvent(sig_t, hz)
+                priceable = br is not None
+                self._resid_coverage_meta.append({
+                    "variant": cand["variant"], "stratum": cand.get("stratum"), "horizon": hz,
+                    "window": wn, "priceable": priceable,
+                    "miss_entry": int(meta.get("miss_entry", 0)), "miss_exit": int(meta.get("miss_exit", 0)),
+                    "censored": bool(meta.get("censored")),
                 })
+                col = hz.lower()
+                if priceable:
+                    b0 = resid_proxy_benefit(br, 0)
+                    b2 = resid_proxy_benefit(br, 2)
+                    b5 = resid_proxy_benefit(br, 5)
+                    wide[f"{col}_b2"] = b2
+                    wide[f"{col}_ok"] = 1
+                    events.append({
+                        **cand, "horizon": hz, "window": wn,
+                        "benefit_0bps": b0, "benefit_2bps": b2, "benefit_5bps": b5,
+                        "false_cut": int(br > 0), "truth_hit": self._MacroResidB1TruthHit(sig_t),
+                    })
+            self._resid_detail_signals.append(wide)
         self._MacroResidB1AttachExcess(events)
         return events
 
@@ -537,45 +575,60 @@ class CgMacroResidB1DiagMixin:
                                 "metrics": metrics, "pass": True, "reasons": gate.get("reasons") or []})
         return resid_rank_passers(passing), passing
 
-    def _MacroResidB1EmitAll(self, arts, transport):
-        # Prefer ObjectStore; always attempt log chunks. transport.ok is validated
-        # separately for research finalization.
+    def _MacroResidB1EmitTier1(self, tier1, meta_map):
+        """Emit only Tier-1 within 85KB budget; META includes sha256 and chunk counts."""
         chunk = 700
-        emitted_any = False
-        for name, text in sorted((arts or {}).items()):
-            raw_txt = str(text or "")
-            try:
-                if hasattr(self, "object_store") and self.object_store is not None:
-                    try:
-                        self.object_store.save(name, raw_txt)
-                    except Exception:
-                        try:
-                            self.object_store.save_bytes(name, raw_txt.encode("utf-8"))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            raw = raw_txt.encode("utf-8")
+        emitted = 0
+        for name, text in sorted((tier1 or {}).items()):
+            mm = (meta_map or {}).get(name) or {}
+            raw = str(text or "").encode("utf-8")
             z = zlib.compress(raw, 9)
             b64 = base64.b64encode(z).decode("ascii")
             n = max(1, (len(b64) + chunk - 1) // chunk)
-            if transport and not transport.get("ok"):
-                # Over budget: emit META only so validators see truncation explicitly.
-                self._MacroResidB1Log(
-                    f"CG_MACRO_RESID_B1_ART_META,name={name},bytes={len(raw)},zbytes={len(z)},"
-                    f"chunks={n},emitted=0,truncated=YES"
-                )
-                continue
-            lines = [
-                f"CG_MACRO_RESID_B1_ART_META,name={name},bytes={len(raw)},zbytes={len(z)},"
-                f"chunks={n},emitted={n},truncated=NO"
-            ]
+            sha = mm.get("sha256") or ""
+            self._MacroResidB1Log(
+                f"CG_MACRO_RESID_B11_ART_META,name={name},bytes={len(raw)},zbytes={len(z)},"
+                f"expected_chunks={n},emitted_chunks={n},truncated=NO,sha256={sha}"
+            )
             for i in range(n):
-                lines.append(f"CG_MACRO_RESID_B1_ART,name={name},i={i},n={n},b64={b64[i*chunk:(i+1)*chunk]}")
-            for line in lines:
-                self._MacroResidB1Log(line)
-            emitted_any = True
-        return bool(emitted_any or (transport and transport.get("ok")))
+                self._MacroResidB1Log(
+                    f"CG_MACRO_RESID_B11_ART,name={name},i={i},n={n},b64={b64[i * chunk:(i + 1) * chunk]}"
+                )
+            emitted += 1
+        return emitted
+
+    def _MacroResidB1SaveTier2(self, tier2):
+        saved, readback = 0, 0
+        detail = {}
+        for name, text in sorted((tier2 or {}).items()):
+            ok_save = False
+            try:
+                if hasattr(self, "object_store") and self.object_store is not None:
+                    try:
+                        self.object_store.save(name, str(text))
+                        ok_save = True
+                    except Exception:
+                        try:
+                            self.object_store.save_bytes(name, str(text).encode("utf-8"))
+                            ok_save = True
+                        except Exception:
+                            ok_save = False
+            except Exception:
+                ok_save = False
+            rb = False
+            if ok_save:
+                saved += 1
+                try:
+                    got = self.object_store.read(name)
+                    rb = (got is not None) and (str(got) == str(text) or (
+                        hasattr(got, "decode") and got.decode("utf-8") == str(text)))
+                except Exception:
+                    rb = False
+                if rb:
+                    readback += 1
+            detail[name] = {"objectstore_save_attempted": 1, "objectstore_save_ok": int(ok_save),
+                            "objectstore_readback_ok": int(rb)}
+        return saved, readback, detail
 
     def _MacroResidB1Identity(self):
         out = {}
@@ -585,14 +638,14 @@ class CgMacroResidB1DiagMixin:
             led = leds.get(label) or {}
             if not cmp_fn:
                 out[label] = {"pass": False, "n": 0}
-                self._MacroResidB1Log(f"CG_MACRO_RESID_B1_IDENTITY_FINAL,id={label},pass=NO,identity_observed=NO")
+                self._MacroResidB1Log(f"CG_MACRO_RESID_B11_IDENTITY_FINAL,id={label},pass=NO,identity_observed=NO")
                 continue
             cmp = dict(cmp_fn(list(led.get("rets") or [])))
             passed = bool(cmp.get("pass"))
             out[label] = {"pass": passed, "n": cmp.get("n", 0), "nav_d": cmp.get("nav_d"),
                           "dd_d": cmp.get("dd_d"), "corr": cmp.get("corr")}
             self._MacroResidB1Log(
-                f"CG_MACRO_RESID_B1_IDENTITY_FINAL,id={label},pass={'YES' if passed else 'NO'},"
+                f"CG_MACRO_RESID_B11_IDENTITY_FINAL,id={label},pass={'YES' if passed else 'NO'},"
                 f"n={cmp.get('n',0)},nav_diff_pct={macro_mf(cmp.get('nav_d'),6)},"
                 f"maxdd_diff_pp={macro_mf(cmp.get('dd_d'),6)},corr={macro_mf(cmp.get('corr'),6)}"
             )
@@ -621,6 +674,7 @@ class CgMacroResidB1DiagMixin:
                 self._D2FlushPending()
         except Exception:
             self._resid_err += 1
+            self._resid_ctr["err"] = int(self._resid_ctr.get("err", 0)) + 1
         id_results = self._MacroResidB1Identity()
         events = self._MacroResidB1BuildEvents()
         ranked, passing = self._MacroResidB1ComputePasses(events)
@@ -638,58 +692,72 @@ class CgMacroResidB1DiagMixin:
                 symbol_sub_types[tk] = self._MacroResidB1SubType(tk)
         except Exception:
             self._resid_err += 1
-        data_audit = {
-            tk: {"accepted": d["accepted"], "dup": d["dup"], "oo": d["oo"],
-                 "first": d["first"], "last": d["last"],
-                 "train_days": len(d["train_days"]), "oos_days": len(d["oos_days"]),
-                 "crisis_days": len(d["crisis_days"])}
-            for tk, d in self._resid_data.items()
-        }
-        counters = {
-            "err": self._resid_err, "diagnostic_real_orders": self._resid_real_orders,
-            "future_vix_use": self._resid_future_vix, "same_session_vix_use": self._resid_same_session_vix,
-            "fabricated_vix_date": self._resid_fabricated_vix, "same_bar_fill": self._resid_same_bar,
-            "partial_proxy_accepted": self._resid_partial_proxy, "future_price_use": self._resid_future_price,
-            "unresolved_protection_state": self._resid_unresolved_prot, "transport_budget": 500000,
-            "missing_price": self._resid_missing_price,
-        }
+        self._resid_ctr["diagnostic_real_orders"] = int(self._resid_real_orders or 0)
+        self._resid_ctr["err"] = int(self._resid_err or 0)
         prot = self._MacroResidProtectionSnapshot()
         self._MacroResidB1Log(
-            f"CG_MACRO_RESID_B1_PROTECTION_FINAL,valid={int(prot.get('valid',0))},"
+            f"CG_MACRO_RESID_B11_PROTECTION_FINAL,valid={int(prot.get('valid',0))},"
             f"unresolved={self._resid_unresolved_prot},r0={self._resid_r0},r1={self._resid_r1},r2={self._resid_r2}"
         )
-        self._MacroResidB1Log(
-            f"CG_MACRO_RESID_B1_DATA_FINAL,obs={len(self._resid_obs)},panel={len(RESID_PXY5)},"
-            f"same_bar={self._resid_same_bar},partial_proxy={self._resid_partial_proxy},"
-            f"future_price={self._resid_future_price},missing_price={self._resid_missing_price}"
-        )
+        # price coverage summary by horizon (RUN R0)
+        cov_by_hz = {h: {"sig": 0, "ok": 0} for h in RESID_HORIZONS}
+        for row in self._resid_coverage_meta:
+            if row.get("stratum") != "R0_UNPROTECTED" or row.get("window") not in (
+                    "TRAIN_2012_2018", "OOS_2019_2021", "CRISIS_2022_2025", "Y2020", "Y2022",
+                    "Y2023", "Y2024", "Y2025", "LIVE_RECENT", "TRAIN_A_2012_2015", "TRAIN_B_2016_2018"):
+                # still count all R0 for RUN-like aggregate across all windows via signals
+                pass
+            hz = row.get("horizon")
+            if hz in cov_by_hz and row.get("stratum") == "R0_UNPROTECTED":
+                cov_by_hz[hz]["sig"] += 1
+                cov_by_hz[hz]["ok"] += int(bool(row.get("priceable")))
+        parts = []
+        for hz in RESID_HORIZONS:
+            s, o = cov_by_hz[hz]["sig"], cov_by_hz[hz]["ok"]
+            parts.append(f"{hz}={macro_mf((o / s) if s else 0, 4)}")
+        self._MacroResidB1Log(f"CG_MACRO_RESID_B11_PRICE_COVERAGE_FINAL,{','.join(parts)}")
         for v in RESID_VARIANTS:
             n_fire = sum(1 for o in self._resid_obs if (o.get("variant_pass") or {}).get(v["id"]))
-            self._MacroResidB1Log(f"CG_MACRO_RESID_B1_VARIANT_FINAL,id={v['id']},fires={n_fire}")
+            self._MacroResidB1Log(f"CG_MACRO_RESID_B11_VARIANT_FINAL,id={v['id']},fires={n_fire}")
         self._MacroResidB1Log(
-            f"CG_MACRO_RESID_B1_PASS_FINAL,passing={len(passing)},ranked={len(ranked)},"
+            f"CG_MACRO_RESID_B11_PASS_FINAL,passing={len(passing)},ranked={len(ranked)},"
             f"top={ranked[0]['id'] if ranked else 'NONE'}"
         )
-        self._MacroResidB1Log(f"CG_MACRO_RESID_B1_SUBSCRIPTION_FINAL,events={len(subscription_events)},symbols={len(symbol_sub_types)}")
+        self._MacroResidB1Log(
+            f"CG_MACRO_RESID_B11_SUBSCRIPTION_FINAL,events={len(subscription_events)},symbols={len(symbol_sub_types)}"
+        )
         bid = self._MsBid() if hasattr(self, "_MsBid") else "NA"
         src = getattr(self, "cg_macro_resid_b1_source_commit", "") or ""
-        out = resid_finalize_research(
-            self._resid_obs, id_results, parity_ok, counters, data_audit, src, prot,
-            events=events, passing_variants=passing, bid=bid,
-            subscription_events=subscription_events, symbol_sub_types=symbol_sub_types,
+        out = resid_b11_finalize(
+            self._resid_obs, id_results, parity_ok, self._resid_ctr, src, prot,
+            events=events, coverage_meta=self._resid_coverage_meta, passing_variants=passing,
+            bid=bid, subscription_events=subscription_events, symbol_sub_types=symbol_sub_types,
+            detail_signals=self._resid_detail_signals,
         )
-        emitted = self._MacroResidB1EmitAll(out["arts"], out["transport"])
+        t2_saved, t2_rb, t2_detail = self._MacroResidB1SaveTier2(out.get("tier2") or {})
+        if out.get("transport", {}).get("ok") and out.get("art_ok") and out.get("tech_ok"):
+            emitted = self._MacroResidB1EmitTier1(out.get("tier1") or {}, out.get("meta_map") or {})
+        else:
+            emitted = 0
+            # still emit META-only failure markers for expected tier1 names
+            for name in sorted((out.get("tier1") or {}).keys()):
+                self._MacroResidB1Log(
+                    f"CG_MACRO_RESID_B11_ART_META,name={name},bytes=0,zbytes=0,"
+                    f"expected_chunks=0,emitted_chunks=0,truncated=YES,sha256=NONE"
+                )
         fin = out["fin"]
-        if not emitted and fin.get("result") != "FAILED":
-            fin = {"result": "FAILED", "reason": "ARTIFACT_TRANSPORT_BUDGET_EXCEEDED",
-                   "next": "FIX_MACRO_RESID_B1_IMPLEMENTATION", "research_conclusion": "NOT_REACHED"}
+        if t2_saved < 3 and out.get("art_ok") and out.get("tech_ok"):
+            # Tier-2 ObjectStore failure does not invalidate when Tier-1 complete
+            if isinstance(out.get("manifest"), dict):
+                out["manifest"]["detail_status"] = "DETAIL_NOT_EXTERNALLY_RETRIEVED"
         self._MacroResidB1Log(
-            f"CG_MACRO_RESID_B1_ARTIFACT_FINAL,artifacts={len(out['arts'])},"
-            f"manifest_sha256={out.get('manifest_sha256')},transport_ok={int(out['transport'].get('ok',0))},"
-            f"emitted={int(emitted)}"
+            f"CG_MACRO_RESID_B11_ARTIFACT_FINAL,tier1={len(out.get('tier1') or {})},"
+            f"tier1_emitted={emitted},transport_ok={int(out['transport'].get('ok',0))},"
+            f"tier2_saved={t2_saved},tier2_readback={t2_rb},"
+            f"manifest_sha256={out.get('manifest_sha256')}"
         )
         self._MacroResidB1Log(
-            f"CG_MACRO_RESID_B1_RECOMMENDATION,result={fin['result']},reason={fin['reason']},"
+            f"CG_MACRO_RESID_B11_RECOMMENDATION,result={fin['result']},reason={fin['reason']},"
             f"next={fin['next']},research_conclusion={fin['research_conclusion']},"
             f"passing={len(passing)},subscription_hint={out.get('subscription_hint') or 'NONE'}"
         )

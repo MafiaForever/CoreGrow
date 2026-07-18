@@ -131,7 +131,7 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
         lp = list(getattr(self, "log_only_prefixes", None) or [])
         for pref in (
             "CG_MAISR_D0_", "CG_MAISR_P1_", "CG_MAISR_D2_", "CG_MAISR_D3_", "CG_MAISR_D4_",
-            "CG_MAISR_CLOSEOUT", "CG_MACRO_A1_", "CG_MACRO_RESID_B1_", "CG_MACRO_A1_CLOSEOUT",
+            "CG_MAISR_CLOSEOUT", "CG_MACRO_A1_", "CG_MACRO_RESID_B1_", "CG_MACRO_RESID_B11_", "CG_MACRO_A1_CLOSEOUT",
         ):
             if pref not in lp:
                 lp.append(pref)
@@ -1035,6 +1035,7 @@ class CgMaisrDiagMixin(CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMaisrD4Ove
             n = len(msg) + 1
             # Macro A1 owns a separate EOA/artifact budget; do not starve it with P1 lines.
             if (str(msg).startswith("CG_MACRO_A1_") or str(msg).startswith("CG_MACRO_RESID_B1_")
+                    or str(msg).startswith("CG_MACRO_RESID_B11_")
                     or str(msg).startswith("CG_MACRO_A1_CLOSEOUT") or str(msg).startswith("CG_MAISR_CLOSEOUT")):
                 self.log(msg)
                 return
