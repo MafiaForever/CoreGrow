@@ -21,6 +21,10 @@ from cg_damage_duration_d02_features import (
     FeatureCollector, run_all_d02b_static_tests, SCHEMA_VERSION as D02B_SCHEMA,
     EXPERIMENT as D02B_EXPERIMENT, PHASE as D02B_PHASE,
 )
+from cg_damage_duration_d02_structure import (
+    D02CCollector, run_all_d02c_static_tests, EXPERIMENT as D02C_EXPERIMENT,
+    PHASE as D02C_PHASE,
+)
 
 _SH_ACTIVE = frozenset(("HEDGED", "ENTRY_PENDING", "EXIT_PENDING"))
 
@@ -130,6 +134,7 @@ class CgDamageDurationD01DiagMixin:
             self._dmg_ledger = DamageEpisodeLedger(confirmation_minutes=CONFIRMATION_WINDOW_MINUTES)
         self._dmg_d02_sensor = DamageD02Sensor()
         self._dmg_d02_features = FeatureCollector()
+        self._dmg_d02c = D02CCollector()
         self._dmg_d02_ctr = empty_sensor_counters()
         self._dmg_d02_err = 0
         self._dmg_prev_prot = getattr(self, "_dmg_prev_prot", False)
@@ -138,7 +143,7 @@ class CgDamageDurationD01DiagMixin:
         self._dmg_sub_changes = int(getattr(self, "_dmg_sub_changes", 0) or 0)
         self._dmg_target_mut = int(getattr(self, "_dmg_target_mut", 0) or 0)
         lp = list(getattr(self, "log_only_prefixes", None) or [])
-        for pref in ("CG_DAMAGE_D02_", "CG_DAMAGE_D02B_"):
+        for pref in ("CG_DAMAGE_D02_", "CG_DAMAGE_D02B_", "CG_DAMAGE_D02C_"):
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
@@ -154,6 +159,11 @@ class CgDamageDurationD01DiagMixin:
         except Exception:
             rep_b = {"passed": 0, "failed": 1, "total": 1}
         self._dmg_d02b_static = rep_b
+        try:
+            rep_c = run_all_d02c_static_tests()
+        except Exception:
+            rep_c = {"passed": 0, "failed": 1, "total": 1}
+        self._dmg_d02c_static = rep_c
         self._DamageD01Log(
             f"CG_DAMAGE_D02A_INIT,enable=1,tests={rep['passed']}/{rep['total']},"
             f"atr_source={PRIOR_ATR_SOURCE},runtime_source={D30_D45_RUNTIME_SOURCE},"
@@ -163,7 +173,11 @@ class CgDamageDurationD01DiagMixin:
             f"CG_DAMAGE_D02B_INIT,enable=1,tests={rep_b.get('passed', 0)}/{rep_b.get('total', 0)},"
             f"schema={D02B_SCHEMA},feature_collector=1,event_memory=1"
         )
-        if rep["failed"] or int(rep_b.get("failed", 1) or 0):
+        self._DamageD01Log(
+            f"CG_DAMAGE_D02C_INIT,enable=1,tests={rep_c.get('passed', 0)}/{rep_c.get('total', 0)},"
+            f"changepoint=1,structure=1,veto=FORBIDDEN"
+        )
+        if rep["failed"] or int(rep_b.get("failed", 1) or 0) or int(rep_c.get("failed", 1) or 0):
             self._dmg_d02_err += 1
 
     def _DamageD01Log(self, msg):
@@ -321,7 +335,10 @@ class CgDamageDurationD01DiagMixin:
                     if et is not None and et > t:
                         act = et
                         break
-                fc.build_snapshot(t, ck, sens_snap, ep, nav, src, action_eligible_time=act)
+                snap_b = fc.build_snapshot(t, ck, sens_snap, ep, nav, src, action_eligible_time=act)
+                d02c = getattr(self, "_dmg_d02c", None)
+                if d02c is not None and snap_b is not None:
+                    d02c.update(snap_b)
             self._dmg_prev_prot = active
             self._dmg_d02_ctr = dict(sens.counters)
             self._dmg_ctr = dict(led.counters)
@@ -390,7 +407,7 @@ class CgDamageDurationD01DiagMixin:
                 f"CG_DAMAGE_D02A_CLOSEOUT,experiment={D02_EXPERIMENT},phase={D02_PHASE},"
                 f"static={rep.get('passed', 0)}/{rep.get('total', 0)},"
                 f"runtime_source={D30_D45_RUNTIME_SOURCE},"
-                f"next=D0.2C_CHANGE_POINT_STRUCTURE_FEATURES"
+                f"next=D0.3A_MODEL_A_DETERMINISTIC_SHADOW_ROUTER"
             )
             rep_b = getattr(self, "_dmg_d02b_static", None) or {}
             fc = getattr(self, "_dmg_d02_features", None)
@@ -400,7 +417,17 @@ class CgDamageDurationD01DiagMixin:
                 f"static={rep_b.get('passed', 0)}/{rep_b.get('total', 0)},"
                 f"feature_snapshots={n_snap},feature_collector=IMPLEMENTED,"
                 f"event_memory=IMPLEMENTED,recovery_score=NOT_IMPLEMENTED,"
-                f"next=D0.2C_CHANGE_POINT_STRUCTURE_FEATURES"
+                f"next=D0.3A_MODEL_A_DETERMINISTIC_SHADOW_ROUTER"
+            )
+            rep_c = getattr(self, "_dmg_d02c_static", None) or {}
+            d02c = getattr(self, "_dmg_d02c", None)
+            n_c = int(getattr(d02c, "counters", {}).get("snapshots", 0) or 0) if d02c else 0
+            self._DamageD01Log(
+                f"CG_DAMAGE_D02C_CLOSEOUT,experiment={D02C_EXPERIMENT},phase={D02C_PHASE},"
+                f"static={rep_c.get('passed', 0)}/{rep_c.get('total', 0)},"
+                f"d02c_snapshots={n_c},changepoint=IMPLEMENTED,structure=IMPLEMENTED,"
+                f"veto=FORBIDDEN,recovery_score=NOT_IMPLEMENTED,"
+                f"next=D0.3A_MODEL_A_DETERMINISTIC_SHADOW_ROUTER"
             )
         except Exception as e:
             self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1
