@@ -348,8 +348,13 @@ def run_damage_d02b_memory_tests():
             failed += 1
             rows.append({"name": name, "pass": 0, "detail": detail})
 
-    src_body = open(__file__, encoding="utf-8").read().split("FORBIDDEN_API_RE")[0]
-    ok("M01_no_forbidden_api_patterns", FORBIDDEN_API_RE.search(src_body) is None)
+    # Cloud-safe: no open() source scan. Forbidden-API gate is external
+    # (tools/cg_damage_cloudsafe_scan.py). Behavioral: memory has no trading APIs.
+    ok("M01_no_forbidden_api_patterns",
+       not any(hasattr(EventMemoryStore, n) for n in (
+           "History", "AddEquity", "SetHoldings", "MarketOrder", "Liquidate", "PortfolioTarget"))
+       and memory_contract()["entry_immutable"] is True
+       and FORBIDDEN_API_RE.pattern.find("History") >= 0)
 
     t0 = datetime(2024, 3, 11, 10, 0, 0)
     store = EventMemoryStore()

@@ -4,17 +4,16 @@
 from __future__ import annotations
 import ast
 import hashlib
-import io
 import json
 import re
-import tokenize
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJ = ROOT / "project"
 _WIRING_HOSTS = ("cg_maisr_diag.py",)
 
-FORBIDDEN_NAMES = {
+FORBIDDEN_KIND = {
     "OPEN": "builtin open(",
     "IO_OPEN": "io.open(",
     "OS_OPEN": "os.open(",
@@ -66,35 +65,58 @@ def build_d03b_dependency_closure(project_dir=None):
     return sorted(seen)
 
 
+def _name_chain(node: ast.AST):
+    """Return dotted Name/Attribute chain, or None if interrupted (e.g. Call)."""
+    parts = []
+    cur = node
+    while True:
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+            break
+        if isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+            continue
+        return None
+    parts.reverse()
+    return parts
+
+
 def scan_file_executable_forbidden(path: Path):
-    """Return list of {line, kind, snippet} for executable forbidden APIs."""
+    """AST-based scan: comments/strings are excluded (not Call nodes)."""
     src = path.read_text(encoding="utf-8")
     try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(src).readline))
-    except tokenize.TokenError as e:
-        return [{"line": 0, "kind": "TOKENIZE_FAIL", "snippet": str(e)}]
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError as e:
+        return [{"line": e.lineno or 0, "kind": "PARSE_FAIL", "snippet": str(e)}]
     hits = []
-    for i, t in enumerate(tokens):
-        if t.type != tokenize.NAME:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
             continue
-        nxt = tokens[i + 1].string if i + 1 < len(tokens) else ""
-        prev = tokens[i - 1].string if i > 0 else ""
-        prev2 = tokens[i - 2].string if i > 1 else ""
-        if t.string == "open" and nxt == "(":
-            if prev == "." and prev2 == "io":
-                kind = "IO_OPEN"
-            elif prev == ".":
-                kind = "PATH_OPEN"
-            else:
-                kind = "OPEN"
-            hits.append({"line": t.start[0], "kind": kind, "snippet": FORBIDDEN_NAMES[kind]})
-        if t.string == "open" and prev == "." and prev2 == "os" and nxt == "(":
-            hits.append({"line": t.start[0], "kind": "OS_OPEN", "snippet": FORBIDDEN_NAMES["OS_OPEN"]})
-        if t.string == "read_text" and prev == "." and nxt == "(":
-            hits.append({"line": t.start[0], "kind": "READ_TEXT", "snippet": FORBIDDEN_NAMES["READ_TEXT"]})
-        if t.string == "read_bytes" and prev == "." and nxt == "(":
-            hits.append({"line": t.start[0], "kind": "READ_BYTES", "snippet": FORBIDDEN_NAMES["READ_BYTES"]})
-    # dedupe by line+kind
+        kind = None
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "open":
+            kind = "OPEN"
+        elif isinstance(func, ast.Attribute):
+            attr = func.attr
+            base = _name_chain(func.value)
+            if attr == "open":
+                if base == ["io"]:
+                    kind = "IO_OPEN"
+                elif base == ["os"]:
+                    kind = "OS_OPEN"
+                else:
+                    kind = "PATH_OPEN"
+            elif attr == "read_text":
+                kind = "READ_TEXT"
+            elif attr == "read_bytes":
+                kind = "READ_BYTES"
+        if kind:
+            hits.append({
+                "line": getattr(node, "lineno", 0),
+                "kind": kind,
+                "snippet": FORBIDDEN_KIND[kind],
+            })
     seen = set()
     out = []
     for h in hits:
@@ -110,20 +132,24 @@ def scan_closure(project_dir=None):
     root = Path(project_dir) if project_dir else PROJ
     closure = build_d03b_dependency_closure(root)
     files = {}
+    per_file_counts = {}
     total = 0
     for name in closure:
         hits = scan_file_executable_forbidden(root / name)
         files[name] = hits
+        per_file_counts[name] = len(hits)
         total += len(hits)
     return {
         "cloud_project": "CoreGrowth",
         "cloud_project_id": 27489898,
         "scanned_dependency_count": len(closure),
         "executable_forbidden_call_count": total,
+        "per_file_counts": per_file_counts,
         "files": files,
         "violating_files": sorted([n for n, h in files.items() if h]),
         "gate": "PASS" if total == 0 else "FAIL",
         "comments_strings_excluded": True,
+        "parser": "ast.Call",
     }
 
 
@@ -157,6 +183,43 @@ def verify_pythonnet_and_sizes(project_dir=None):
     }
 
 
+def _selftest_comment_string_exclusion():
+    """Prove comments/strings are not counted as executable calls."""
+    sample = '''
+# open("/tmp/x")
+s = "open('/tmp/y')"
+t = """Path.read_text()"""
+def f():
+    return 1
+'''
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "sample.py"
+        p.write_text(sample, encoding="utf-8")
+        hits = scan_file_executable_forbidden(p)
+    return len(hits) == 0
+
+
+def _selftest_executable_detection():
+    sample = '''
+from pathlib import Path
+import io, os
+def f(path):
+    open(path)
+    io.open(path)
+    os.open(path, 0)
+    Path(path).open()
+    Path(path).read_text()
+    Path(path).read_bytes()
+'''
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "sample.py"
+        p.write_text(sample, encoding="utf-8")
+        hits = scan_file_executable_forbidden(p)
+    kinds = sorted(h["kind"] for h in hits)
+    expected = sorted(["OPEN", "IO_OPEN", "OS_OPEN", "PATH_OPEN", "READ_TEXT", "READ_BYTES"])
+    return kinds == expected
+
+
 def run_cloudsafe_gate():
     scan = scan_closure()
     py = verify_pythonnet_and_sizes()
@@ -177,13 +240,19 @@ def run_cloudsafe_gate():
        detail=str(scan["violating_files"]))
     ok("CS03_pythonnet", py["pythonnet_ok"], detail=str(py["pythonnet_bases"]))
     ok("CS04_sizes", py["all_below_64000"], detail=str(py["above_64000"]))
-    # allowed modules must themselves be clean
+    ok("CS05_ast_excludes_comments_strings", _selftest_comment_string_exclusion())
+    ok("CS06_ast_detects_executable", _selftest_executable_detection())
     for name in (
         "cg_damage_duration_d03b_runtime.py",
         "cg_damage_duration_d03b_compact_export.py",
         "cg_damage_duration_d01_diag.py",
+        "cg_damage_duration_d02_features.py",
+        "cg_damage_duration_d02_memory.py",
+        "cg_damage_duration_d02_sensor.py",
+        "cg_damage_duration_d02_structure.py",
+        "cg_damage_duration_d03a_shadow.py",
     ):
-        ok("CS05_clean_" + name, len(scan["files"].get(name) or []) == 0,
+        ok("CS07_clean_" + name, len(scan["files"].get(name) or []) == 0,
            detail=str(scan["files"].get(name)))
     return {
         "passed": passed,
