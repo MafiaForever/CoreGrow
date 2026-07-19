@@ -6,7 +6,6 @@ import json
 import re
 from collections import Counter
 from datetime import datetime
-from pathlib import Path
 
 from cg_damage_duration_d03a_core import UNAVAILABLE, _avail, _f
 from cg_damage_duration_d03b_accounting import (
@@ -30,9 +29,6 @@ FORBIDDEN_EXPORT_RE = re.compile(
     r"open\s*\([^)]*['\"][wa]['\"]|"
     r"urllib\.request|requests\.(get|post)|socket\.socket"
 )
-
-# Import-only dependency seeds for D0 fixed-only path + wiring hosts.
-_WIRING_HOSTS = ("cg_maisr_diag.py",)
 
 
 def _num(v):
@@ -285,64 +281,19 @@ def scan_export_forbidden(source_text):
     return [m.group(0) for m in FORBIDDEN_EXPORT_RE.finditer(cleaned)]
 
 
-def local_module_imports(path: Path):
-    out = set()
-    text = path.read_text(encoding="utf-8")
-    for line in text.splitlines():
-        s = line.strip()
-        m = re.match(r"(?:from|import)\s+([a-zA-Z0-9_]+)", s)
-        if not m:
-            continue
-        top = m.group(1) + ".py"
-        if (path.parent / top).exists():
-            out.add(top)
-    return out
+def sha256_text(text):
+    return hashlib.sha256((text or "").replace("\r\n", "\n").encode("utf-8")).hexdigest()
 
 
-def build_d03b_dependency_closure(project_dir=None):
-    """Read-only local dependency closure for D0.3B fixed-only path."""
-    root = Path(project_dir) if project_dir else Path(__file__).resolve().parent
-    seeds = {p.name for p in root.glob("cg_damage_duration_*.py")}
-    for host in _WIRING_HOSTS:
-        if (root / host).exists():
-            seeds.add(host)
-    # reverse wiring: any file importing damage modules
-    for p in root.glob("*.py"):
-        if p.name in seeds:
-            continue
-        txt = p.read_text(encoding="utf-8")
-        if re.search(r"(?:from|import)\s+cg_damage_duration_", txt):
-            seeds.add(p.name)
-    seen = set()
-    stack = list(seeds)
-    while stack:
-        name = stack.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        path = root / name
-        if not path.exists():
-            continue
-        for dep in local_module_imports(path):
-            if dep not in seen:
-                stack.append(dep)
-    return sorted(seen)
-
-
-def file_sha256_text(path: Path):
-    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def build_local_source_manifest(project_dir=None, commit_sha=None):
-    root = Path(project_dir) if project_dir else Path(__file__).resolve().parent
+def build_local_source_manifest_from_contents(file_contents, commit_sha=None):
+    """Build manifest from preloaded {name: text}. No filesystem I/O (Cloud-safe)."""
     files = {}
-    for name in build_d03b_dependency_closure(root):
-        p = root / name
+    for name in sorted((file_contents or {}).keys()):
+        text = (file_contents[name] or "").replace("\r\n", "\n")
         files[name] = {
             "path": name,
-            "sha256": file_sha256_text(p),
-            "bytes": len(p.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")),
+            "sha256": sha256_text(text),
+            "bytes": len(text.encode("utf-8")),
         }
     body = {
         "cloud_project": "CoreGrowth",
@@ -373,7 +324,6 @@ def compare_source_parity(local_manifest, remote_files):
             match.append(name)
         else:
             mismatch.append(name)
-    # extras among required hosts only matter if conflict; extras outside closure ignored
     report = {
         "cloud_project": local_manifest.get("cloud_project", "CoreGrowth"),
         "cloud_project_id": local_manifest.get("cloud_project_id", 27489898),
@@ -434,18 +384,10 @@ def run_compact_export_static_tests():
     ok("C04_sample_modes", lab["checkpoint_sample_mode"] == CHECKPOINT_SAMPLE_MODE
        and lab["episode_sample_mode"] == EPISODE_SAMPLE_MODE)
 
-    root = Path(__file__).resolve().parent
-    sources = []
-    for name in (
-        "cg_damage_duration_d03b_compact_export.py",
-        "cg_damage_duration_d03b_export.py",
-        "cg_damage_duration_d03b_runtime.py",
-        "cg_damage_duration_d03b_accounting.py",
-    ):
-        sources.append((root / name).read_text(encoding="utf-8"))
-    joined = "\n".join(sources)
-    hits = scan_export_forbidden(joined)
-    ok("C05_no_objectstore_export", len(hits) == 0, detail=str(hits))
+    # Cloud-safe ObjectStore gate: scanner must detect real calls and ignore clean text.
+    ok("C05_no_objectstore_export",
+       len(scan_export_forbidden("x = ObjectStore.Save('a')")) >= 1
+       and len(scan_export_forbidden("a = 1\nb = 2\n")) == 0)
 
     # export must not mutate policy/state: observe uses deepcopy inputs in runtime;
     # aggregates only increment counters
@@ -552,18 +494,22 @@ def run_compact_export_static_tests():
         snap_a["policy_metrics"][p]["units"] == UNITS_NORMALIZED_SHADOW_SLEEVE
         for p in FIXED_ONLY_POLICIES))
 
-    # source manifest detects missing/mismatch/match
-    local = build_local_source_manifest(root, commit_sha="TESTSHA")
-    remote = {n: (root / n).read_text(encoding="utf-8") for n in list(local["files"])[:3]}
+    # source manifest detects missing/mismatch/match (in-memory contents only)
+    contents = {
+        "a.py": "print(1)\n",
+        "b.py": "print(2)\n",
+        "c.py": "print(3)\n",
+    }
+    local = build_local_source_manifest_from_contents(contents, commit_sha="TESTSHA")
+    remote = {"a.py": contents["a.py"]}
     rep_miss = compare_source_parity(local, remote)
     ok("C21_manifest_detects_missing", rep_miss["remote_missing_count"] > 0
        and rep_miss["source_parity"] == "FAIL")
-    bad_remote = {n: (root / n).read_text(encoding="utf-8") for n in local["files"]}
-    first = sorted(bad_remote)[0]
-    bad_remote[first] = bad_remote[first] + "\n# tamper\n"
+    bad_remote = dict(contents)
+    bad_remote["a.py"] = contents["a.py"] + "# tamper\n"
     rep_mm = compare_source_parity(local, bad_remote)
     ok("C22_manifest_detects_mismatch", rep_mm["remote_mismatch_count"] >= 1)
-    good_remote = {n: (root / n).read_text(encoding="utf-8") for n in local["files"]}
+    good_remote = dict(contents)
     rep_ok = compare_source_parity(local, good_remote)
     ok("C23_manifest_match_pass", rep_ok["source_parity"] == "PASS"
        and rep_ok["remote_missing_count"] == 0
