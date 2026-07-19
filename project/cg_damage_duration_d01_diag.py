@@ -45,6 +45,8 @@ class CgDamageDurationD01DiagMixin:
         self.cg_damage_duration_d02_enable = _bool("cg_damage_duration_d02_enable", "0")
         self.cg_damage_duration_d03a_enable = _bool("cg_damage_duration_d03a_enable", "0")
         self.cg_damage_duration_d03b_enable = _bool("cg_damage_duration_d03b_enable", "0")
+        self.cg_damage_duration_d03b_fixed_only_shadow_enable = _bool(
+            "cg_damage_duration_d03b_fixed_only_shadow_enable", "0")
 
     def _DamageD01MaybeEnableMs(self):
         if getattr(self, "cg_damage_duration_d01_enable", False) or getattr(
@@ -424,6 +426,8 @@ class CgDamageDurationD01DiagMixin:
                         shadow_out,
                         d03b_enabled=bool(getattr(self, "cg_damage_duration_d03b_enable", False)),
                         prod_state={"production_nav_read_only": nav},
+                        fixed_only_shadow_enable=bool(
+                            getattr(self, "cg_damage_duration_d03b_fixed_only_shadow_enable", False)),
                     )
             self._dmg_prev_prot = active
             self._dmg_d02_ctr = dict(sens.counters)

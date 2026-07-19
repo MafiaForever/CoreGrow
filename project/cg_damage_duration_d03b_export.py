@@ -8,6 +8,7 @@ from collections import deque
 
 from cg_damage_duration_d03b_accounting import (
     SCHEMA_VERSION, MAX_CHECKPOINT_ROWS, MAX_EPISODE_ROWS, UNAVAILABLE,
+    FIXED_ONLY_BASELINES,
 )
 
 ORDINARY_LOG_LIMIT = 100 * 1024
@@ -27,6 +28,7 @@ class PolicyRuntimeExporter:
     def __init__(self, max_ck=MAX_CHECKPOINT_ROWS, max_ep=MAX_EPISODE_ROWS):
         self.checkpoint_rows = deque(maxlen=int(max_ck))
         self.episode_rows = deque(maxlen=int(max_ep))
+        self.pairwise_rows = deque(maxlen=256)
         self.counters = {
             "checkpoint_rows_written": 0,
             "episode_rows_written": 0,
@@ -89,8 +91,33 @@ class PolicyRuntimeExporter:
             "schema_version": SCHEMA_VERSION,
             "checkpoint_rows": len(self.checkpoint_rows),
             "episode_rows": len(self.episode_rows),
+            "pairwise_rows": len(getattr(self, "pairwise_rows", []) or []),
             "counters": dict(self.counters),
             "ordinary_log_limit": ORDINARY_LOG_LIMIT,
             "below_ordinary_log_limit": self.counters["export_bytes"] <= ORDINARY_LOG_LIMIT
             or self.counters["truncated"] > 0,
         }
+
+    def add_pairwise_rows(self, rows):
+        if not hasattr(self, "pairwise_rows"):
+            self.pairwise_rows = deque(maxlen=256)
+        for r in rows or []:
+            self.pairwise_rows.append(dict(r))
+
+    def pairwise_csv(self):
+        return self.to_csv(getattr(self, "pairwise_rows", []))
+
+
+def fixed_only_pairwise_schema_rows():
+    """Static schema rows for P5-minus-P1..P4 (no values / no best selection)."""
+    rows = []
+    for pid in FIXED_ONLY_BASELINES:
+        rows.append({
+            "lhs": "P5_DYNAMIC",
+            "rhs": pid,
+            "metric": "pairwise_policy_difference",
+            "units": "NORMALIZED_SHADOW_SLEEVE",
+            "best_fixed_selection": "FORBIDDEN",
+            "production_claim_eligible": "NO",
+        })
+    return rows

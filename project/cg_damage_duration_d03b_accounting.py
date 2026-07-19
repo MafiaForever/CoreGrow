@@ -391,3 +391,164 @@ def policy_runtime_schema():
         "max_checkpoint_rows": MAX_CHECKPOINT_ROWS,
         "max_episode_rows": MAX_EPISODE_ROWS,
     }
+
+
+# ---------------------------------------------------------------------------
+# D0.3B2A fixed-only shadow comparison contract (P5 vs P1–P4; P0 excluded)
+# ---------------------------------------------------------------------------
+FIXED_ONLY_EXPERIMENT = "CG-DAMAGE-DURATION-D0.3B2A-FIXED-ONLY-CONTRACT"
+FIXED_ONLY_PHASE = "D0.3B2A_FIXED_ONLY_SHADOW_COMPARISON_GUARDS"
+FIXED_ONLY_POLICIES = (
+    "P1_HOLD_TO_CLOSE", "P2_HOLD_TO_NEXT_CLOSE", "P3_HOLD_3D",
+    "P4_GRADUAL_FIXED", "P5_DYNAMIC",
+)
+FIXED_ONLY_BASELINES = (
+    "P1_HOLD_TO_CLOSE", "P2_HOLD_TO_NEXT_CLOSE", "P3_HOLD_3D", "P4_GRADUAL_FIXED",
+)
+NORMALIZED_SHADOW_SLEEVE_START = 0.0  # identical withheld start for all P1–P5
+UNITS_NORMALIZED_SHADOW_SLEEVE = "NORMALIZED_SHADOW_SLEEVE"
+PROHIBITED_PRODUCTION_CLAIM_FIELDS = (
+    "production_improvement", "production_alpha", "portfolio_cagr",
+    "production_maxdd", "avoided_loss_versus_production", "live_performance",
+    "production_cagr", "production_return", "production_claim",
+)
+
+
+def fixed_only_shadow_contract():
+    return {
+        "experiment": FIXED_ONLY_EXPERIMENT,
+        "phase": FIXED_ONLY_PHASE,
+        "original_p0_hypothesis": "STOPPED",
+        "p0_stop_verdict": P0_SOURCE_VERDICT,
+        "replacement_hypothesis": "P5_DYNAMIC versus fixed shadow policies P1–P4 only",
+        "comparison_universe": list(FIXED_ONLY_POLICIES),
+        "p0_current": {
+            "policy_id": "P0_CURRENT",
+            "numeric_status": "UNAVAILABLE",
+            "comparison_eligible": False,
+            "production_claim_eligible": False,
+        },
+        "normalized_shadow_sleeve_start": NORMALIZED_SHADOW_SLEEVE_START,
+        "units": UNITS_NORMALIZED_SHADOW_SLEEVE,
+        "comparison_scope": "FIXED_ONLY_SHADOW",
+        "production_comparison_available": False,
+        "production_claim_eligible": False,
+        "outcomes_are": "normalized_shadow_sleeve_diagnostics",
+        "production_promotion_from_this_branch_alone": "FORBIDDEN",
+        "best_fixed_selection_in_this_phase": "FORBIDDEN",
+        "future_cloud_evaluation": "ALLOWED_ONLY_AFTER_THIS_PHASE_PASSES",
+        "flag": "cg_damage_duration_d03b_fixed_only_shadow_enable",
+        "flag_default": "0",
+    }
+
+
+def fixed_only_policy_schema():
+    return {
+        "comparison_eligible": list(FIXED_ONLY_POLICIES),
+        "comparison_ineligible": ["P0_CURRENT"],
+        "p0": {
+            "policy_id": "P0_CURRENT",
+            "numeric_status": "UNAVAILABLE",
+            "comparison_eligible": False,
+            "production_claim_eligible": False,
+        },
+        "shared_start": {
+            "normalized_shadow_sleeve_start": NORMALIZED_SHADOW_SLEEVE_START,
+            "description": (
+                "Every P1–P5 episode begins at identical withheld shadow-sleeve "
+                "fraction 0.0; no production restoration fraction is required."
+            ),
+        },
+    }
+
+
+def fixed_only_metric_schema():
+    return {
+        "units": UNITS_NORMALIZED_SHADOW_SLEEVE,
+        "allowed_metric_names": [
+            "normalized_shadow_sleeve_return",
+            "normalized_shadow_sleeve_drawdown",
+            "pairwise_policy_difference",
+            "shadow_withheld_upside",
+            "shadow_switch_count",
+            "policy_restore_fraction",
+        ],
+        "prohibited_metric_names": list(PROHIBITED_PRODUCTION_CLAIM_FIELDS),
+        "production_relative_metrics": "UNAVAILABLE",
+        "reason_if_needs_p0_or_production_gross": "PRODUCTION_COMPARISON_UNAVAILABLE",
+    }
+
+
+def claim_guard_reject(field_name):
+    """Return (UNAVAILABLE, reason) if field is a prohibited production claim."""
+    n = str(field_name or "").strip().lower()
+    if n in PROHIBITED_PRODUCTION_CLAIM_FIELDS:
+        return UNAVAILABLE, "PRODUCTION_CLAIM_FORBIDDEN"
+    return None
+
+
+def is_prohibited_production_claim(field_name):
+    return str(field_name or "").strip().lower() in PROHIBITED_PRODUCTION_CLAIM_FIELDS
+
+
+def build_fixed_only_pairwise(policy_fractions):
+    """P5 minus each of P1–P4. No best-fixed selection. Missing stays UNAVAILABLE."""
+    fr = dict(policy_fractions or {})
+    p5 = fr.get("P5_DYNAMIC", UNAVAILABLE)
+    rows = []
+    for pid in FIXED_ONLY_BASELINES:
+        base = fr.get(pid, UNAVAILABLE)
+        if not _avail(p5) or not _avail(base):
+            diff = UNAVAILABLE
+        else:
+            diff = _f(p5) - _f(base)
+        rows.append({
+            "metric": "pairwise_policy_difference",
+            "units": UNITS_NORMALIZED_SHADOW_SLEEVE,
+            "lhs": "P5_DYNAMIC",
+            "rhs": pid,
+            "lhs_fraction": p5,
+            "rhs_fraction": base,
+            "difference_p5_minus_fixed": diff,
+            "comparison_scope": "FIXED_ONLY_SHADOW",
+            "production_comparison_available": False,
+            "production_claim_eligible": False,
+            "best_fixed_selection": False,
+        })
+    return rows
+
+
+def annotate_fixed_only_row(row, fixed_only=False):
+    """Attach fixed-only claim/scope tags; P0 always comparison-ineligible."""
+    out = dict(row or {})
+    pid = out.get("policy_id")
+    if pid == "P0_CURRENT":
+        out["policy_restore_fraction"] = UNAVAILABLE
+        out["comparison_eligible"] = False
+        out["numeric_status"] = "UNAVAILABLE"
+        out["production_claim_eligible"] = False
+    elif fixed_only and pid in FIXED_ONLY_POLICIES:
+        out["comparison_eligible"] = True
+        out["normalized_shadow_sleeve_start"] = NORMALIZED_SHADOW_SLEEVE_START
+        out["units"] = UNITS_NORMALIZED_SHADOW_SLEEVE
+    else:
+        out["comparison_eligible"] = False if pid == "P0_CURRENT" else out.get("comparison_eligible", True)
+    if fixed_only:
+        out["comparison_scope"] = "FIXED_ONLY_SHADOW"
+        out["production_comparison_available"] = False
+        out["production_claim_eligible"] = False
+        out["units"] = UNITS_NORMALIZED_SHADOW_SLEEVE
+    return out
+
+
+def p0_exclusion_audit():
+    return {
+        "p0_numeric_source": "UNAVAILABLE",
+        "p0_numeric_comparison_eligible": False,
+        "p0_in_ranking": False,
+        "p0_in_aggregation": False,
+        "p0_in_denominator": False,
+        "p0_in_pairwise": False,
+        "p0_stop_verdict": P0_SOURCE_VERDICT,
+        "candidates_rejected": len(P0_CANDIDATES),
+    }

@@ -13,8 +13,14 @@ from cg_damage_duration_d03b_accounting import (
     MAX_CHECKPOINT_ROWS, MAX_EPISODE_ROWS, P0_AUDIT,
     resolve_p0_numeric_source, build_policy_observation, build_episode_summary,
     policy_runtime_schema, validate_timestamps,
+    FIXED_ONLY_POLICIES, FIXED_ONLY_BASELINES, NORMALIZED_SHADOW_SLEEVE_START,
+    fixed_only_shadow_contract, fixed_only_policy_schema, fixed_only_metric_schema,
+    build_fixed_only_pairwise, annotate_fixed_only_row, p0_exclusion_audit,
+    is_prohibited_production_claim, claim_guard_reject,
 )
-from cg_damage_duration_d03b_export import PolicyRuntimeExporter, ORDINARY_LOG_LIMIT
+from cg_damage_duration_d03b_export import (
+    PolicyRuntimeExporter, ORDINARY_LOG_LIMIT, fixed_only_pairwise_schema_rows,
+)
 
 FORBIDDEN_RE = re.compile(
     r"(?<![A-Za-z_])(History|AddEquity|AddData|SetHoldings|MarketOrder|LimitOrder|"
@@ -28,6 +34,7 @@ class ModelAShadowRuntimeAccounting:
 
     def __init__(self):
         self.enabled = False
+        self.fixed_only = False
         self.last_checkpoint = None
         self.seen_checkpoints = set()
         self.checkpoint_rows = []
@@ -41,10 +48,12 @@ class ModelAShadowRuntimeAccounting:
             "target_mutations": 0, "production_gross_mutations": 0,
         }
 
-    def update(self, snap_b, snap_c, shadow_out, d03b_enabled=True, prod_state=None):
+    def update(self, snap_b, snap_c, shadow_out, d03b_enabled=True, prod_state=None,
+               fixed_only_shadow_enable=False):
         if not d03b_enabled:
             return None
         self.enabled = True
+        self.fixed_only = bool(fixed_only_shadow_enable)
         if snap_b is None or shadow_out is None:
             return None
         b = deepcopy(snap_b)
@@ -59,7 +68,6 @@ class ModelAShadowRuntimeAccounting:
             return {"action": "DUPLICATE_CHECKPOINT_BLOCKED", "shadow_only": True}
 
         dt = get(b, "decision_time")
-        # stale: earlier decision_time than last accepted
         if (
             isinstance(dt, datetime)
             and self.checkpoint_rows
@@ -95,11 +103,10 @@ class ModelAShadowRuntimeAccounting:
             nav = prod_state.get("production_nav_read_only")
 
         rows = []
+        frac_map = {}
         for pid in POLICY_IDS:
             sp = out.get(pid) if isinstance(out.get(pid), dict) else {}
-            # map P0_CURRENT etc. keys from shadow_out
             if not sp:
-                # shadow_out uses same policy_id keys
                 for k, v in out.items():
                     if isinstance(v, dict) and v.get("policy_id") == pid:
                         sp = v
@@ -108,12 +115,22 @@ class ModelAShadowRuntimeAccounting:
                 pid, sp, b, c, out, p0_frac, p0_name, p0_conf,
                 production_nav_read_only=nav,
             )
+            row = annotate_fixed_only_row(row, fixed_only=self.fixed_only)
+            if pid in FIXED_ONLY_POLICIES:
+                frac_map[pid] = row.get("policy_restore_fraction", UNAVAILABLE)
             rows.append(row)
             self.checkpoint_rows.append(row)
             if len(self.checkpoint_rows) > MAX_CHECKPOINT_ROWS * len(POLICY_IDS):
                 self.checkpoint_rows = self.checkpoint_rows[-(MAX_CHECKPOINT_ROWS * len(POLICY_IDS)):]
 
         self.exporter.add_checkpoint_rows(rows)
+        pairwise = []
+        if self.fixed_only:
+            pairwise = build_fixed_only_pairwise(frac_map)
+            # P0 must never appear in pairwise universe
+            pairwise = [r for r in pairwise if r.get("rhs") != "P0_CURRENT" and r.get("lhs") != "P0_CURRENT"]
+            self.exporter.add_pairwise_rows(pairwise)
+
         eid = get(b, "episode_id")
         if eid not in (None, UNAVAILABLE) and eid not in self.episode_ids:
             self.episode_ids.append(eid)
@@ -126,11 +143,10 @@ class ModelAShadowRuntimeAccounting:
         if ck is not None:
             self.seen_checkpoints.add(ck)
             if len(self.seen_checkpoints) > MAX_CHECKPOINT_ROWS * 4:
-                # bound set growth
                 self.seen_checkpoints = set(list(self.seen_checkpoints)[-MAX_CHECKPOINT_ROWS * 2:])
         self.counters["snapshots"] += 1
         self.counters["policy_rows"] += len(rows)
-        return {
+        result = {
             "schema_version": SCHEMA_VERSION,
             "experiment": EXPERIMENT,
             "phase": PHASE,
@@ -141,8 +157,21 @@ class ModelAShadowRuntimeAccounting:
             "p0_source_name": p0_name,
             "p0_source_confidence": p0_conf,
             "p0_verdict": audit.get("verdict", P0_SOURCE_VERDICT),
+            "p0_comparison_eligible": False,
             "timestamp_gate": "PASS" if ok_ts else "FAIL",
+            "fixed_only_shadow_enable": self.fixed_only,
         }
+        if self.fixed_only:
+            result.update({
+                "comparison_scope": "FIXED_ONLY_SHADOW",
+                "production_comparison_available": False,
+                "production_claim_eligible": False,
+                "units": "NORMALIZED_SHADOW_SLEEVE",
+                "normalized_shadow_sleeve_start": NORMALIZED_SHADOW_SLEEVE_START,
+                "pairwise_count": len(pairwise),
+                "comparison_universe": list(FIXED_ONLY_POLICIES),
+            })
+        return result
 
     def export_summary(self):
         return {
@@ -343,10 +372,62 @@ def run_damage_d03b1_static_tests(param_map=None):
     d01 = run_damage_d01_static_tests()
     ok("45_d01_regression", d01.get("failed", 1) == 0 or d01.get("passed") == d01.get("total"))
 
+    # --- D0.3B2A fixed-only shadow contract ---
+    ok("F01_fixed_only_flag_default_off",
+       RRX_PARAMS.get("cg_damage_duration_d03b_fixed_only_shadow_enable") == "0")
+    ok("F02_disabled_noop_unchanged",
+       ModelAShadowRuntimeAccounting().update(None, None, None, d03b_enabled=False) is None)
+    ctr = fixed_only_shadow_contract()
+    ok("F03_contract_p0_stopped", ctr["original_p0_hypothesis"] == "STOPPED"
+       and ctr["production_claim_eligible"] is False)
+    ok("F04_universe", ctr["comparison_universe"] == list(FIXED_ONLY_POLICIES))
+    ok("F05_no_best_fixed", ctr["best_fixed_selection_in_this_phase"] == "FORBIDDEN")
+
+    rt_fo = ModelAShadowRuntimeAccounting()
+    sb2 = _snap_b(t0, 50)
+    sb2["decision_time"] = t0
+    sb2["feature_cutoff"] = t0 - timedelta(minutes=5)
+    sb2["action_eligible_time"] = t0 + timedelta(minutes=5)
+    sh2 = ModelAShadowRouter().update(sb2, _snap_c(t0, 50))
+    out_fo = rt_fo.update(sb2, _snap_c(t0, 50), sh2, d03b_enabled=True,
+                          fixed_only_shadow_enable=True)
+    ok("F06_p0_still_unavailable", out_fo["p0_numeric_restore_fraction"] == UNAVAILABLE
+       and out_fo["p0_comparison_eligible"] is False)
+    ok("F07_scope_tags", out_fo.get("comparison_scope") == "FIXED_ONLY_SHADOW"
+       and out_fo.get("production_comparison_available") is False
+       and out_fo.get("units") == "NORMALIZED_SHADOW_SLEEVE")
+    p0_rows = [r for r in rt_fo.checkpoint_rows if r.get("policy_id") == "P0_CURRENT"]
+    ok("F08_p0_comparison_ineligible",
+       all(r.get("comparison_eligible") is False for r in p0_rows))
+    ok("F09_shared_start",
+       all(r.get("normalized_shadow_sleeve_start") == NORMALIZED_SHADOW_SLEEVE_START
+           for r in rt_fo.checkpoint_rows if r.get("policy_id") in FIXED_ONLY_POLICIES))
+    pw = list(rt_fo.exporter.pairwise_rows)
+    ok("F10_pairwise_count4", len(pw) == 4)
+    ok("F11_pairwise_targets",
+       {r["rhs"] for r in pw} == set(FIXED_ONLY_BASELINES)
+       and all(r["lhs"] == "P5_DYNAMIC" for r in pw)
+       and "P0_CURRENT" not in {r["rhs"] for r in pw})
+    ok("F12_no_best_selection_in_rows", all(r.get("best_fixed_selection") is False for r in pw))
+    ok("F13_p0_exclusion_audit", p0_exclusion_audit()["p0_in_pairwise"] is False
+       and p0_exclusion_audit()["p0_numeric_comparison_eligible"] is False)
+    ok("F14_claim_guard", is_prohibited_production_claim("production_alpha")
+       and claim_guard_reject("portfolio_cagr")[0] == UNAVAILABLE)
+    ok("F15_metric_schema", "normalized_shadow_sleeve_return" in fixed_only_metric_schema()["allowed_metric_names"]
+       and "production_alpha" in fixed_only_metric_schema()["prohibited_metric_names"])
+    ok("F16_policy_schema", fixed_only_policy_schema()["p0"]["comparison_eligible"] is False)
+    ok("F17_pairwise_schema_static", len(fixed_only_pairwise_schema_rows()) == 4)
+    # P0 must not enter numeric aggregate of comparison-eligible fractions
+    elig = [r for r in rt_fo.checkpoint_rows if r.get("comparison_eligible") is True]
+    ok("F18_no_p0_in_eligible", all(r.get("policy_id") != "P0_CURRENT" for r in elig))
+    ok("F19_prod_claim_absent",
+       "production_improvement" not in str(out_fo) and "production_alpha" not in str(pw))
+
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
         "p0_verdict": P0_SOURCE_VERDICT,
-        "phase_verdict": "STOP_D0_P0_BASELINE_UNOBSERVABLE",
+        "phase_verdict": "FIXED_ONLY_SHADOW_CONTRACT_READY" if failed == 0 else "STOP_D0_SHADOW_FIXED_CONTRACT_INVALID",
+        "fixed_only_shadow_contract": "READY" if failed == 0 else "INVALID",
         "d01": d01, "d03a": d03a, "p4_repair": p4,
     }
 
