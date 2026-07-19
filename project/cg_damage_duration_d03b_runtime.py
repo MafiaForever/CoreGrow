@@ -21,11 +21,16 @@ from cg_damage_duration_d03b_accounting import (
 from cg_damage_duration_d03b_export import (
     PolicyRuntimeExporter, ORDINARY_LOG_LIMIT, fixed_only_pairwise_schema_rows,
 )
+from cg_damage_duration_d03b_compact_export import (
+    CompactStreamingAggregates, build_compact_closeout, compact_closeout_text,
+    compact_payload_bytes, export_mode_labels, run_compact_export_static_tests,
+    EXPORT_MODE, FULL_HISTORY_RAW_EXPORT, AGGREGATE_COVERAGE,
+)
 
 FORBIDDEN_RE = re.compile(
     r"(?<![A-Za-z_])(History|AddEquity|AddData|SetHoldings|MarketOrder|LimitOrder|"
-    r"StopMarketOrder|Liquidate)\s*\(|PortfolioTarget\b|ObjectStore\.(Save|Delete)\b|"
-    r"Schedule\.On\b"
+    r"StopMarketOrder|Liquidate)\s*\(|PortfolioTarget\b|"
+    r"ObjectStore\.(Save|SaveBytes|Delete)\b|Schedule\.On\b"
 )
 
 
@@ -40,6 +45,7 @@ class ModelAShadowRuntimeAccounting:
         self.checkpoint_rows = []
         self.episode_ids = []
         self.exporter = PolicyRuntimeExporter()
+        self.aggregates = CompactStreamingAggregates()
         self.p0_audit = dict(P0_AUDIT)
         self.counters = {
             "snapshots": 0, "duplicate_blocked": 0, "stale_blocked": 0,
@@ -62,9 +68,11 @@ class ModelAShadowRuntimeAccounting:
         ck = b.get("checkpoint_key")
         if ck is not None and ck == self.last_checkpoint:
             self.counters["duplicate_blocked"] += 1
+            self.aggregates.note_reject("DUPLICATE_CHECKPOINT_BLOCKED")
             return {"action": "DUPLICATE_CHECKPOINT_BLOCKED", "shadow_only": True}
         if ck is not None and ck in self.seen_checkpoints:
             self.counters["duplicate_blocked"] += 1
+            self.aggregates.note_reject("DUPLICATE_CHECKPOINT_BLOCKED")
             return {"action": "DUPLICATE_CHECKPOINT_BLOCKED", "shadow_only": True}
 
         dt = get(b, "decision_time")
@@ -75,6 +83,7 @@ class ModelAShadowRuntimeAccounting:
             and dt < self.checkpoint_rows[-1]["decision_time"]
         ):
             self.counters["stale_blocked"] += 1
+            self.aggregates.note_reject("STALE_CHECKPOINT_BLOCKED")
             return {"action": "STALE_CHECKPOINT_BLOCKED", "shadow_only": True}
 
         fc = get(b, "feature_cutoff")
@@ -89,6 +98,7 @@ class ModelAShadowRuntimeAccounting:
             "SAME_BAR_OVERLAP",
         ):
             self.counters["timestamp_fail"] += 1
+            self.aggregates.note_reject(ts_reason)
             return {"action": "TIMESTAMP_GATE_FAIL", "reason": ts_reason, "shadow_only": True}
 
         p0_frac, p0_name, p0_conf, audit = resolve_p0_numeric_source(
@@ -139,6 +149,18 @@ class ModelAShadowRuntimeAccounting:
         if eid not in (None, UNAVAILABLE):
             self.exporter.add_episode_row(build_episode_summary(eid, self.checkpoint_rows))
 
+        # Streaming aggregates over ALL valid observations (independent of sample caps).
+        self.aggregates.observe_recorded(
+            rows, pairwise,
+            decision_time=dt if isinstance(dt, datetime) else None,
+            episode_id=eid,
+            label_ok=True,
+            gate_ok=True,
+        )
+        self.aggregates.set_sample_retained(
+            len(self.exporter.checkpoint_rows), len(self.exporter.episode_rows))
+        self.aggregates.note_gate("TIMESTAMP_OK" if ok_ts else "TIMESTAMP_SOFT_FAIL")
+
         self.last_checkpoint = ck
         if ck is not None:
             self.seen_checkpoints.add(ck)
@@ -179,9 +201,23 @@ class ModelAShadowRuntimeAccounting:
             "exporter": self.exporter.summary(),
             "counters": dict(self.counters),
             "p0_audit": dict(self.p0_audit),
+            "export_mode_labels": export_mode_labels(),
+            "aggregates": self.aggregates.snapshot(),
             "checkpoint_sample_csv": self.exporter.checkpoint_csv()[:8000],
             "episode_sample_csv": self.exporter.episode_csv()[:4000],
         }
+
+    def compact_closeout_payload(self, source_manifest_hash=None):
+        return build_compact_closeout(
+            self.aggregates,
+            runtime_counters=self.counters,
+            source_manifest_hash=source_manifest_hash,
+            fixed_only=self.fixed_only,
+            p0_audit=self.p0_audit,
+        )
+
+    def compact_closeout_line(self, source_manifest_hash=None):
+        return compact_closeout_text(self.compact_closeout_payload(source_manifest_hash))
 
 
 def run_damage_d03b1_static_tests(param_map=None):
@@ -203,7 +239,9 @@ def run_damage_d03b1_static_tests(param_map=None):
     body = open(__file__, encoding="utf-8").read()
     acct = open(__file__.replace("d03b_runtime.py", "d03b_accounting.py"), encoding="utf-8").read()
     exp = open(__file__.replace("d03b_runtime.py", "d03b_export.py"), encoding="utf-8").read()
-    prod = body.split("def run_damage_d03b1_static_tests")[0].split("FORBIDDEN_RE")[0] + "\n" + acct + "\n" + exp
+    cexp = open(__file__.replace("d03b_runtime.py", "d03b_compact_export.py"), encoding="utf-8").read()
+    prod = (body.split("def run_damage_d03b1_static_tests")[0].split("FORBIDDEN_RE")[0]
+            + "\n" + acct + "\n" + exp + "\n" + cexp)
 
     ok("01_d03b_flag_default_off", RRX_PARAMS.get("cg_damage_duration_d03b_enable") == "0")
     rt = ModelAShadowRuntimeAccounting()
@@ -423,11 +461,37 @@ def run_damage_d03b1_static_tests(param_map=None):
     ok("F19_prod_claim_absent",
        "production_improvement" not in str(out_fo) and "production_alpha" not in str(pw))
 
+    # --- D0.3B2B compact aggregate export ---
+    ok("B01_compact_labels", EXPORT_MODE == "CLOUD_COMPACT_AGGREGATE"
+       and FULL_HISTORY_RAW_EXPORT == "NOT_AVAILABLE_IN_CLOUD_MODE"
+       and AGGREGATE_COVERAGE == "FULL_VALID_OBSERVATION_SET")
+    ok("B02_has_aggregates", hasattr(rt_fo, "aggregates")
+       and rt_fo.aggregates.valid_checkpoints >= 1)
+    line = rt_fo.compact_closeout_line(source_manifest_hash="STATIC")
+    ok("B03_compact_eoa_prefix", line.startswith("D0_COMPACT_CLOSEOUT,"))
+    ok("B04_compact_eoa_size", compact_payload_bytes(rt_fo.compact_closeout_payload()) < ORDINARY_LOG_LIMIT)
+    ok("B05_no_objectstore_in_prod_scan", "ObjectStore.Save(" not in prod
+       and "ObjectStore.SaveBytes(" not in prod
+       and "ObjectStore.Delete(" not in prod)
+    cex = run_compact_export_static_tests()
+    ok("B06_compact_suite", cex.get("failed", 1) == 0, detail=str(cex.get("failed")))
+    for crow in cex.get("rows") or []:
+        rows.append({"name": "CX_" + crow["name"], "pass": crow["pass"], "detail": crow.get("detail", "")})
+        if crow["pass"]:
+            passed += 1
+        else:
+            failed += 1
+
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
         "p0_verdict": P0_SOURCE_VERDICT,
-        "phase_verdict": "FIXED_ONLY_SHADOW_CONTRACT_READY" if failed == 0 else "STOP_D0_SHADOW_FIXED_CONTRACT_INVALID",
+        "phase_verdict": (
+            "CLOUD_PARITY_AND_COMPACT_EXPORT_READY" if failed == 0
+            else "STOP_D0_3B2B_REPAIR_STATIC_FAIL"
+        ),
         "fixed_only_shadow_contract": "READY" if failed == 0 else "INVALID",
+        "compact_export": cex,
+        "eoa_payload_size_bytes": cex.get("eoa_payload_size_bytes"),
         "d01": d01, "d03a": d03a, "p4_repair": p4,
     }
 

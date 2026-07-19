@@ -538,8 +538,25 @@ class CgDamageDurationD01DiagMixin:
                     f"static={rep_b3.get('passed', 0)}/{rep_b3.get('total', 0)},"
                     f"runtime_rows={n_b},p0={rep_b3.get('p0_verdict', 'UNRESOLVED')},"
                     f"verdict={rep_b3.get('phase_verdict', 'REPAIR_REQUIRED')},"
-                    f"next=D0.3B1_P0_NUMERIC_SOURCE_REPAIR"
+                    f"next=D0.3B2B_FIXED_ONLY_SHADOW_HISTORICAL_BACKTEST_RERUN"
                 )
+                # Compact aggregate closeout (full valid observation set; samples remain bounded).
+                if d03b is not None and hasattr(d03b, "compact_closeout_line"):
+                    try:
+                        line = d03b.compact_closeout_line(
+                            source_manifest_hash=getattr(self, "_dmg_source_manifest_hash", None))
+                        if line and len(line.encode("utf-8")) < 100 * 1024:
+                            self._DamageD01Log(line)
+                        else:
+                            self._DamageD01Log(
+                                "D0_COMPACT_CLOSEOUT,status=OVERSIZE_OR_EMPTY,"
+                                "export_mode=CLOUD_COMPACT_AGGREGATE"
+                            )
+                    except Exception:
+                        self._DamageD01Log(
+                            "D0_COMPACT_CLOSEOUT,status=EOA_EMIT_FAIL,"
+                            "export_mode=CLOUD_COMPACT_AGGREGATE"
+                        )
         except Exception as e:
             self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1
             self._DamageD01Log(f"CG_DAMAGE_D02A_EOA_FAIL,err={type(e).__name__}")
