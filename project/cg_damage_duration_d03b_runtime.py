@@ -84,7 +84,10 @@ class ModelAShadowRuntimeAccounting:
             return {"action": "TIMESTAMP_GATE_FAIL", "reason": ts_reason, "shadow_only": True}
 
         p0_frac, p0_name, p0_conf, audit = resolve_p0_numeric_source(
-            prod_state=prod_state, decision_time=dt if isinstance(dt, datetime) else None)
+            prod_state=prod_state,
+            decision_time=dt if isinstance(dt, datetime) else None,
+            feature_cutoff=fc if isinstance(fc, datetime) else None,
+        )
         self.p0_audit = audit
 
         nav = get(b, "NAV") if get(b, "NAV") != UNAVAILABLE else get(b, "production_nav_read_only")
@@ -185,16 +188,35 @@ def run_damage_d03b1_static_tests(param_map=None):
     sc = _snap_c(t0, 0)
     sh = router.update(sb, sc)
     out = rt.update(sb, sc, sh, d03b_enabled=True, prod_state={})
-    ok("03_p0_unresolved", out["p0_source_name"] == "UNRESOLVED"
-       and out["p0_numeric_restore_fraction"] == UNAVAILABLE)
-    ok("04_p0_reject_future", resolve_p0_numeric_source({"uses_future_fills": True}, t0)[0] == UNAVAILABLE)
-    ok("05_p0_accept_explicit_causal", resolve_p0_numeric_source({
+    ok("03_p0_unresolved", out["p0_source_name"] == "UNAVAILABLE"
+       and out["p0_numeric_restore_fraction"] == UNAVAILABLE
+       and out["p0_verdict"] == "STOP_D0_P0_BASELINE_UNOBSERVABLE")
+    ok("04_p0_reject_future", resolve_p0_numeric_source(
+        {"uses_future_fills": True}, t0, t0 - timedelta(minutes=5))[0] == UNAVAILABLE)
+    inj = resolve_p0_numeric_source({
         "p0_numeric_restore_fraction": 0.5,
-        "p0_source_time": t0 - timedelta(minutes=1),
+        "p0_source_time": t0 - timedelta(minutes=5),
         "p0_source_name": "TEST_FIELD",
-    }, t0)[1] == "TEST_FIELD")
+    }, t0, t0 - timedelta(minutes=5))
+    ok("05_reject_synthetic_injection",
+       inj[0] == UNAVAILABLE and inj[3].get("rejected") == "SYNTHETIC_OR_NONPRODUCTION_INJECTION")
     ok("06_p0_reject_same_bar_flag", resolve_p0_numeric_source(
-        {"uses_same_bar_overlap": True}, t0)[0] == UNAVAILABLE)
+        {"uses_same_bar_overlap": True}, t0, t0 - timedelta(minutes=5))[0] == UNAVAILABLE)
+    late = resolve_p0_numeric_source({
+        "p0_numeric_restore_fraction": 0.5,
+        "p0_source_time": t0 + timedelta(minutes=1),
+    }, t0, t0 - timedelta(minutes=5))
+    ok("06b_reject_after_cutoff",
+       late[0] == UNAVAILABLE and late[3].get("rejected") == "SOURCE_AFTER_FEATURE_CUTOFF")
+    ok("06c_reject_p1p5", resolve_p0_numeric_source(
+        {"from_p1_p5": True, "policy_id": "P5_DYNAMIC"}, t0)[0] == UNAVAILABLE)
+    ok("06d_reject_default_fallback", resolve_p0_numeric_source(
+        {"default_fraction": 1.0}, t0)[0] == UNAVAILABLE)
+    ok("06e_reject_later_holdings", resolve_p0_numeric_source(
+        {"from_later_holdings": True}, t0)[0] == UNAVAILABLE)
+    from cg_damage_duration_d03b_accounting import P0_CANDIDATES
+    ok("06f_candidate_lineage", len(P0_CANDIDATES) >= 10
+       and all(c.get("causal_verdict") == "REJECTED" for c in P0_CANDIDATES))
 
     sch = policy_runtime_schema()
     ok("07_policy_ids", sch["policies"] == list(POLICY_IDS))
@@ -303,7 +325,7 @@ def run_damage_d03b1_static_tests(param_map=None):
     ok("34_diag_defaults_off", RRX_PARAMS.get("cg_damage_duration_d01_enable") == "0"
        and RRX_PARAMS.get("cg_damage_duration_d02_enable") == "0"
        and RRX_PARAMS.get("cg_damage_duration_d03a_enable") == "0")
-    ok("35_p0_verdict_constant", P0_SOURCE_VERDICT == "STOP_P0_NUMERIC_SOURCE_UNRESOLVED")
+    ok("35_p0_verdict_constant", P0_SOURCE_VERDICT == "STOP_D0_P0_BASELINE_UNOBSERVABLE")
     ok("36_shadow_only", sch["shadow_only"] is True)
     ok("37_p5_one_step", "ONE_STEP_UP" in sh_src and "NORMAL_DOWNGRADE" in sh_src)
     ok("38_p5_dwell", "DWELL_BLOCK_UP" in sh_src)
@@ -324,7 +346,7 @@ def run_damage_d03b1_static_tests(param_map=None):
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
         "p0_verdict": P0_SOURCE_VERDICT,
-        "phase_verdict": "REPAIR_REQUIRED",
+        "phase_verdict": "STOP_D0_P0_BASELINE_UNOBSERVABLE",
         "d01": d01, "d03a": d03a, "p4_repair": p4,
     }
 
