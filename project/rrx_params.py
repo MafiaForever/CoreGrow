@@ -43,6 +43,7 @@ RRX_PARAMS = {
     "cg_macro_resid_b1_export_detail": "1",
     "cg_damage_duration_d01_enable":   "0",
     "cg_damage_duration_d02_enable":   "0",
+    "cg_damage_duration_d03a_enable":  "0",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
