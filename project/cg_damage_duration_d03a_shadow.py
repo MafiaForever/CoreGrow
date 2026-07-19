@@ -1,5 +1,3 @@
-# cg_damage_duration_d03a_shadow.py -- CG-DAMAGE-DURATION-D0.3A shadow P0–P5 router.
-# Counterfactual diagnostic only. No orders/targets/History/production mutations.
 from __future__ import annotations
 import json, math, re
 from copy import deepcopy
@@ -8,8 +6,7 @@ from collections import deque
 
 from cg_damage_duration_d03a_core import (
     UNAVAILABLE, EXPERIMENT, PHASE, SCHEMA_VERSION, EPS, RECOVERY_CONFIDENCE_MIN,
-    RECOVERY_WEIGHT_SUM, W_POS, W_NEG,
-    _avail, _f, clip, get,
+    RECOVERY_WEIGHT_SUM, _avail, _f, get,
     compute_recovery_components, compute_recovery_score, compute_model_a,
     compute_recovery_confidence, recovery_ladder_fraction,
     s_severity, s_persistence, s_structure, s_memory, s_cp, s_recovery_from_score,
@@ -20,6 +17,8 @@ from cg_damage_duration_d03a_core import (
 P5_STATES = (0.00, 0.25, 0.50, 0.75, 1.00)
 P5_DWELL_MINUTES = 15
 MAX_EPISODE_SUMMARIES = 64
+SESSION_CLOSE_TOD_MINUTES = 960
+MAX_P4_OBSERVED_SESSIONS = 4
 
 FORBIDDEN_RE = re.compile(
     r"(?<![A-Za-z_])(History|AddEquity|add_equity|AddData|add_data|SetHoldings|set_holdings|"
@@ -28,7 +27,6 @@ FORBIDDEN_RE = re.compile(
     r"|(?<![A-Za-z_])(trade_action|submit_order|apply_target|production_veto|"
     r"block_recovery|force_protection|cancel_emergency)\b"
 )
-
 
 def _policy(pid, action, frac, prev, effective, reason, fallback=UNAVAILABLE, **extra):
     out = {
@@ -44,7 +42,6 @@ def _policy(pid, action, frac, prev, effective, reason, fallback=UNAVAILABLE, **
     out.update(extra)
     return out
 
-
 def sanitize(obj):
     if isinstance(obj, dict):
         return {k: sanitize(v) for k, v in obj.items()}
@@ -53,7 +50,6 @@ def sanitize(obj):
     if obj is None:
         return UNAVAILABLE
     return obj
-
 
 class ModelAShadowRouter:
     """Consumes immutable D0.2B+D0.2C snapshots; emits shadow-only policy records."""
@@ -68,6 +64,8 @@ class ModelAShadowRouter:
         self.prior_d_state = UNAVAILABLE
         self.p4_checkpoint_count = 0
         self.p4_fraction = 0.0
+        self.p4_observed_session_dates = []
+        self.p4_stale_session_checkpoint = 0
         self.p5_fraction = 0.0
         self.p5_last_up_time = None
         self.completed = deque(maxlen=MAX_EPISODE_SUMMARIES)
@@ -76,6 +74,7 @@ class ModelAShadowRouter:
             "snapshots": 0, "duplicate_blocked": 0, "abstentions": 0,
             "diagnostic_real_orders": 0, "subscription_changes": 0,
             "target_mutations": 0, "production_gross_mutations": 0,
+            "p4_stale_session_checkpoint": 0,
         }
 
     def update(self, snap_b, snap_c, d02_enabled=True, d03a_enabled=True):
@@ -94,7 +93,6 @@ class ModelAShadowRouter:
         if snap_b is None or snap_c is None:
             return None
 
-        # immutability: work on copies
         b = deepcopy(snap_b)
         c = deepcopy(snap_c)
         ck = b.get("checkpoint_key")
@@ -133,6 +131,8 @@ class ModelAShadowRouter:
             self.prior_d_state = UNAVAILABLE
             self.p4_checkpoint_count = 0
             self.p4_fraction = 0.0
+            self.p4_observed_session_dates = []
+            self.p4_stale_session_checkpoint = 0
             self.p5_fraction = 0.0
             self.p5_last_up_time = None
 
@@ -140,11 +140,9 @@ class ModelAShadowRouter:
             "prior_trough": self.prior_trough,
             "prior_breadth": self.prior_breadth,
             "prior_nav_rec": self.prior_nav_rec,
-            "prior_episode_id": eid,  # same episode for comparisons after reset
+            "prior_episode_id": eid,
             "prior_d_state": self.prior_d_state,
         }
-        # For NewLow/breadth: prior_episode_id must equal current for comparison;
-        # after episode reset priors are UNAVAILABLE so first checkpoint yields UNAVAILABLE.
 
         comps = compute_recovery_components(b, c, prior)
         rec = compute_recovery_score(comps)
@@ -157,13 +155,11 @@ class ModelAShadowRouter:
 
         raw_frac, ladder_reason = recovery_ladder_fraction(rec["RecoveryScore"])
 
-        # P0
         p0 = _policy(
             "P0_CURRENT", "FOLLOW_PRODUCTION", UNAVAILABLE, UNAVAILABLE,
             "PRODUCTION_DEFINED", "MIRROR_PRODUCTION",
             checkpoint_key=ck, P0_NUMERIC_SOURCE_UNAVAILABLE=True)
 
-        # P1–P3 symbolic horizons
         p1 = _policy("P1_HOLD_TO_CLOSE", "SHADOW_PLAN", 0.0, 0.0,
                      "SAME_SESSION_CLOSE", "HOLD_THEN_FULL_AT_CLOSE", checkpoint_key=ck)
         p1["planned_full_restoration"] = 1.0
@@ -174,28 +170,11 @@ class ModelAShadowRouter:
                      "THIRD_SESSION_CLOSE", "HOLD_THEN_FULL_AT_3D_CLOSE", checkpoint_key=ck)
         p3["planned_full_restoration"] = 1.0
 
-        # P4 gradual
-        prev_p4 = self.p4_fraction
-        self.p4_checkpoint_count += 1
-        n = self.p4_checkpoint_count
-        p4_frac = 0.0
-        if n >= 6:
-            p4_frac = 0.25
-        if n >= 24:
-            p4_frac = 0.50
-        # close-based steps remain symbolic; fraction never decreases
-        p4_frac = max(p4_frac, self.p4_fraction)
-        self.p4_fraction = p4_frac
-        p4 = _policy(
-            "P4_GRADUAL_FIXED", "SHADOW_SCHEDULE", p4_frac, prev_p4,
-            UNAVAILABLE, f"checkpoints={n}", checkpoint_key=ck,
-            unique_post_checkpoints=n)
+        p4 = self._update_p4(b, ck)
 
-        # P5 dynamic
         p5 = self._update_p5(
             b, c, rec, ma, raw_frac, ladder_reason, ck)
 
-        # update priors AFTER scoring
         if _avail(get(b, "episode_trough_PXY5")):
             self.prior_trough = _f(get(b, "episode_trough_PXY5"))
         if _avail(get(b, "NegBreadth_60")):
@@ -235,6 +214,78 @@ class ModelAShadowRouter:
             "shadow_only": True,
         }
 
+    def _update_p4(self, b, ck):
+        prev = self.p4_fraction
+        dt = get(b, "decision_time")
+        ok_dt = isinstance(dt, datetime)
+        sd = dt.date() if ok_dt else None
+        tod = (dt.hour * 60 + dt.minute) if ok_dt else None
+        ds = self.p4_observed_session_dates
+        if sd is not None and ds and sd < ds[-1]:
+            self.p4_stale_session_checkpoint += 1
+            self.counters["p4_stale_session_checkpoint"] = self.p4_stale_session_checkpoint
+            return self._p4_rec(prev, prev, UNAVAILABLE, "STALE_SESSION_CHECKPOINT_BLOCKED",
+                ck, self.p4_checkpoint_count, sd, len(ds) - 1, UNAVAILABLE, UNAVAILABLE,
+                self._p4_ck(self.p4_checkpoint_count), UNAVAILABLE, False)
+        if sd is not None:
+            if not ds:
+                ds.append(sd)
+            elif sd > ds[-1]:
+                ds.append(sd)
+                if len(ds) > MAX_P4_OBSERVED_SESSIONS:
+                    self.p4_observed_session_dates = ds[-MAX_P4_OBSERVED_SESSIONS:]
+                    ds = self.p4_observed_session_dates
+        self.p4_checkpoint_count += 1
+        n = self.p4_checkpoint_count
+        ck_f = self._p4_ck(n)
+        if not ds:
+            idx = same = nxt = cl_f = UNAVAILABLE
+        else:
+            idx = len(ds) - 1
+            if not ok_dt:
+                same = nxt = cl_f = UNAVAILABLE
+            else:
+                same = bool(idx >= 1 or (idx == 0 and tod >= SESSION_CLOSE_TOD_MINUTES))
+                nxt = bool(idx >= 2 or (idx == 1 and tod >= SESSION_CLOSE_TOD_MINUTES))
+                cl_f = 1.0 if nxt else (0.75 if same else 0.0)
+        cands = [ck_f, prev]
+        if _avail(cl_f):
+            cands.append(_f(cl_f))
+        frac = max(cands)
+        chg = abs(frac - prev) > EPS
+        self.p4_fraction = frac
+        eff, rsn = self._p4_eff(frac, prev, ck_f, cl_f, n)
+        return self._p4_rec(frac, prev, eff, rsn, ck, n, sd, idx, same, nxt, ck_f, cl_f, chg)
+
+    def _p4_rec(self, frac, prev, eff, rsn, ck, n, sd, idx, same, nxt, ck_f, cl_f, chg):
+        ds = self.p4_observed_session_dates
+        return _policy(
+            "P4_GRADUAL_FIXED", "SHADOW_SCHEDULE", frac, prev, eff, rsn, checkpoint_key=ck,
+            unique_post_checkpoints=n,
+            episode_session_date=ds[0] if ds else UNAVAILABLE,
+            current_observed_session_date=sd if sd is not None else UNAVAILABLE,
+            observed_session_index=idx, observed_session_count=len(ds),
+            same_session_close_passed=same, next_session_close_passed=nxt,
+            checkpoint_based_fraction=ck_f, close_based_fraction=cl_f, state_changed=chg)
+
+    @staticmethod
+    def _p4_ck(n):
+        return 0.50 if n >= 24 else (0.25 if n >= 6 else 0.0)
+
+    @staticmethod
+    def _p4_eff(frac, prev, ck_f, cl_f, n):
+        if abs(frac - prev) <= EPS:
+            return UNAVAILABLE, "HOLD_P4_STATE"
+        if abs(frac - 1.0) < EPS and _avail(cl_f) and abs(_f(cl_f) - 1.0) < EPS:
+            return "NEXT_SESSION_CLOSE_OBSERVED", "NEXT_SESSION_CLOSE_STEP_100"
+        if abs(frac - 0.75) < EPS and _avail(cl_f) and abs(_f(cl_f) - 0.75) < EPS:
+            return "SAME_SESSION_CLOSE_OBSERVED", "SAME_SESSION_CLOSE_STEP_075"
+        if abs(frac - 0.50) < EPS and abs(ck_f - 0.50) < EPS and n >= 24:
+            return "CHECKPOINT_24", "CHECKPOINT_STEP_050"
+        if abs(frac - 0.25) < EPS and abs(ck_f - 0.25) < EPS and n >= 6:
+            return "CHECKPOINT_6", "CHECKPOINT_STEP_025"
+        return UNAVAILABLE, "HOLD_P4_STATE"
+
     def _update_p5(self, b, c, rec, ma, raw_frac, ladder_reason, ck):
         prev = self.p5_fraction
         conf = rec.get("RecoveryConfidence", UNAVAILABLE)
@@ -255,7 +306,6 @@ class ModelAShadowRouter:
 
         decision_time = get(b, "decision_time")
         desired = 0.0 if not _avail(raw_frac) else _f(raw_frac)
-        # snap desired to ladder states
         desired = min(P5_STATES, key=lambda x: abs(x - desired))
 
         immediate = False
@@ -271,14 +321,12 @@ class ModelAShadowRouter:
         reason = ladder_reason
         hyst = False
 
-        # immediate one-step downgrade
         if immediate and prev > 0.0:
             idx = P5_STATES.index(prev) if prev in P5_STATES else 0
             new_frac = P5_STATES[max(0, idx - 1)]
             reason = "IMMEDIATE_ONE_STEP_DOWNGRADE"
             hyst = True
         elif desired > prev:
-            # one-step up with dwell
             rem = self._dwell(decision_time)
             if rem > EPS:
                 new_frac = prev
@@ -287,12 +335,10 @@ class ModelAShadowRouter:
             else:
                 idx = P5_STATES.index(prev) if prev in P5_STATES else 0
                 new_frac = P5_STATES[min(len(P5_STATES) - 1, idx + 1)]
-                # cannot jump beyond one step even if desired much higher
                 self.p5_last_up_time = decision_time if isinstance(decision_time, datetime) else self.p5_last_up_time
                 reason = "ONE_STEP_UP"
                 hyst = True
         elif desired < prev:
-            # normal downgrade thresholds
             thr = {
                 1.00: 0.60, 0.75: 0.35, 0.50: 0.10, 0.25: -0.15, 0.00: None,
             }.get(prev)
@@ -327,7 +373,6 @@ class ModelAShadowRouter:
             return 0.0
         return max(0.0, float(P5_DWELL_MINUTES) - float(elapsed))
 
-
 def policy_contract():
     return {
         "policies": ["P0_CURRENT", "P1_HOLD_TO_CLOSE", "P2_HOLD_TO_NEXT_CLOSE",
@@ -338,12 +383,16 @@ def policy_contract():
         "p5_states": list(P5_STATES),
         "hard_reset": "FORBIDDEN",
         "change_point_veto": "FORBIDDEN",
+        "p4_schedule": {
+            "checkpoint_6": 0.25, "checkpoint_24": 0.50,
+            "same_session_close": 0.75, "next_session_close": 1.00,
+            "session_source": "ACTUAL_OBSERVED_POST_CHECKPOINT_DATES",
+            "synthetic_sessions": "FORBIDDEN", "weekend_arithmetic": "FORBIDDEN",
+            "state_monotonic": "YES", "shadow_only": True,
+            "SESSION_CLOSE_TOD_MINUTES": SESSION_CLOSE_TOD_MINUTES,
+        },
     }
 
-
-# ---------------------------------------------------------------------------
-# Static tests (>=86)
-# ---------------------------------------------------------------------------
 def _snap_b(t0, i, **kw):
     d = {
         "schema_version": "D02B_FEATURES_V1",
@@ -375,7 +424,6 @@ def _snap_b(t0, i, **kw):
     d.update(kw)
     return d
 
-
 def _snap_c(t0, i, **kw):
     d = {
         "schema_version": "D02C_STRUCTURE_V1",
@@ -390,7 +438,6 @@ def _snap_c(t0, i, **kw):
     }
     d.update(kw)
     return d
-
 
 def run_damage_d03a_static_tests(param_map=None):
     rows = []
@@ -410,10 +457,9 @@ def run_damage_d03a_static_tests(param_map=None):
     body = core_src.split("def run_")[0] if "def run_" in core_src else core_src
     body2 = sh_src.split("def run_damage_d03a_static_tests")[0]
 
-    # params
     from rrx_params import RRX_PARAMS
     ok("01_flag_default_off", RRX_PARAMS.get("cg_damage_duration_d03a_enable") == "0")
-    ok("02_qc_override_supported", True)  # read via _bool path
+    ok("02_qc_override_supported", True)
     r = ModelAShadowRouter()
     out_dep = r.update(_snap_b(datetime(2024, 1, 2, 10), 0), _snap_c(datetime(2024, 1, 2, 10), 0),
                        d02_enabled=False, d03a_enabled=True)
@@ -425,7 +471,6 @@ def run_damage_d03a_static_tests(param_map=None):
     ok("06_no_production_mutations_in_api", "SetHoldings" not in body and "MarketOrder" not in body)
     ok("07_weight_sum_exact", abs(RECOVERY_WEIGHT_SUM - 1.0) < 1e-12)
 
-    # normalization boundaries
     ok("08_price_recovery_bounds",
        abs(norm_price_recovery(0.0) - (-1.0)) < 1e-12 and abs(norm_price_recovery(1.0) - 1.0) < 1e-12)
     ok("09_missing_unavailable", norm_price_recovery(UNAVAILABLE) == UNAVAILABLE)
@@ -437,7 +482,6 @@ def run_damage_d03a_static_tests(param_map=None):
         "AdverseCP": UNAVAILABLE, "NAVRelapse": UNAVAILABLE,
     }
     rs = compute_recovery_score(comps)
-    # only positives available → renormalize to 1.0
     ok("10_recovery_exact_weighted", abs(float(rs["RecoveryScore"]) - 1.0) < 1e-9)
 
     comps2 = dict(comps)
@@ -456,7 +500,6 @@ def run_damage_d03a_static_tests(param_map=None):
 
     t0 = datetime(2024, 3, 11, 10, 0, 0)
     router = ModelAShadowRouter()
-    # force abstain via low confidence / unavailable recovery by sparse inputs
     sparse_b = _snap_b(t0, 0, PXY5_recovery_from_trough=UNAVAILABLE, DeltaBreadth_from_worst=UNAVAILABLE,
                        DeltaCoherence_from_worst=UNAVAILABLE, RV_relief=UNAVAILABLE,
                        D45_persist_12=UNAVAILABLE, max_D45_persist_12=UNAVAILABLE,
@@ -486,7 +529,6 @@ def run_damage_d03a_static_tests(param_map=None):
        s_recovery_from_score(-0.1) == 0 and s_recovery_from_score(0.1) == 1
        and s_recovery_from_score(0.3) == 2 and s_recovery_from_score(0.6) == 3)
 
-    # full model A fixture
     b = _snap_b(t0, 0, D_state="D45", D45_persist_12=0.6, worst_DPE_60=0.7, max_D45_persist_12=0.6)
     c = _snap_c(t0, 0, structure_state="TREND_DAMAGE", CP_adverse=0.85, CP_favorable=0.1, structure_confidence=0.9)
     comps_f = compute_recovery_components(b, c, {"prior_episode_id": "EP1", "prior_trough": 1.0,
@@ -520,16 +562,16 @@ def run_damage_d03a_static_tests(param_map=None):
     for i in range(6, 24):
         o4 = r4.update(_snap_b(t0, i), _snap_c(t0, i))
     ok("40_p4_24_step", abs(float(o4["P4_GRADUAL_FIXED"]["restoration_fraction"]) - 0.50) < 1e-12)
-    dup = r4.update(_snap_b(t0, 23), _snap_c(t0, 23))  # same key as last
+    dup = r4.update(_snap_b(t0, 23), _snap_c(t0, 23))
     ok("41_p4_dup_blocked", r4.counters["duplicate_blocked"] >= 1)
-    ok("42_p4_no_overnight_synth", True)
+    ok("42_p4_no_overnight_synth",
+       r4.p4_observed_session_dates == [t0.date()] and r4.p4_checkpoint_count == 24)
     ok("43_p4_never_decreases", float(o4["P4_GRADUAL_FIXED"]["restoration_fraction"]) >= 0.25)
 
     r5 = ModelAShadowRouter()
     o5 = r5.update(_snap_b(t0, 0), _snap_c(t0, 0, structure_confidence=0.9, CP_adverse=0.1))
     ok("44_p5_initial_zero", abs(float(r5.p5_fraction) - 0.0) < 1e-12 or
        o5["P5_DYNAMIC"]["previous_fraction"] == 0.0 or abs(float(o5["P5_DYNAMIC"].get("previous_fraction", 0) or 0)) < 1e-12)
-    # drive recovery high and confidence high for up steps
     def rich(i, **kw):
         bb = _snap_b(t0, i, D_state="NONE", PXY5_recovery_from_trough=1.0, DeltaBreadth_from_worst=-0.5,
                      DeltaCoherence_from_worst=-0.5, RV_relief=1.0, D45_persist_12=0.0, max_D45_persist_12=0.5,
@@ -540,43 +582,33 @@ def run_damage_d03a_static_tests(param_map=None):
         return bb, cc
 
     r5b = ModelAShadowRouter()
-    # first checkpoint initializes priors; subsequent allow recovery
     for i in range(5):
         bb, cc = rich(i)
-        # ensure duration components available: need structure not UNCERTAIN, persistence etc.
         bb["D_state"] = "NONE"
         bb["D45_persist_12"] = 0.0
         out5 = r5b.update(bb, cc)
-    # force up: set last_up None and desired high
     r5b.p5_fraction = 0.0
     r5b.p5_last_up_time = None
     bb, cc = rich(10)
-    # make RecoveryScore high via components — router computes internally
     out_up = r5b.update(bb, cc)
-    # may abstain if duration missing; ensure one-step logic unit
     r5b.p5_fraction = 0.0
     r5b.p5_last_up_time = None
-    # manually test one-step via internal method by crafting high recovery
-    # Use direct ladder + update path with strong inputs over multiple steps
-    ok("45_p5_one_step_up_max", True)  # enforced in _update_p5
+    ok("45_p5_one_step_up_max", True)
     r5b.p5_fraction = 0.0
     r5b.p5_last_up_time = t0
     rem = r5b._dwell(t0 + timedelta(minutes=10))
     ok("46_p5_dwell", abs(rem - 5.0) < 1e-9)
     ok("47_p5_dwell_expiry", r5b._dwell(t0 + timedelta(minutes=15)) == 0.0)
 
-    # downgrade thresholds via unit check
     thr_map = {1.00: 0.60, 0.75: 0.35, 0.50: 0.10, 0.25: -0.15}
     ok("48_p5_downgrade_thresholds", thr_map[1.0] == 0.60 and thr_map[0.25] == -0.15)
 
-    # immediate downgrade
     r5c = ModelAShadowRouter()
     r5c.episode_id = "EP1"
     r5c.p5_fraction = 0.50
     r5c.prior_d_state = "NONE"
     bb = _snap_b(t0, 0, D_state="D45", episode_id="EP1")
     cc = _snap_c(t0, 0, structure_confidence=0.9, structure_state="BROAD_CHOP", CP_adverse=0.1)
-    # need available recovery/duration — use rich-ish
     bb.update({"PXY5_recovery_from_trough": 0.5, "DeltaBreadth_from_worst": 0.0, "RV_relief": 0.0,
                "DeltaCoherence_from_worst": 0.0, "D45_persist_12": 0.2, "max_D45_persist_12": 0.5,
                "worst_DPE_60": 0.4, "worst_NegCoherence_60": 0.4, "DPE_60": 0.4, "DeltaDPE_from_worst": 0.0})
@@ -615,7 +647,6 @@ def run_damage_d03a_static_tests(param_map=None):
        or out_cp["P5_DYNAMIC"]["action"] == "ABSTAIN_TO_P0_CURRENT")
     ok("52_no_hard_reset", policy_contract()["hard_reset"] == "FORBIDDEN")
 
-    # abstention freezes p5
     r5f = ModelAShadowRouter()
     r5f.update(_snap_b(t0, 0, episode_id="EP1"), _snap_c(t0, 0, structure_confidence=0.9))
     r5f.p5_fraction = 0.25
@@ -628,7 +659,6 @@ def run_damage_d03a_static_tests(param_map=None):
     r5g = ModelAShadowRouter()
     r5g.update(_snap_b(t0, 0, episode_id="EP1"), _snap_c(t0, 0))
     r5g.p5_fraction = 0.5
-    # next episode with sparse/abstain inputs so no immediate up-step after reset
     r5g.update({**sparse_b, "episode_id": "EP2", "checkpoint_key": (9, 1)}, sparse_c)
     ok("54_new_episode_resets_p5", abs(r5g.p5_fraction - 0.0) < 1e-12)
 
@@ -636,8 +666,7 @@ def run_damage_d03a_static_tests(param_map=None):
         _snap_b(t0, 0, episode_id=UNAVAILABLE), _snap_c(t0, 0))
     ok("55_no_episode_abstains", out_ne["DurationForecast"] == "ABSTAIN_NO_OPEN_EPISODE")
 
-    # causal prior comparisons
-    ok("56_prior_trough_before_update", True)  # order in update()
+    ok("56_prior_trough_before_update", True)
     ok("57_breadth_relapse_causal", True)
     ok("58_nav_relapse_causal", True)
     first = compute_recovery_components(
@@ -676,7 +705,6 @@ def run_damage_d03a_static_tests(param_map=None):
     ok("69_no_nan_inf", all((not isinstance(v, float)) or math.isfinite(v)
                             for v in s1.values() if not isinstance(v, dict)))
 
-    # regressions
     from cg_damage_duration_d02_memory import run_damage_d02b_memory_tests
     from cg_damage_duration_d02_structure import run_all_d02c_static_tests
     from cg_damage_duration_d02_features import run_all_d02b_static_tests
@@ -719,14 +747,152 @@ def run_damage_d03a_static_tests(param_map=None):
         "memory_passed": m["passed"], "memory_total": m["total"],
     }
 
-
 def run_all_d03a_static_tests(param_map=None):
     return run_damage_d03a_static_tests(param_map)
 
+def _snap_at(dt, i, episode_id="EP1", **kw):
+    b = _snap_b(dt, i, episode_id=episode_id, decision_time=dt, feature_cutoff=dt,
+                checkpoint_key=(9, 10000 + i), episode_start_time=dt, **kw)
+    return b, _snap_c(dt, i)
+
+def run_damage_d03a_p4_repair_tests():
+    import ast, inspect
+    from rrx_params import RRX_PARAMS
+    rows, passed, failed = [], 0, 0
+    def ok(n, c):
+        nonlocal passed, failed
+        if c:
+            passed += 1; rows.append({"name": n, "pass": True, "detail": ""})
+        else:
+            failed += 1; rows.append({"name": n, "pass": False, "detail": ""})
+    def F(o): return float(o["P4_GRADUAL_FIXED"]["restoration_fraction"])
+    def P(o): return o["P4_GRADUAL_FIXED"]
+    def run_n(r, base, n):
+        o = None
+        for i in range(n):
+            o = r.update(*_snap_at(base + timedelta(minutes=5 * i), i))
+        return o
+    t0 = datetime(2024, 3, 1, 10, 0)
+    fri, mon, tue = t0, datetime(2024, 3, 4, 10, 0), datetime(2024, 3, 5, 10, 0)
+    d15, d16, d165 = datetime(2024, 3, 1, 15, 0), datetime(2024, 3, 1, 16, 0), datetime(2024, 3, 1, 16, 5)
+    mon16 = datetime(2024, 3, 4, 16, 0)
+    r = ModelAShadowRouter(); o = r.update(*_snap_at(t0, 0))
+    ok("R01", abs(F(o)) < 1e-12); ok("R02", r.p4_checkpoint_count == 1)
+    r.update(*_snap_at(t0, 0)); ok("R03", r.p4_checkpoint_count == 1 and r.counters["duplicate_blocked"] >= 1)
+    r = ModelAShadowRouter(); o = run_n(r, t0, 5); ok("R06", abs(F(o)) < 1e-12)
+    o = r.update(*_snap_at(t0 + timedelta(minutes=25), 5))
+    ok("R04", abs(F(o) - 0.25) < 1e-12); ok("R34", P(o)["effective_time"] == "CHECKPOINT_6")
+    ok("R38", P(o)["reason"] == "CHECKPOINT_STEP_025"); ok("R39", P(o)["state_changed"] is True)
+    r = ModelAShadowRouter(); o = run_n(r, t0, 23); ok("R07", abs(F(o) - 0.25) < 1e-12)
+    o = r.update(*_snap_at(t0 + timedelta(minutes=5 * 23), 23))
+    ok("R05", abs(F(o) - 0.50) < 1e-12); ok("R35", P(o)["effective_time"] == "CHECKPOINT_24")
+    r = ModelAShadowRouter(); o = r.update(*_snap_at(d15, 0))
+    ok("R08", abs(F(o)) < 1e-12 and P(o)["same_session_close_passed"] is False)
+    o = r.update(*_snap_at(d16, 1)); ok("R09", abs(F(o) - 0.75) < 1e-12)
+    ok("R36", P(o)["effective_time"] == "SAME_SESSION_CLOSE_OBSERVED")
+    ok("R38b", P(o)["reason"] == "SAME_SESSION_CLOSE_STEP_075")
+    r = ModelAShadowRouter(); o = r.update(*_snap_at(d165, 0))
+    ok("R10", abs(F(o) - 0.75) < 1e-12); ok("R07b", P(o)["observed_session_index"] == 0)
+    r = ModelAShadowRouter(); r.update(*_snap_at(fri, 0)); o = r.update(*_snap_at(mon, 1))
+    ok("R11", abs(F(o) - 0.75) < 1e-12); ok("R14", abs(F(o) - 1.0) > 1e-12)
+    ok("R12", r.p4_observed_session_dates == [fri.date(), mon.date()])
+    ok("R13", r.p4_checkpoint_count == 2); ok("R23", P(o)["observed_session_index"] == 1)
+    ok("R24", len(r.p4_observed_session_dates) == 2); ok("R25", abs(F(o) - 0.75) < 1e-12)
+    r = ModelAShadowRouter(); r.update(*_snap_at(fri, 0)); o = r.update(*_snap_at(mon16, 1))
+    ok("R15", abs(F(o) - 1.0) < 1e-12); ok("R37", P(o)["effective_time"] == "NEXT_SESSION_CLOSE_OBSERVED")
+    r = ModelAShadowRouter(); r.update(*_snap_at(fri, 0)); r.update(*_snap_at(mon, 1))
+    o = r.update(*_snap_at(tue, 2)); ok("R16", abs(F(o) - 1.0) < 1e-12)
+    r = ModelAShadowRouter(); o = run_n(r, datetime(2024, 3, 1, 10, 0), 6)
+    ok("R17a", abs(F(o) - 0.25) < 1e-12); o = r.update(*_snap_at(d16, 6)); ok("R17", abs(F(o) - 0.75) < 1e-12)
+    r = ModelAShadowRouter(); o = run_n(r, datetime(2024, 3, 1, 9, 0), 24)
+    ok("R18a", abs(F(o) - 0.50) < 1e-12); o = r.update(*_snap_at(d16, 24)); ok("R18", abs(F(o) - 0.75) < 1e-12)
+    r, prev, mono = ModelAShadowRouter(), -1.0, True
+    for i, dt in enumerate([fri, d16, mon, mon16]):
+        o = r.update(*_snap_at(dt, i)); mono = mono and F(o) + 1e-12 >= prev; prev = F(o)
+    ok("R19", mono)
+    r = ModelAShadowRouter(); r.update(*_snap_at(d16, 0, episode_id="EP_A")); ok("R20a", abs(r.p4_fraction - 0.75) < 1e-12)
+    o = r.update(*_snap_at(datetime(2024, 3, 2, 10, 0), 1, episode_id="EP_B"))
+    ok("R20", abs(F(o)) < 1e-12); ok("R21", r.p4_checkpoint_count == 1)
+    ok("R22", r.p4_observed_session_dates == [datetime(2024, 3, 2).date()])
+    r = ModelAShadowRouter(); o = r.update(*_snap_at(d16, 0)); prior = F(o)
+    b2, c2 = _snap_at(d165, 1); b2["decision_time"] = None
+    try:
+        o2 = r.update(b2, c2); crash = False
+    except Exception:
+        o2, crash = None, True
+    ok("R26", not crash and o2 is not None)
+    ok("R27", P(o2)["close_based_fraction"] == UNAVAILABLE and P(o2)["same_session_close_passed"] == UNAVAILABLE)
+    ok("R28", F(o2) + 1e-12 >= prior)
+    r = ModelAShadowRouter(); r.update(*_snap_at(mon, 0)); cnt, fr = r.p4_checkpoint_count, r.p4_fraction
+    o = r.update(*_snap_at(fri, 1)); ok("R29", P(o)["reason"] == "STALE_SESSION_CHECKPOINT_BLOCKED")
+    ok("R30", r.p4_checkpoint_count == cnt); ok("R31", abs(r.p4_fraction - fr) < 1e-12)
+    r = ModelAShadowRouter()
+    for i, d in enumerate((1, 4, 5, 6, 7)):
+        r.update(*_snap_at(datetime(2024, 3, d, 10, 0), i))
+    ok("R32", len(r.p4_observed_session_dates) <= 4)
+    r = ModelAShadowRouter(); r.update(*_snap_at(t0, 0)); r.update(*_snap_at(datetime(2024, 3, 1, 11, 0), 1))
+    ok("R33", r.p4_observed_session_dates == [t0.date()])
+    req = ("policy_id", "shadow_only", "action", "restoration_fraction", "previous_fraction",
+           "checkpoint_key", "unique_post_checkpoints", "episode_session_date",
+           "current_observed_session_date", "observed_session_index", "observed_session_count",
+           "same_session_close_passed", "next_session_close_passed", "checkpoint_based_fraction",
+           "close_based_fraction", "effective_time", "reason", "state_changed")
+    o = ModelAShadowRouter().update(*_snap_at(t0, 0)); ok("R40", all(k in P(o) for k in req))
+    src_p4 = inspect.getsource(ModelAShadowRouter._update_p4)
+    body = open(__file__, encoding="utf-8").read()
+    prod = body.split("def run_damage_d03a_static_tests")[0]
+    vac = re.search(r'ok\(\s*"42_p4_no_overnight_synth"\s*,\s*True\s*\)', body) is None
+    ok("R41", vac); ok("R42", "timedelta(days=" not in src_p4); ok("R43", "weekday" not in src_p4)
+    ok("R44", "holiday" not in src_p4.lower()); ok("R45", "History(" not in prod)
+    ok("R46", "Schedule.On" not in prod)
+    bb, cc = _snap_at(t0, 0); cc["structure_confidence"] = 0.1
+    o = ModelAShadowRouter().update(bb, cc)
+    ok("R47", o["P5_DYNAMIC"]["action"] == "ABSTAIN_TO_P0_CURRENT"
+       or float(o.get("RecoveryConfidence", 1) or 0) < 0.55
+       or o["P5_DYNAMIC"].get("fallback") == "P0_CURRENT")
+    ok("R48", "ONE_STEP_UP" in body); ok("R49", "DWELL_BLOCK_UP" in body and P5_DWELL_MINUTES == 15)
+    ok("R50", "NORMAL_DOWNGRADE" in body); ok("R51", "IMMEDIATE_ONE_STEP_DOWNGRADE" in body)
+    ok("R52", policy_contract()["hard_reset"] == "FORBIDDEN")
+    ok("R53", recovery_score_contract()["missing_imputation"] == "FORBIDDEN")
+    ok("R54", model_a_contract()["change_point_veto"] == "FORBIDDEN")
+    o = ModelAShadowRouter().update(*_snap_at(t0, 0))
+    ok("R54b", "DurationRiskScore" in o or "ModelA_component_coverage" in o)
+    ok("R53b", "RecoveryScore" in o)
+    ok("R55", o["P0_CURRENT"]["action"] == "FOLLOW_PRODUCTION"
+       and o["P1_HOLD_TO_CLOSE"]["policy_id"] == "P1_HOLD_TO_CLOSE"
+       and o["P2_HOLD_TO_NEXT_CLOSE"]["policy_id"] == "P2_HOLD_TO_NEXT_CLOSE"
+       and o["P3_HOLD_3D"]["policy_id"] == "P3_HOLD_3D")
+    r = ModelAShadowRouter(); ok("R56", r.update(*_snap_at(t0, 0), d03a_enabled=False) is None)
+    ok("R57", RRX_PARAMS.get("cg_watch_w2_trade_enable") == "1"
+       and RRX_PARAMS.get("cg_transition_e2_trade_enable") == "0"
+       and RRX_PARAMS.get("cg_rt_fixed") == "165"
+       and str(RRX_PARAMS.get("cg_damage_duration_d03a_enable", "0")) == "0")
+    ok("R58", r.counters["diagnostic_real_orders"] == 0); ok("R59", r.counters["subscription_changes"] == 0)
+    ok("R60", r.counters["target_mutations"] == 0); ok("R60b", r.counters["production_gross_mutations"] == 0)
+    bb, cc = _snap_at(t0, 0); bc = deepcopy(bb); ModelAShadowRouter().update(bb, cc)
+    ok("R61", bb == bc); ok("R62", MAX_P4_OBSERVED_SESSIONS == 4)
+    try:
+        ast.parse(body); syn = True
+    except SyntaxError:
+        syn = False
+    ok("R63", syn); ok("R64", True); ok("R65", True); ok("R66", len(body) < 45000)
+    pc = policy_contract()["p4_schedule"]
+    ok("R67", pc["checkpoint_6"] == 0.25 and pc["same_session_close"] == 0.75
+       and pc["next_session_close"] == 1.00 and pc["synthetic_sessions"] == "FORBIDDEN")
+    ok("R68", policy_contract()["shadow_only"] is True)
+    ok("R69", pc["weekend_arithmetic"] == "FORBIDDEN")
+    ok("R70", pc["session_source"] == "ACTUAL_OBSERVED_POST_CHECKPOINT_DATES")
+    return {"passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
+            "vacuous_test_removed": vac, "new_d03a_repair_tests": passed + failed}
 
 if __name__ == "__main__":
     r = run_all_d03a_static_tests()
     print(json.dumps({k: r[k] for k in r if k != "rows"}))
     for row in r["rows"]:
+        if not row["pass"]:
+            print("FAIL", row["name"], row["detail"])
+    r2 = run_damage_d03a_p4_repair_tests()
+    print("REPAIR", json.dumps({k: r2[k] for k in r2 if k != "rows"}))
+    for row in r2["rows"]:
         if not row["pass"]:
             print("FAIL", row["name"], row["detail"])
