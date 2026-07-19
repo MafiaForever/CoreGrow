@@ -29,6 +29,10 @@ from cg_damage_duration_d03a_shadow import (
     ModelAShadowRouter, run_all_d03a_static_tests, EXPERIMENT as D03A_EXPERIMENT,
     PHASE as D03A_PHASE,
 )
+from cg_damage_duration_d03b_runtime import (
+    ModelAShadowRuntimeAccounting, run_all_d03b1_static_tests,
+    EXPERIMENT as D03B_EXPERIMENT, PHASE as D03B_PHASE,
+)
 
 _SH_ACTIVE = frozenset(("HEDGED", "ENTRY_PENDING", "EXIT_PENDING"))
 
@@ -40,6 +44,7 @@ class CgDamageDurationD01DiagMixin:
         self.cg_damage_duration_d01_enable = _bool("cg_damage_duration_d01_enable", "0")
         self.cg_damage_duration_d02_enable = _bool("cg_damage_duration_d02_enable", "0")
         self.cg_damage_duration_d03a_enable = _bool("cg_damage_duration_d03a_enable", "0")
+        self.cg_damage_duration_d03b_enable = _bool("cg_damage_duration_d03b_enable", "0")
 
     def _DamageD01MaybeEnableMs(self):
         if getattr(self, "cg_damage_duration_d01_enable", False) or getattr(
@@ -58,6 +63,10 @@ class CgDamageDurationD01DiagMixin:
             self._ms_err = int(getattr(self, "_ms_err", 0) or 0) + 1
         try:
             self._DamageD03aInitHooks()
+        except Exception:
+            self._ms_err = int(getattr(self, "_ms_err", 0) or 0) + 1
+        try:
+            self._DamageD03bInitHooks()
         except Exception:
             self._ms_err = int(getattr(self, "_ms_err", 0) or 0) + 1
 
@@ -214,6 +223,28 @@ class CgDamageDurationD01DiagMixin:
         )
         if int(rep.get("failed", 1) or 0):
             self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1
+
+    def _DamageD03bInitHooks(self):
+        # D0.3B1 accounting/export; requires D0.3A. Default OFF.
+        if not getattr(self, "cg_damage_duration_d03b_enable", False):
+            return
+        if not getattr(self, "cg_damage_duration_d03a_enable", False):
+            self._DamageD01Log("CG_DAMAGE_D03B_INIT,enable=1,dependency=D03A_REQUIRED,initialized=0")
+            return
+        self._dmg_d03b = ModelAShadowRuntimeAccounting()
+        lp = list(getattr(self, "log_only_prefixes", None) or [])
+        if "CG_DAMAGE_D03B_" not in lp:
+            lp.append("CG_DAMAGE_D03B_")
+        self.log_only_prefixes = lp
+        try:
+            rep = run_all_d03b1_static_tests()
+        except Exception:
+            rep = {"passed": 0, "failed": 1, "total": 1}
+        self._dmg_d03b_static = rep
+        self._DamageD01Log(
+            f"CG_DAMAGE_D03B_INIT,enable=1,tests={rep.get('passed', 0)}/{rep.get('total', 0)},"
+            f"p0={rep.get('p0_verdict', 'UNRESOLVED')},verdict={rep.get('phase_verdict', 'REPAIR_REQUIRED')}"
+        )
 
     def _DamageD01Log(self, msg):
         try:
@@ -376,11 +407,23 @@ class CgDamageDurationD01DiagMixin:
                 if d02c is not None and snap_b is not None:
                     snap_c = d02c.update(snap_b)
                 d03a = getattr(self, "_dmg_d03a", None)
+                shadow_out = None
                 if d03a is not None and snap_b is not None:
-                    d03a.update(
+                    shadow_out = d03a.update(
                         snap_b, snap_c if snap_c is not None else getattr(d02c, "last_snapshot", None),
                         d02_enabled=bool(getattr(self, "cg_damage_duration_d02_enable", False)),
                         d03a_enabled=bool(getattr(self, "cg_damage_duration_d03a_enable", False)),
+                    )
+                d03b = getattr(self, "_dmg_d03b", None)
+                if d03b is not None and snap_b is not None and shadow_out is not None:
+                    sb_acc = dict(snap_b)
+                    if sb_acc.get("action_eligible_time") in (None,):
+                        sb_acc["action_eligible_time"] = act
+                    d03b.update(
+                        sb_acc, snap_c if snap_c is not None else getattr(d02c, "last_snapshot", None),
+                        shadow_out,
+                        d03b_enabled=bool(getattr(self, "cg_damage_duration_d03b_enable", False)),
+                        prod_state={"production_nav_read_only": nav},
                     )
             self._dmg_prev_prot = active
             self._dmg_d02_ctr = dict(sens.counters)
@@ -480,7 +523,18 @@ class CgDamageDurationD01DiagMixin:
                     f"CG_DAMAGE_D03A_CLOSEOUT,experiment={D03A_EXPERIMENT},phase={D03A_PHASE},"
                     f"static={rep_a.get('passed', 0)}/{rep_a.get('total', 0)},"
                     f"shadow_snapshots={n_a},model_a=IMPLEMENTED,p5=IMPLEMENTED,"
-                    f"production_actions=0,next=D0.3B_MODEL_A_SHADOW_RUNTIME_BACKTEST"
+                    f"production_actions=0,next=D0.3B1_ACCOUNTING_EXPORT"
+                )
+            if getattr(self, "cg_damage_duration_d03b_enable", False):
+                rep_b3 = getattr(self, "_dmg_d03b_static", None) or {}
+                d03b = getattr(self, "_dmg_d03b", None)
+                n_b = int(getattr(d03b, "counters", {}).get("snapshots", 0) or 0) if d03b else 0
+                self._DamageD01Log(
+                    f"CG_DAMAGE_D03B_CLOSEOUT,experiment={D03B_EXPERIMENT},phase={D03B_PHASE},"
+                    f"static={rep_b3.get('passed', 0)}/{rep_b3.get('total', 0)},"
+                    f"runtime_rows={n_b},p0={rep_b3.get('p0_verdict', 'UNRESOLVED')},"
+                    f"verdict={rep_b3.get('phase_verdict', 'REPAIR_REQUIRED')},"
+                    f"next=D0.3B1_P0_NUMERIC_SOURCE_REPAIR"
                 )
         except Exception as e:
             self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1
