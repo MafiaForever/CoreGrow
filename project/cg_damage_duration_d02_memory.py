@@ -348,7 +348,7 @@ def run_damage_d02b_memory_tests():
             failed += 1
             rows.append({"name": name, "pass": 0, "detail": detail})
 
-    # Cloud-safe: no open() source scan. Forbidden-API gate is external
+    # Cloud-safe: no file-read API source scan. Forbidden-API gate is external
     # (tools/cg_damage_cloudsafe_scan.py). Behavioral: memory has no trading APIs.
     ok("M01_no_forbidden_api_patterns",
        not any(hasattr(EventMemoryStore, n) for n in (

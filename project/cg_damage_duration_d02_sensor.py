@@ -398,7 +398,7 @@ def run_damage_d02a_static_tests(param_map=None, sensor_src=None, diag_src=None)
     # 3 disabled runtime no-op
     ok("03_disabled_d02_runtime_noop", _d02_disabled_noop_probe())
 
-    # 4-6 independence: Cloud-safe behavioral checks (no open()/source scan).
+    # 4-6 independence: Cloud-safe behavioral checks (no file-read API/source scan).
     # Optional sensor_src retained for external Cursor tooling only.
     _ = sensor_src  # unused in Cloud path; external scanners may still pass text
     ok("04_independent_symbols_contract", SENSOR_SYMBOLS == ("SPY", "XLE", "XLB", "XLV", "XLU"))

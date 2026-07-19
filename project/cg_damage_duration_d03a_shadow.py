@@ -452,7 +452,7 @@ def run_damage_d03a_static_tests(param_map=None):
             failed += 1
             rows.append({"name": name, "pass": 0, "detail": str(detail)})
 
-    # Cloud-safe: no open()/source scan. Forbidden-API gate is external.
+    # Cloud-safe: no file-read API/source scan. Forbidden-API gate is external.
     from rrx_params import RRX_PARAMS
     ok("01_flag_default_off", RRX_PARAMS.get("cg_damage_duration_d03a_enable") == "0")
     ok("02_qc_override_supported", True)
@@ -837,7 +837,7 @@ def run_damage_d03a_p4_repair_tests():
            "same_session_close_passed", "next_session_close_passed", "checkpoint_based_fraction",
            "close_based_fraction", "effective_time", "reason", "state_changed")
     o = ModelAShadowRouter().update(*_snap_at(t0, 0)); ok("R40", all(k in P(o) for k in req))
-    # Cloud-safe: no open()/inspect.getsource. Contracts + behavioral coverage.
+    # Cloud-safe: no file-read API/inspect.getsource. Contracts + behavioral coverage.
     pc0 = policy_contract()
     ok("R41", pc0["p4_schedule"]["synthetic_sessions"] == "FORBIDDEN")
     ok("R42", pc0["p4_schedule"]["weekend_arithmetic"] == "FORBIDDEN")

@@ -236,7 +236,7 @@ def run_damage_d03b1_static_tests(param_map=None):
             failed += 1
             rows.append({"name": n, "pass": False, "detail": str(detail)})
 
-    # Cloud-safe: no open()/Path.read_text introspection in this module.
+    # Cloud-safe: no file-read API / Path.read_text introspection in this module.
     # Source-text gates live in Cursor-local tools/cg_damage_cloudsafe_scan.py.
 
     ok("01_d03b_flag_default_off", RRX_PARAMS.get("cg_damage_duration_d03b_enable") == "0")

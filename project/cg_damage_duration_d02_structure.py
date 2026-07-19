@@ -308,7 +308,7 @@ def run_damage_d02c_static_tests():
             failed += 1
             rows.append({"name": name, "pass": 0, "detail": str(detail)})
 
-    # Cloud-safe: no open()/source scan. Forbidden-API gate is external
+    # Cloud-safe: no file-read API/source scan. Forbidden-API gate is external
     # (tools/cg_damage_cloudsafe_scan.py). Behavioral API absence checks below.
     ok("01_frozen_constants",
        CP_WARMUP_VALID_CHECKPOINTS == 24 and CP_ALPHA == 0.10 and CP_SCALE_ALPHA == 0.10

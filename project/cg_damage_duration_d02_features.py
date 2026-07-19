@@ -799,7 +799,7 @@ def run_damage_d02b_feature_tests():
             failed += 1
             rows.append({"name": name, "pass": 0, "detail": str(detail)})
 
-    # Cloud-safe: no open()/source scan. Forbidden-API gate is external.
+    # Cloud-safe: no file-read API / source scan. Forbidden-API gate is external.
     ok("01_windows_exact", WINDOWS_MINUTES == (15, 30, 60, 120))
     ok("02_symbols_exact", list(SENSOR_SYMBOLS) == ["SPY", "XLE", "XLB", "XLV", "XLU"])
     ok("03_no_forbidden_apis",
@@ -1025,7 +1025,7 @@ def run_damage_d02b_feature_tests():
     ok("59_sanitize_inf", sanitize_snapshot({"x": float("inf")})["x"] == UNAVAILABLE)
     ok("60_sign_zero", sign(0.0) == 0 and sign(1) == 1 and sign(-1) == -1)
 
-    # regression: D0.2A tests (Cloud-safe: no open() for sensor_src)
+    # regression: D0.2A tests (Cloud-safe: no file-read API for sensor_src)
     r2a = run_damage_d02a_static_tests()
     ok("61_d02a_regression_46", r2a["failed"] == 0 and r2a["total"] >= 46)
     ok("62_d02a_mismatches_zero", r2a.get("fixture_variant_mismatches", 1) == 0)
@@ -1264,7 +1264,7 @@ def run_damage_d02b_repair_tests():
     ok("R39_no_nan_inf", all((not isinstance(v, float)) or math.isfinite(v)
                              for v in snap_ae.values() if not isinstance(v, dict)))
 
-    # R40-R42 regressions (Cloud-safe: no open())
+    # R40-R42 regressions (Cloud-safe: no file-read API)
     r2a = run_damage_d02a_static_tests()
     ok("R40_d02a_parity", r2a["failed"] == 0 and r2a.get("fixture_variant_mismatches", 1) == 0)
     mrep = run_damage_d02b_memory_tests()
