@@ -102,6 +102,24 @@ class ModelAShadowRouter:
 
         eid = get(b, "episode_id")
         if eid is None or eid == UNAVAILABLE:
+            # Confirmed-close / no-open: clear per-episode P4/P5 schedule state.
+            if self.episode_id not in (None, UNAVAILABLE):
+                self.completed.append({
+                    "episode_id": self.episode_id,
+                    "final_p5": self.p5_fraction,
+                    "final_p4": self.p4_fraction,
+                })
+                self.episode_id = UNAVAILABLE
+                self.prior_trough = UNAVAILABLE
+                self.prior_breadth = UNAVAILABLE
+                self.prior_nav_rec = UNAVAILABLE
+                self.prior_d_state = UNAVAILABLE
+                self.p4_checkpoint_count = 0
+                self.p4_fraction = 0.0
+                self.p4_observed_session_dates = []
+                self.p4_stale_session_checkpoint = 0
+                self.p5_fraction = 0.0
+                self.p5_last_up_time = None
             out = self._identity(b, c)
             out["DurationForecast"] = "ABSTAIN_NO_OPEN_EPISODE"
             out["P5_DYNAMIC"] = _policy(

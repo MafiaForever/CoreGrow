@@ -234,7 +234,8 @@ class CompactStreamingAggregates:
 
 
 def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_hash=None,
-                           fixed_only=False, p0_audit=None):
+                           fixed_only=False, p0_audit=None, lifecycle_yearly=None,
+                           lifecycle_counters=None):
     """Deterministic compact EOA payload; ordinary-log safe."""
     agg = aggregates.snapshot() if aggregates is not None else {}
     labels = export_mode_labels()
@@ -242,6 +243,10 @@ def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_ha
     if p0_audit:
         p0 = dict(p0)
         p0["runtime_audit_verdict"] = (p0_audit or {}).get("verdict", UNAVAILABLE)
+    ly = {}
+    for y, bucket in sorted((lifecycle_yearly or {}).items()):
+        ly[str(y)] = dict(bucket or {})
+    lc = dict(lifecycle_counters or {})
     payload = {
         "prefix": D0_COMPACT_PREFIX,
         "schema_version": COMPACT_SCHEMA_VERSION,
@@ -256,10 +261,13 @@ def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_ha
             "production_claim_eligible": False,
         },
         "runtime_counters": dict(runtime_counters or {}),
+        "lifecycle_counters": lc,
+        "lifecycle_yearly": ly,
         "source_manifest_hash": source_manifest_hash or UNAVAILABLE,
         "aggregates": agg,
         "artifact_completeness": {
             "aggregates": "COMPLETE_VALID_OBSERVATION_SET",
+            "lifecycle_yearly": "COMPLETE_VALID_OBSERVATION_SET",
             "raw_checkpoint_export": FULL_HISTORY_RAW_EXPORT,
             "raw_episode_export": FULL_HISTORY_RAW_EXPORT,
             "bounded_sample_only": True,
@@ -366,6 +374,12 @@ def compact_export_schema():
             "coverage_by_year", "valid_checkpoints", "valid_episodes",
             "policy_metrics", "pairwise_metrics", "gate_counters",
             "rejected_reason_counts", "sample_meta",
+        ],
+        "required_lifecycle_yearly_fields": [
+            "open", "provisional_close", "confirmed_close", "reopen", "merge",
+            "relapse_child", "attach_to_open", "release_check",
+            "reject_unavailable", "reject_stale", "reject_duplicate",
+            "reject_label_unavailable", "eoy_open_count", "eoy_open_age",
         ],
     }
 
@@ -723,6 +737,30 @@ def run_compact_export_static_tests():
     ok("C18_eoa_below_100kb", nbytes < ORDINARY_LOG_LIMIT, detail=str(nbytes))
     ok("C19_eoa_deterministic",
        compact_closeout_text(payload) == compact_closeout_text(payload))
+
+    # lifecycle yearly full-aggregate fields in compact closeout
+    ly_fix = {
+        "2024": {
+            "open": 2, "provisional_close": 2, "confirmed_close": 1, "reopen": 1,
+            "merge": 1, "relapse_child": 1, "attach_to_open": 3, "release_check": 10,
+            "reject_unavailable": 0, "reject_stale": 0, "reject_duplicate": 1,
+            "reject_label_unavailable": 0, "eoy_open_count": 1, "eoy_open_age": 120.0,
+        }
+    }
+    payload_ly = build_compact_closeout(
+        rt_a.aggregates, runtime_counters=rt_a.counters,
+        source_manifest_hash="TEST", fixed_only=True, p0_audit=rt_a.p0_audit,
+        lifecycle_yearly=ly_fix,
+        lifecycle_counters={"provisional_closes": 2, "confirmed_closes": 1},
+    )
+    ok("C20_lifecycle_yearly_present",
+       payload_ly.get("lifecycle_yearly", {}).get("2024", {}).get("confirmed_close") == 1
+       and payload_ly.get("lifecycle_counters", {}).get("confirmed_closes") == 1)
+    req_ly = set(compact_export_schema()["required_lifecycle_yearly_fields"])
+    ok("C21_lifecycle_yearly_schema",
+       req_ly.issubset(set(ly_fix["2024"].keys())))
+    ok("C22_lifecycle_eoa_size",
+       compact_payload_bytes(payload_ly) < ORDINARY_LOG_LIMIT)
     ok("C20_units", all(
         snap_a["policy_metrics"][p]["units"] == UNITS_NORMALIZED_SHADOW_SLEEVE
         for p in FIXED_ONLY_POLICIES))

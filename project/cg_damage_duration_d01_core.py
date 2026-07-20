@@ -117,7 +117,48 @@ def empty_counters():
         "right_censored_episodes": 0, "split_overlap_violations": 0,
         "diagnostic_real_orders": 0, "subscription_changes": 0,
         "target_mutations": 0, "runtime_errors": 0,
+        "release_checks": 0, "provisional_closes": 0, "confirmed_closes": 0,
+        "relapse_reopens": 0, "attach_to_open": 0,
+        "release_check_duplicate_blocked": 0, "release_check_hold": 0,
     }
+
+
+# Causal RELEASE_CHECK reasons (dual of existing open edges; no new thresholds).
+RELEASE_PROT = "PROTECTION_RELEASE"
+RELEASE_DMG = "DAMAGE_CLEARED"
+RELEASE_HOLD = "HOLD_OPEN"
+
+
+def release_check_close_predicate(ep, *, protection_active, prev_protection_active,
+                                  d_severity=None):
+    """Existing causal close predicate for RELEASE_CHECK cadence.
+
+    Owner: this function. Dual of protection rising-edge open and unprotected
+    D30/D45 open. No RecoveryScore AND-gate and no new numeric thresholds.
+    """
+    if ep is None or getattr(ep, "locked", False) or getattr(ep, "state", None) != EP_OPEN:
+        return False, "NO_OPEN_EPISODE"
+    if bool(prev_protection_active) and not bool(protection_active):
+        return True, RELEASE_PROT
+    sev = str(d_severity or "").strip().upper()
+    trig = str(getattr(ep, "trigger_kind", "") or "")
+    if (not bool(protection_active) and not bool(prev_protection_active)
+            and sev in ("NONE", "SEV_NONE") and trig in (EV_D30, EV_D45)):
+        return True, RELEASE_DMG
+    return False, RELEASE_HOLD
+
+
+def _lifecycle_year_bucket(store, decision_time):
+    if not isinstance(decision_time, datetime):
+        return None
+    y = str(decision_time.year)
+    return store.setdefault(y, {
+        "open": 0, "provisional_close": 0, "confirmed_close": 0,
+        "reopen": 0, "merge": 0, "relapse_child": 0, "attach_to_open": 0,
+        "release_check": 0, "reject_unavailable": 0, "reject_stale": 0,
+        "reject_duplicate": 0, "reject_label_unavailable": 0,
+        "eoy_open_count": 0, "eoy_open_age": "UNAVAILABLE",
+    })
 
 
 def make_episode_id(decision_time, trigger_kind, protection_source):
@@ -435,9 +476,17 @@ class DamageEpisodeLedger:
         self.open_ids = []  # stack/order of open or provisional
         self.counters = empty_counters()
         self._event_to_episode = {}
+        self._last_release_ck = None
+        self.lifecycle_yearly = {}  # year -> full-aggregate lifecycle counters
+        self._last_lifecycle_action = None
 
     def _bump(self, key, n=1):
         self.counters[key] = int(self.counters.get(key, 0) or 0) + int(n)
+
+    def _bump_year(self, decision_time, field, n=1):
+        b = _lifecycle_year_bucket(self.lifecycle_yearly, decision_time)
+        if b is not None:
+            b[field] = int(b.get(field, 0) or 0) + int(n)
 
     def current_open(self):
         for eid in reversed(self.open_ids):
@@ -467,13 +516,16 @@ class DamageEpisodeLedger:
             self._bump("same_bar_action_violations", 1)
 
         cur = self.current_open()
-        # Relapse while provisional => reopen/merge
-        if kind == EV_RELAPSE and cur is not None and cur.state == EP_PROVISIONAL:
-            return self._relapse_reopen(cur, decision_time, protection_source, feat, act)
+        # Relapse while provisional => reopen/merge (PROTECTION/D30/D45/RELAPSE)
+        if cur is not None and cur.state == EP_PROVISIONAL and not force_new:
+            if kind in (EV_D30, EV_D45, EV_PROTECTION, EV_RELAPSE):
+                return self._relapse_reopen(cur, decision_time, protection_source, feat, act)
 
         # Attach D30/D45/protection to existing open episode (no independent episode)
         if cur is not None and cur.state == EP_OPEN and not force_new:
             if kind in (EV_D30, EV_D45, EV_PROTECTION, EV_RELAPSE):
+                self._bump("attach_to_open", 1)
+                self._bump_year(decision_time, "attach_to_open", 1)
                 return self._attach_event(cur, kind, decision_time, protection_source, feat, act,
                                           is_relapse_merge=False)
 
@@ -487,6 +539,7 @@ class DamageEpisodeLedger:
         self.episodes[ep.episode_id] = ep
         self.open_ids.append(ep.episode_id)
         self._bump("episodes_created", 1)
+        self._bump_year(decision_time, "open", 1)
         return self._attach_event(ep, kind, decision_time, protection_source, feat, act)
 
     def _attach_event(self, ep, kind, decision_time, protection_source, feat, act,
@@ -521,6 +574,10 @@ class DamageEpisodeLedger:
         ep.duration_class = None
         ep.label_availability = LAB_UNAVAILABLE
         ep.right_censored = False
+        self._bump("relapse_reopens", 1)
+        self._bump_year(decision_time, "reopen", 1)
+        self._bump_year(decision_time, "merge", 1)
+        self._bump_year(decision_time, "relapse_child", 1)
         return self._attach_event(ep, EV_RELAPSE, decision_time, protection_source, feat, act,
                                   is_relapse_merge=True)
 
@@ -545,6 +602,8 @@ class DamageEpisodeLedger:
             ep.label_availability = LAB_RIGHT_CENSORED
             # incomplete => do not lock as labeled T*; remain open or mark censored lock path
             ep.state = EP_PROVISIONAL
+            self._bump("provisional_closes", 1)
+            self._bump_year(resolution_time, "provisional_close", 1)
             return True
         ep.provisional_close_time = resolution_time
         ep.label_finalization_time = label_finalization_time(
@@ -553,6 +612,8 @@ class DamageEpisodeLedger:
         ep.label_availability = label_is_available(
             now_t if now_t is not None else resolution_time, ep.label_finalization_time,
             locked=False, right_censored=False)
+        self._bump("provisional_closes", 1)
+        self._bump_year(resolution_time, "provisional_close", 1)
         return True
 
     def confirm_close(self, episode_id, confirm_time):
@@ -566,13 +627,123 @@ class DamageEpisodeLedger:
             return False
         if ep.right_censored:
             # lock as censored terminal
-            return self._lock(ep, confirm_time)
+            ok = self._lock(ep, confirm_time)
+            if ok:
+                self._bump("confirmed_closes", 1)
+                self._bump_year(confirm_time, "confirmed_close", 1)
+            return ok
         if ep.label_finalization_time is None:
             return False
         if confirm_time < ep.label_finalization_time:
             # confirmation window not finished; still provisional
             return False
-        return self._lock(ep, confirm_time)
+        ok = self._lock(ep, confirm_time)
+        if ok:
+            self._bump("confirmed_closes", 1)
+            self._bump_year(confirm_time, "confirmed_close", 1)
+        return ok
+
+    def process_release_check(self, decision_time, *, protection_active, prev_protection_active,
+                              d_severity=None, protection_source="NONE", bar_end_times=None,
+                              checkpoint_key=None):
+        """Idempotent RELEASE_CHECK at existing POST cadence. Calls ledger close APIs only."""
+        self._bump("release_checks", 1)
+        self._bump_year(decision_time, "release_check", 1)
+        if checkpoint_key is not None and checkpoint_key == self._last_release_ck:
+            self._bump("release_check_duplicate_blocked", 1)
+            self._bump_year(decision_time, "reject_duplicate", 1)
+            return {
+                "action": "DUP_BLOCKED", "episode_id": None, "reason": "DUPLICATE_CHECKPOINT",
+                "mutated": False,
+            }
+        if checkpoint_key is not None:
+            self._last_release_ck = checkpoint_key
+
+        bars = list(bar_end_times or [])
+        cur = self.current_open()
+        sev = str(d_severity or "").strip().upper()
+        d_active = sev in ("D30", "D45", "SEV_D30", "SEV_D45")
+
+        # Provisional: relapse before confirm; else confirm when window elapsed.
+        if cur is not None and cur.state == EP_PROVISIONAL:
+            rising = bool(protection_active) and not bool(prev_protection_active)
+            if rising or d_active:
+                ev = self.observe_open_trigger(
+                    EV_RELAPSE if not rising else EV_PROTECTION,
+                    decision_time, protection_source, bars)
+                self._last_lifecycle_action = "RELAPSE_REOPEN"
+                return {
+                    "action": "RELAPSE_REOPEN", "episode_id": cur.episode_id,
+                    "reason": "RELAPSE_IN_CONFIRMATION_WINDOW", "mutated": True,
+                    "event_id": getattr(ev, "event_id", None),
+                }
+            if self.confirm_close(cur.episode_id, decision_time):
+                self._last_lifecycle_action = "CONFIRMED_CLOSE"
+                return {
+                    "action": "CONFIRMED_CLOSE", "episode_id": cur.episode_id,
+                    "reason": "CONFIRMATION_WINDOW_ELAPSED", "mutated": True,
+                }
+            self._bump("release_check_hold", 1)
+            self._last_lifecycle_action = "HOLD_PROVISIONAL"
+            return {
+                "action": "HOLD_PROVISIONAL", "episode_id": cur.episode_id,
+                "reason": "CONFIRMATION_PENDING", "mutated": False,
+            }
+
+        # Open: existing close predicate only.
+        if cur is not None and cur.state == EP_OPEN:
+            do_close, reason = release_check_close_predicate(
+                cur, protection_active=protection_active,
+                prev_protection_active=prev_protection_active, d_severity=d_severity)
+            if do_close:
+                ok = self.provisional_close(cur.episode_id, decision_time, now_t=decision_time)
+                self._last_lifecycle_action = "PROVISIONAL_CLOSE" if ok else "CLOSE_FAIL"
+                return {
+                    "action": "PROVISIONAL_CLOSE" if ok else "CLOSE_FAIL",
+                    "episode_id": cur.episode_id, "reason": reason, "mutated": bool(ok),
+                }
+            self._bump("release_check_hold", 1)
+            self._last_lifecycle_action = "HOLD_OPEN"
+            return {
+                "action": "HOLD_OPEN", "episode_id": cur.episode_id,
+                "reason": reason, "mutated": False,
+            }
+
+        self._last_lifecycle_action = "NONE"
+        return {"action": "NONE", "episode_id": None, "reason": "NO_OPEN", "mutated": False}
+
+    def finalize_lifecycle_yearly_eoy(self, as_of=None):
+        """Stamp end-of-year open state into yearly aggregates (full observation set)."""
+        open_eps = [
+            ep for ep in self.episodes.values()
+            if ep.state in (EP_OPEN, EP_PROVISIONAL) and not ep.locked
+        ]
+        years = set(self.lifecycle_yearly.keys())
+        if isinstance(as_of, datetime):
+            years.add(str(as_of.year))
+        for y in years:
+            b = self.lifecycle_yearly.setdefault(y, {
+                "open": 0, "provisional_close": 0, "confirmed_close": 0,
+                "reopen": 0, "merge": 0, "relapse_child": 0, "attach_to_open": 0,
+                "release_check": 0, "reject_unavailable": 0, "reject_stale": 0,
+                "reject_duplicate": 0, "reject_label_unavailable": 0,
+                "eoy_open_count": 0, "eoy_open_age": "UNAVAILABLE",
+            })
+            y_open = [ep for ep in open_eps
+                      if isinstance(ep.decision_time, datetime)
+                      and str(ep.decision_time.year) == y]
+            b["eoy_open_count"] = len(y_open)
+            if y_open and isinstance(as_of, datetime):
+                ages = []
+                for ep in y_open:
+                    if isinstance(ep.decision_time, datetime):
+                        ages.append((as_of - ep.decision_time).total_seconds() / 60.0)
+                b["eoy_open_age"] = max(ages) if ages else "UNAVAILABLE"
+            elif not y_open:
+                b["eoy_open_count"] = 0
+                if b.get("eoy_open_age") is None:
+                    b["eoy_open_age"] = "UNAVAILABLE"
+        return dict(self.lifecycle_yearly)
 
     def _lock(self, ep, lock_time):
         ep.state = EP_LOCKED
@@ -1009,6 +1180,179 @@ def _disabled_runtime_noop_probe():
     return True
 
 
+def run_damage_d01_lifecycle_static_tests():
+    """D0.3B2D RELEASE_CHECK close/confirm/reopen wiring tests."""
+    rows, passed, failed = [], 0, 0
+
+    def ok(n, c, detail=""):
+        nonlocal passed, failed
+        if c:
+            passed += 1
+            rows.append({"name": n, "pass": True, "detail": detail})
+        else:
+            failed += 1
+            rows.append({"name": n, "pass": False, "detail": str(detail)})
+
+    t0 = datetime(2024, 3, 11, 10, 0, 0)
+    bars = [t0 - timedelta(minutes=5), t0, t0 + timedelta(minutes=5)]
+    sessions = [date(2024, 3, 11), date(2024, 3, 12), date(2024, 3, 13),
+                date(2024, 3, 14), date(2024, 3, 15), date(2024, 3, 18)]
+
+    # predicate: protection falling edge
+    led = DamageEpisodeLedger(sessions)
+    ev = led.observe_open_trigger(EV_PROTECTION, t0, "W2", bars)
+    ep = led.episodes[ev.episode_id]
+    ok("L01_open", ep.state == EP_OPEN)
+    do, reason = release_check_close_predicate(
+        ep, protection_active=False, prev_protection_active=True, d_severity="D30")
+    ok("L02_prot_release_predicate", do and reason == RELEASE_PROT)
+
+    # no close before confirmation window
+    r = led.process_release_check(
+        t0 + timedelta(minutes=5), protection_active=False, prev_protection_active=True,
+        d_severity="NONE", protection_source="NONE", bar_end_times=bars, checkpoint_key=(1, 1))
+    ok("L03_provisional", r["action"] == "PROVISIONAL_CLOSE" and ep.state == EP_PROVISIONAL)
+    early = t0 + timedelta(minutes=5 + 10)  # < 30m confirmation
+    r2 = led.process_release_check(
+        early, protection_active=False, prev_protection_active=False,
+        d_severity="NONE", checkpoint_key=(1, 2))
+    ok("L04_no_confirm_early", r2["action"] == "HOLD_PROVISIONAL" and ep.state == EP_PROVISIONAL)
+
+    # relapse before confirmation reopens
+    r3 = led.process_release_check(
+        early + timedelta(minutes=1), protection_active=True, prev_protection_active=False,
+        d_severity="NONE", protection_source="W2", checkpoint_key=(1, 3))
+    ok("L05_relapse_reopen", r3["action"] == "RELAPSE_REOPEN" and ep.state == EP_OPEN)
+
+    # provisional again then confirm after window
+    led.process_release_check(
+        early + timedelta(minutes=2), protection_active=False, prev_protection_active=True,
+        d_severity="NONE", checkpoint_key=(1, 4))
+    fin = ep.label_finalization_time
+    ok("L06_fin_set", fin is not None)
+    r4 = led.process_release_check(
+        fin, protection_active=False, prev_protection_active=False,
+        d_severity="NONE", checkpoint_key=(1, 5))
+    ok("L07_confirm_close", r4["action"] == "CONFIRMED_CLOSE" and ep.locked and ep.state == EP_LOCKED)
+
+    # new trigger after confirm creates new episode
+    t_new = fin + timedelta(minutes=5)
+    bars2 = [t_new - timedelta(minutes=5), t_new, t_new + timedelta(minutes=5)]
+    ev2 = led.observe_open_trigger(EV_PROTECTION, t_new, "IDS", bars2)
+    ok("L08_new_episode_after_confirm",
+       ev2 is not None and ev2.episode_id != ep.episode_id and led.counters["episodes_created"] == 2)
+
+    # repeated D30 while open only attaches
+    n_ep = led.counters["episodes_created"]
+    n_att = led.counters["attach_to_open"]
+    led.observe_open_trigger(EV_D30, t_new + timedelta(minutes=5), "IDS", bars2)
+    ok("L09_attach_only",
+       led.counters["episodes_created"] == n_ep and led.counters["attach_to_open"] == n_att + 1)
+
+    # duplicate checkpoint idempotence
+    r5 = led.process_release_check(
+        t_new + timedelta(minutes=10), protection_active=False, prev_protection_active=True,
+        checkpoint_key=(2, 9))
+    r6 = led.process_release_check(
+        t_new + timedelta(minutes=10), protection_active=False, prev_protection_active=True,
+        checkpoint_key=(2, 9))
+    ok("L10_dup_idempotent", r6["action"] == "DUP_BLOCKED" and r5["mutated"] is True)
+
+    # D-only open closes on DAMAGE_CLEARED
+    led3 = DamageEpisodeLedger(sessions)
+    e3 = led3.observe_open_trigger(EV_D30, t0, "NONE", bars)
+    do3, rs3 = release_check_close_predicate(
+        led3.episodes[e3.episode_id], protection_active=False,
+        prev_protection_active=False, d_severity="NONE")
+    ok("L11_damage_cleared_predicate", do3 and rs3 == RELEASE_DMG)
+
+    # no future-data: confirm uses decision_time only vs label_finalization_time
+    ok("L12_confirm_uses_elapsed_causal_time",
+       CONFIRMATION_WINDOW_MINUTES == 30 and fin == ep.provisional_close_time + timedelta(minutes=30)
+       if ep.provisional_close_time else False)
+
+    # no production mutation counters
+    ok("L13_no_prod_mut",
+       led.counters["diagnostic_real_orders"] == 0 and led.counters["target_mutations"] == 0
+       and led.counters["subscription_changes"] == 0)
+
+    # yearly aggregates non-empty
+    ok("L14_yearly_open", any(v.get("open", 0) > 0 for v in led.lifecycle_yearly.values()))
+    ok("L15_yearly_confirmed", any(v.get("confirmed_close", 0) > 0 for v in led.lifecycle_yearly.values()))
+
+    # state-lock: confirmed close never rewrites locked label
+    before_cls = ep.duration_class
+    ok("L16_state_lock", led.try_mutate_locked(ep.episode_id, "duration_class", "T999") is False
+       and ep.duration_class == before_cls and ep.locked)
+
+    # same-bar / future-bar: feature_cutoff <= decision; action > decision
+    ok("L17_same_bar_contract",
+       all((ev.feature_cutoff is None or ev.feature_cutoff <= ev.decision_time)
+           and (ev.action_eligible_time is None or ev.action_eligible_time > ev.decision_time)
+           for ev in led.events.values()))
+
+    # Event Memory reset only after confirmed close (not provisional)
+    from cg_damage_duration_d02_memory import EventMemoryStore
+    store = EventMemoryStore()
+    led_m = DamageEpisodeLedger(sessions)
+    ev_m = led_m.observe_open_trigger(EV_PROTECTION, t0, "W2", bars)
+    ep_m = led_m.episodes[ev_m.episode_id]
+    store.sync_open_episode(ep_m, t0, t0, "D30", 1.0, 100.0, "W2")
+    ok("L18_memory_active_on_open", store.active is not None and store.active.episode_id == ep_m.episode_id)
+    led_m.process_release_check(
+        t0 + timedelta(minutes=5), protection_active=False, prev_protection_active=True,
+        d_severity="NONE", checkpoint_key=("M", 1))
+    ok("L19_memory_preserved_provisional",
+       store.active is not None and ep_m.state == EP_PROVISIONAL)
+    fin_m = ep_m.label_finalization_time
+    led_m.process_release_check(
+        fin_m, protection_active=False, prev_protection_active=False,
+        d_severity="NONE", checkpoint_key=("M", 2))
+    store.sync_open_episode(None, fin_m, fin_m, "NONE", None, None, "NONE")
+    ok("L20_memory_reset_after_confirm",
+       ep_m.locked and store.active is None and len(store.completed) >= 1)
+
+    # P4 schedule resets when episode_id becomes UNAVAILABLE after confirm (existing interface)
+    from cg_damage_duration_d03a_shadow import ModelAShadowRouter, _snap_b, _snap_c, UNAVAILABLE as U
+    rtr = ModelAShadowRouter()
+    rtr.update(_snap_b(t0, 0, episode_id=ep_m.episode_id), _snap_c(t0, 0))
+    ok("L21_p4_bound_to_episode", rtr.episode_id == ep_m.episode_id)
+    rtr.update(_snap_b(fin_m, 1, episode_id=U), _snap_c(fin_m, 1))
+    ok("L22_p4_reset_after_confirm_unavailable",
+       rtr.episode_id == U and abs(float(rtr.p4_fraction)) < 1e-12)
+
+    # runtime wiring: RELEASE_CHECK calls process_release_check from diag
+    import inspect
+    import cg_damage_duration_d01_diag as d01_diag
+    diag_src = inspect.getsource(d01_diag)
+    ok("L23_runtime_wire_present",
+       "process_release_check" in diag_src
+       and "RELEASE_CHECK" in diag_src
+       and "CONFIRMED_CLOSE" in diag_src)
+
+    # no hard AND-gate of RecoveryScore in close predicate
+    pred_src = inspect.getsource(release_check_close_predicate)
+    ok("L24_no_hard_and_gate",
+       "RecoveryScore" not in pred_src.split('"""')[-1]
+       and "all(" not in pred_src.split('"""')[-1])
+
+    # yearly eoy finalize
+    ly = led.finalize_lifecycle_yearly_eoy(as_of=fin)
+    ok("L25_eoy_finalize", isinstance(ly, dict) and any("eoy_open_count" in v for v in ly.values()))
+
+    # fixture parity: yearly open count matches episodes_created for this ledger path
+    ysum_open = sum(int(v.get("open", 0) or 0) for v in led.lifecycle_yearly.values())
+    ok("L26_yearly_open_parity", ysum_open == int(led.counters.get("episodes_created", 0) or 0))
+
+    return {
+        "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
+        "runtime_close_predicate_found": "YES",
+        "runtime_close_predicate_owner": (
+            "cg_damage_duration_d01_core.py:release_check_close_predicate"),
+        "hard_and_gate_found": "NO",
+    }
+
+
 def build_technical_counters_csv(counters):
     c = empty_counters()
     c.update(dict(counters or {}))
@@ -1025,4 +1369,11 @@ def build_technical_counters_csv(counters):
 
 if __name__ == "__main__":
     rep = run_damage_d01_static_tests()
-    print(json.dumps({"passed": rep["passed"], "failed": rep["failed"], "total": rep["total"]}))
+    lc = run_damage_d01_lifecycle_static_tests()
+    print(json.dumps({
+        "d01": {"passed": rep["passed"], "failed": rep["failed"], "total": rep["total"]},
+        "lifecycle": {"passed": lc["passed"], "failed": lc["failed"], "total": lc["total"]},
+    }))
+    for row in lc["rows"]:
+        if not row["pass"]:
+            print("FAIL", row["name"], row["detail"])

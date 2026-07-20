@@ -207,17 +207,23 @@ class ModelAShadowRuntimeAccounting:
             "episode_sample_csv": self.exporter.episode_csv()[:4000],
         }
 
-    def compact_closeout_payload(self, source_manifest_hash=None):
+    def compact_closeout_payload(self, source_manifest_hash=None, lifecycle_yearly=None,
+                                 lifecycle_counters=None):
         return build_compact_closeout(
             self.aggregates,
             runtime_counters=self.counters,
             source_manifest_hash=source_manifest_hash,
             fixed_only=self.fixed_only,
             p0_audit=self.p0_audit,
+            lifecycle_yearly=lifecycle_yearly,
+            lifecycle_counters=lifecycle_counters,
         )
 
-    def compact_closeout_line(self, source_manifest_hash=None):
-        return compact_closeout_text(self.compact_closeout_payload(source_manifest_hash))
+    def compact_closeout_line(self, source_manifest_hash=None, lifecycle_yearly=None,
+                              lifecycle_counters=None):
+        return compact_closeout_text(self.compact_closeout_payload(
+            source_manifest_hash, lifecycle_yearly=lifecycle_yearly,
+            lifecycle_counters=lifecycle_counters))
 
 
 def run_damage_d03b1_static_tests(param_map=None):

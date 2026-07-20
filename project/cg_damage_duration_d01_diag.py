@@ -376,18 +376,38 @@ class CgDamageDurationD01DiagMixin:
             led = getattr(self, "_dmg_ledger", None)
             if led is None:
                 return
-            if active and not prev:
+            ck = (t.date().toordinal(), int(tod)) if tod is not None else (
+                t.date().toordinal(), t.hour * 60 + t.minute)
+            # RELEASE_CHECK before open/attach; skip same-checkpoint open if mutated.
+            lc = led.process_release_check(
+                t, protection_active=active, prev_protection_active=prev,
+                d_severity=None, protection_source=src, bar_end_times=bars,
+                checkpoint_key=("RC",) + tuple(ck) if isinstance(ck, tuple) else ("RC", ck))
+            skip_open = bool(lc.get("mutated"))
+            if active and not prev and not skip_open:
                 led.observe_open_trigger(EV_PROTECTION, t, src, bars)
             # D0.1-only path: B1 residual pass-through (unresolved when B1 off; D0.2A replaces)
-            if not getattr(self, "cg_damage_duration_d02_enable", False):
+            if not getattr(self, "cg_damage_duration_d02_enable", False) and not skip_open:
                 vp = getattr(self, "_resid_last_variant_pass", None)
                 if isinstance(vp, dict):
                     if any(bool(vp.get(k)) for k in vp if str(k).startswith("D45_")):
                         led.observe_open_trigger(EV_D45, t, src, bars)
                     elif any(bool(vp.get(k)) for k in vp if str(k).startswith("D30_")):
                         led.observe_open_trigger(EV_D30, t, src, bars)
+            # After confirmed close, clear event memory active pointer if present.
+            if lc.get("action") == "CONFIRMED_CLOSE":
+                try:
+                    fc = getattr(self, "_dmg_d02_features", None)
+                    store = getattr(fc, "memory", None) if fc is not None else None
+                    if store is None:
+                        store = getattr(self, "_dmg_event_memory", None)
+                    if store is not None and hasattr(store, "sync_open_episode"):
+                        store.sync_open_episode(None, t, t, "NONE", None, None, "NONE")
+                except Exception:
+                    pass
             self._dmg_prev_prot = active
             self._dmg_ctr = dict(led.counters)
+            self._dmg_last_lifecycle = lc
         except Exception:
             self._dmg_err = int(getattr(self, "_dmg_err", 0) or 0) + 1
             ctr = getattr(self, "_dmg_ctr", None) or empty_counters()
@@ -416,8 +436,6 @@ class CgDamageDurationD01DiagMixin:
                 except Exception:
                     return
             bars = list(getattr(self, "_dmg_bar_ends", []) or [])
-            if active and not prev:
-                led.observe_open_trigger(EV_PROTECTION, t, src, bars)
             atr_map = dict(getattr(self, "_ms_atr", {}) or {})
             b1_on = bool(getattr(self, "cg_macro_resid_b1_enable", False))
             b1_vp = None
@@ -427,11 +445,29 @@ class CgDamageDurationD01DiagMixin:
                 if isinstance(vp, dict):
                     b1_vp = vp
             sens_snap = sens.evaluate(
-                t, atr_map, source_macro_resid_enabled=b1_on, b1_variant_pass=b1_vp)
+                t, atr_map, force_macro_resid_enabled=b1_on, b1_variant_pass=b1_vp)
             ck = (t.date().toordinal(), int(tod))
-            if sens_snap is not None:
+            d_sev = None if sens_snap is None else sens_snap.get("strongest_severity")
+            # RELEASE_CHECK before open/attach; existing causal predicates only.
+            lc = led.process_release_check(
+                t, protection_active=active, prev_protection_active=prev,
+                d_severity=d_sev, protection_source=src, bar_end_times=bars,
+                checkpoint_key=("RC2",) + tuple(ck))
+            self._dmg_last_lifecycle = lc
+            skip_open = bool(lc.get("mutated"))
+            if active and not prev and not skip_open:
+                led.observe_open_trigger(EV_PROTECTION, t, src, bars)
+            if sens_snap is not None and not skip_open:
                 sens.attach_to_ledger(led, sens_snap, protection_source=src,
                                       bar_end_times=bars, checkpoint_key=ck)
+            if lc.get("action") == "CONFIRMED_CLOSE":
+                try:
+                    fc0 = getattr(self, "_dmg_d02_features", None)
+                    store = getattr(fc0, "memory", None) if fc0 is not None else None
+                    if store is not None and hasattr(store, "sync_open_episode"):
+                        store.sync_open_episode(None, t, t, "NONE", None, None, "NONE")
+                except Exception:
+                    pass
             # D0.2B feature collector + event memory (after sensor/ledger)
             fc = getattr(self, "_dmg_d02_features", None)
             if fc is not None:
@@ -590,8 +626,20 @@ class CgDamageDurationD01DiagMixin:
                 # Compact aggregate closeout (full valid observation set; samples remain bounded).
                 if d03b is not None and hasattr(d03b, "compact_closeout_line"):
                     try:
+                        ly = None
+                        lc_ctr = None
+                        if led is not None:
+                            try:
+                                ly = led.finalize_lifecycle_yearly_eoy(
+                                    as_of=getattr(self, "time", None))
+                            except Exception:
+                                ly = dict(getattr(led, "lifecycle_yearly", {}) or {})
+                            lc_ctr = dict(getattr(led, "counters", {}) or {})
                         line = d03b.compact_closeout_line(
-                            source_manifest_hash=getattr(self, "_dmg_source_manifest_hash", None))
+                            source_manifest_hash=getattr(self, "_dmg_source_manifest_hash", None),
+                            lifecycle_yearly=ly,
+                            lifecycle_counters=lc_ctr,
+                        )
                         if line and len(line.encode("utf-8")) < 100 * 1024:
                             self._DamageD01Log(line)
                         else:
