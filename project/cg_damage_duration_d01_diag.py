@@ -313,6 +313,16 @@ class CgDamageDurationD01DiagMixin:
             f"CG_DAMAGE_D03B_INIT,enable=1,tests=EXTERNAL_ONLY,"
             f"p0={P0_SOURCE_VERDICT},verdict=RUNTIME_INIT_OK"
         )
+        fo = bool(getattr(self, "cg_damage_duration_d03b_fixed_only_shadow_enable", False))
+        try:
+            self._dmg_d03b.proxy.set_enabled(fo)
+        except Exception:
+            pass
+        if fo:
+            self._DamageD01Log(
+                "CG_DAMAGE_D03B_PROXY_REPLAY,enable=1,underlying=SPY,cost_bps=0,"
+                "gate=fixed_only_shadow"
+            )
 
     def _DamageD01Log(self, msg):
         try:
@@ -326,6 +336,37 @@ class CgDamageDurationD01DiagMixin:
     def _DamageD01ShActive(self):
         st = str(getattr(self, "_sh_state", "") or "").strip().upper()
         return st in _SH_ACTIVE
+
+    def _DamageD03bProxySpyBar(self, tk, et, c):
+        d03b = getattr(self, "_dmg_d03b", None)
+        proxy = getattr(d03b, "proxy", None) if d03b is not None else None
+        if proxy is None or not getattr(proxy, "enabled", False):
+            return
+        try:
+            proxy.on_spy_bar(et, c, tk)
+        except Exception:
+            pass
+
+    def _DamageD03bProxyLife(self, lc, t):
+        d03b = getattr(self, "_dmg_d03b", None)
+        proxy = getattr(d03b, "proxy", None) if d03b is not None else None
+        if proxy is None or not getattr(proxy, "enabled", False):
+            return
+        try:
+            act = (lc or {}).get("action")
+            eid = (lc or {}).get("episode_id")
+            if act == "CONFIRMED_CLOSE" and eid:
+                proxy.on_confirmed_close(eid, t)
+            elif act == "RELAPSE_REOPEN" and eid:
+                proxy.on_abandon(eid, "REOPEN")
+            led = getattr(self, "_dmg_ledger", None)
+            cur = led.current_open() if led is not None else None
+            if cur is not None and str(getattr(cur, "episode_id", "")) not in proxy.active:
+                proxy.on_open(
+                    cur.episode_id,
+                    getattr(cur, "decision_time", None) or t)
+        except Exception:
+            pass
 
     def _DamageD01ProtectionSnap(self):
         return {
@@ -357,6 +398,7 @@ class CgDamageDurationD01DiagMixin:
             return
         try:
             self._DamageD01ObserveSession(et)
+            self._DamageD03bProxySpyBar(tk, et, c)
             ends = getattr(self, "_dmg_bar_ends", None)
             if ends is None:
                 self._dmg_bar_ends = []
@@ -375,6 +417,7 @@ class CgDamageDurationD01DiagMixin:
             return
         try:
             self._DamageD01ObserveSession(et)
+            self._DamageD03bProxySpyBar(tk, et, c)
             t = self.time if isinstance(getattr(self, "time", None), datetime) else None
             sens.on_accepted_bar(tk, et, o, h, l, c, decision_time=t)
             ends = getattr(self, "_dmg_bar_ends", None)
@@ -416,6 +459,7 @@ class CgDamageDurationD01DiagMixin:
                 t, protection_active=active, prev_protection_active=prev,
                 d_severity=None, protection_source=src, bar_end_times=bars,
                 checkpoint_key=("RC",) + tuple(ck) if isinstance(ck, tuple) else ("RC", ck))
+            self._DamageD03bProxyLife(lc, t)
             skip_open = bool(lc.get("mutated"))
             if active and not prev and not skip_open:
                 led.observe_open_trigger(EV_PROTECTION, t, src, bars)
@@ -427,6 +471,7 @@ class CgDamageDurationD01DiagMixin:
                         led.observe_open_trigger(EV_D45, t, src, bars)
                     elif any(bool(vp.get(k)) for k in vp if str(k).startswith("D30_")):
                         led.observe_open_trigger(EV_D30, t, src, bars)
+            self._DamageD03bProxyLife({"action": "SYNC_OPEN"}, t)
             # After confirmed close, clear event memory active pointer if present.
             if lc.get("action") == "CONFIRMED_CLOSE":
                 try:
@@ -487,6 +532,7 @@ class CgDamageDurationD01DiagMixin:
                 t, protection_active=active, prev_protection_active=prev,
                 d_severity=d_sev, protection_source=src, bar_end_times=bars,
                 checkpoint_key=("RC2",) + tuple(ck))
+            self._DamageD03bProxyLife(lc, t)
             self._dmg_last_lifecycle = lc
             skip_open = bool(lc.get("mutated"))
             if active and not prev and not skip_open:
@@ -494,6 +540,8 @@ class CgDamageDurationD01DiagMixin:
             if sens_snap is not None and not skip_open:
                 sens.attach_to_ledger(led, sens_snap, protection_source=src,
                                       bar_end_times=bars, checkpoint_key=ck)
+            # Register newly opened episodes for proxy after open/attach.
+            self._DamageD03bProxyLife({"action": "SYNC_OPEN"}, t)
             if lc.get("action") == "CONFIRMED_CLOSE":
                 try:
                     fc0 = getattr(self, "_dmg_d02_features", None)

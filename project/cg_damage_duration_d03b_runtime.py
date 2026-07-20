@@ -27,6 +27,7 @@ from cg_damage_duration_d03b_compact_export import (
     frame_compact_closeout_parts, reconstruct_compact_closeout_parts,
     D0_COMPACT_PART_PREFIX, EXPORT_MODE, FULL_HISTORY_RAW_EXPORT, AGGREGATE_COVERAGE,
 )
+from cg_damage_duration_d03b_proxy_replay import FixedOnlySpyProxyReplay
 
 FORBIDDEN_RE = re.compile(
     r"(?<![A-Za-z_])(History|AddEquity|AddData|SetHoldings|MarketOrder|LimitOrder|"
@@ -47,6 +48,7 @@ class ModelAShadowRuntimeAccounting:
         self.episode_ids = []
         self.exporter = PolicyRuntimeExporter()
         self.aggregates = CompactStreamingAggregates()
+        self.proxy = FixedOnlySpyProxyReplay()
         self.p0_audit = dict(P0_AUDIT)
         self.counters = {
             "snapshots": 0, "duplicate_blocked": 0, "stale_blocked": 0,
@@ -61,6 +63,7 @@ class ModelAShadowRuntimeAccounting:
             return None
         self.enabled = True
         self.fixed_only = bool(fixed_only_shadow_enable)
+        self.proxy.set_enabled(self.fixed_only)
         if snap_b is None or shadow_out is None:
             return None
         b = deepcopy(snap_b)
@@ -162,6 +165,11 @@ class ModelAShadowRuntimeAccounting:
             len(self.exporter.checkpoint_rows), len(self.exporter.episode_rows))
         self.aggregates.note_gate("TIMESTAMP_OK" if ok_ts else "TIMESTAMP_SOFT_FAIL")
 
+        # Fixed-only SPY proxy: schedule P4/P5 from recorded restore fractions only.
+        if self.fixed_only and eid not in (None, UNAVAILABLE):
+            self.proxy.on_checkpoint(
+                dt if isinstance(dt, datetime) else None, eid, frac_map)
+
         self.last_checkpoint = ck
         if ck is not None:
             self.seen_checkpoints.add(ck)
@@ -210,6 +218,10 @@ class ModelAShadowRuntimeAccounting:
 
     def compact_closeout_payload(self, source_manifest_hash=None, lifecycle_yearly=None,
                                  lifecycle_counters=None, transport_meta=None):
+        proxy_snap = None
+        if self.fixed_only and self.proxy is not None:
+            self.proxy.finalize_eoa()
+            proxy_snap = self.proxy.snapshot()
         return build_compact_closeout(
             self.aggregates,
             runtime_counters=self.counters,
@@ -219,6 +231,7 @@ class ModelAShadowRuntimeAccounting:
             lifecycle_yearly=lifecycle_yearly,
             lifecycle_counters=lifecycle_counters,
             transport_meta=transport_meta,
+            proxy_replay=proxy_snap,
         )
 
     def compact_closeout_part_lines(self, source_manifest_hash=None, lifecycle_yearly=None,
@@ -495,6 +508,16 @@ def run_damage_d03b1_static_tests(param_map=None):
         else:
             failed += 1
 
+    from cg_damage_duration_d03b_proxy_replay import run_proxy_replay_static_tests
+    pr = run_proxy_replay_static_tests()
+    ok("B07_proxy_suite", pr.get("failed", 1) == 0, detail=str(pr.get("failed")))
+    for prow in pr.get("rows") or []:
+        rows.append({"name": "PR_" + prow["name"], "pass": prow["pass"], "detail": prow.get("detail", "")})
+        if prow["pass"]:
+            passed += 1
+        else:
+            failed += 1
+
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
         "p0_verdict": P0_SOURCE_VERDICT,
@@ -504,6 +527,7 @@ def run_damage_d03b1_static_tests(param_map=None):
         ),
         "fixed_only_shadow_contract": "READY" if failed == 0 else "INVALID",
         "compact_export": cex,
+        "proxy_replay": pr,
         "eoa_payload_size_bytes": cex.get("eoa_payload_size_bytes"),
         "d01": d01, "d03a": d03a, "p4_repair": p4,
     }

@@ -242,7 +242,8 @@ class CompactStreamingAggregates:
 
 def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_hash=None,
                            fixed_only=False, p0_audit=None, lifecycle_yearly=None,
-                           lifecycle_counters=None, transport_meta=None):
+                           lifecycle_counters=None, transport_meta=None,
+                           proxy_replay=None):
     """Deterministic compact EOA payload; ordinary-log safe."""
     agg = aggregates.snapshot() if aggregates is not None else {}
     labels = export_mode_labels()
@@ -285,9 +286,13 @@ def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_ha
         "lifecycle_yearly": ly,
         "source_manifest_hash": source_manifest_hash or UNAVAILABLE,
         "aggregates": agg,
+        "proxy_replay": proxy_replay if proxy_replay is not None else UNAVAILABLE,
         "artifact_completeness": {
             "aggregates": "COMPLETE_VALID_OBSERVATION_SET",
             "lifecycle_yearly": "COMPLETE_VALID_OBSERVATION_SET",
+            "proxy_replay": (
+                "COMPLETE_VALID_OBSERVATION_SET"
+                if isinstance(proxy_replay, dict) else "UNAVAILABLE"),
             "raw_checkpoint_export": FULL_HISTORY_RAW_EXPORT,
             "raw_episode_export": FULL_HISTORY_RAW_EXPORT,
             "bounded_sample_only": True,
