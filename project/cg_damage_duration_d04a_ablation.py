@@ -298,8 +298,8 @@ def classify_component_effects(metrics_by_variant):
         # If ablation (component removed) has higher DD than FULL, component was lowering DD
         if d > fd + 1e-12:
             lower_dd.append(name)
-        # If ablation has lower wealth than FULL, component was raising wealth
-        if w < fw - 1e-12:
+        # If ablation has higher wealth than FULL, component was lowering wealth
+        if w > fw + 1e-12:
             lower_wealth.append(name)
     return {
         "component_lowering_dd": lower_dd,
@@ -624,8 +624,9 @@ def run_d04a_ablation_static_tests():
     }
     cl = classify_component_effects(fake)
     ok("A12_classify_cp_lowers_dd", "CHANGEPOINT" in cl["component_lowering_dd"])
-    ok("A13_classify_structure_raises_wealth", "STRUCTURE" in cl["component_lowering_wealth"])
+    ok("A13_classify_cp_lowers_wealth", "CHANGEPOINT" in cl["component_lowering_wealth"])
     ok("A14_classify_structure_not_lowering_dd", "STRUCTURE" not in cl["component_lowering_dd"])
+    ok("A15_classify_structure_not_lowering_wealth", "STRUCTURE" not in cl["component_lowering_wealth"])
 
     return {"passed": passed, "failed": failed, "total": passed + failed, "rows": rows}
 
