@@ -22,6 +22,18 @@ CHECKPOINT_SAMPLE_MODE = "BOUNDED_DIAGNOSTIC_SAMPLE"
 EPISODE_SAMPLE_MODE = "BOUNDED_DIAGNOSTIC_SAMPLE"
 COMPACT_SCHEMA_VERSION = "D03B2B_COMPACT_AGGREGATE_V1"
 D0_COMPACT_PREFIX = "D0_COMPACT_CLOSEOUT"
+TRANSPORT_QUIET_PARAM = "cg_damage_duration_d03b_cloud_transport_quiet_enable"
+TRANSPORT_QUIET_MUTE_PREFIXES = ("CG_REGIME_TIME_",)
+TRANSPORT_QUIET_KEEP_PREFIXES = (
+    "D0_COMPACT_CLOSEOUT", "CG_DAMAGE_", "CG_MAISR_", "CG_MACRO_",
+)
+# High-frequency regime-time allowlist tokens re-injected by regime-time init.
+TRANSPORT_QUIET_STRIP_ALLOW_PREFIXES = (
+    "CG_REGIME_TIME_TRADE",
+    "CG_REGIME_TIME_PENDING",
+    "CG_REGIME_TIME_EXEC",
+    "[INIT] CG_REGIME_TIME_TRADE",
+)
 
 FORBIDDEN_EXPORT_RE = re.compile(
     r"ObjectStore\.Save\s*\(|ObjectStore\.SaveBytes\s*\(|ObjectStore\.Delete\s*\(|"
@@ -357,6 +369,55 @@ def compact_export_schema():
     }
 
 
+def transport_quiet_active(fixed_only_enable, transport_quiet_enable):
+    return bool(fixed_only_enable) and bool(transport_quiet_enable)
+
+
+def apply_transport_quiet_filters(log_only_prefixes, log_mute_prefixes,
+                                  fixed_only_enable, transport_quiet_enable):
+    """Pure filter update. Zero effect unless both D0 diagnostic flags are on.
+    Does not mutate targets/orders/gross/episodes — only log prefix lists."""
+    lp0 = list(log_only_prefixes or [])
+    mp0 = list(log_mute_prefixes or [])
+    if not transport_quiet_active(fixed_only_enable, transport_quiet_enable):
+        return lp0, mp0, False
+    strip = set(TRANSPORT_QUIET_STRIP_ALLOW_PREFIXES)
+    lp = [p for p in lp0 if str(p) not in strip and not str(p).startswith("CG_REGIME_TIME")]
+    for pref in TRANSPORT_QUIET_KEEP_PREFIXES:
+        if pref not in lp:
+            lp.append(pref)
+    mp = list(mp0)
+    for pref in TRANSPORT_QUIET_MUTE_PREFIXES:
+        if pref not in mp:
+            mp.append(pref)
+    return lp, mp, True
+
+
+def project_transport_budget_bytes(compact_payload_nbytes, init_line_count=8,
+                                   status_line_count=10, avg_line_bytes=220):
+    """Ordinary-log projection with CG_REGIME_TIME_* suppressed (by construction)."""
+    n = int(compact_payload_nbytes or 0)
+    overhead = int(init_line_count + status_line_count) * int(avg_line_bytes)
+    return n + overhead
+
+
+def transport_quiet_contract():
+    return {
+        "param": TRANSPORT_QUIET_PARAM,
+        "default": "0",
+        "dual_gate_required": [
+            "cg_damage_duration_d03b_fixed_only_shadow_enable",
+            TRANSPORT_QUIET_PARAM,
+        ],
+        "muted_high_frequency_prefixes": list(TRANSPORT_QUIET_MUTE_PREFIXES),
+        "preserved_prefixes": list(TRANSPORT_QUIET_KEEP_PREFIXES),
+        "strips_regime_allowlist_reinjection": True,
+        "per_checkpoint_d0_logs": "FORBIDDEN_WHEN_QUIET",
+        "state_mutation": "FORBIDDEN",
+        "ordinary_log_limit_bytes": ORDINARY_LOG_LIMIT,
+    }
+
+
 def run_compact_export_static_tests():
     """D0.3B2B repair tests; returns {passed,failed,total,rows,...}."""
     from datetime import timedelta
@@ -479,7 +540,8 @@ def run_compact_export_static_tests():
     ok("C17_disabled_noop",
        ModelAShadowRuntimeAccounting().update(None, None, None, d03b_enabled=False) is None
        and RRX_PARAMS.get("cg_damage_duration_d03b_enable") == "0"
-       and RRX_PARAMS.get("cg_damage_duration_d03b_fixed_only_shadow_enable") == "0")
+       and RRX_PARAMS.get("cg_damage_duration_d03b_fixed_only_shadow_enable") == "0"
+       and RRX_PARAMS.get("cg_damage_duration_d03b_cloud_transport_quiet_enable") == "0")
 
     # EOA payload size
     payload = build_compact_closeout(
@@ -518,11 +580,51 @@ def run_compact_export_static_tests():
     ok("C24_contract_ready", fixed_only_shadow_contract()["production_claim_eligible"] is False)
     ok("C25_schema", compact_export_schema()["export_mode"] == EXPORT_MODE)
 
+    # --- transport quiet dual-gate (log prefixes only; no state mutation) ---
+    tqc = transport_quiet_contract()
+    ok("TQ01_quiet_default_off",
+       RRX_PARAMS.get(TRANSPORT_QUIET_PARAM) == "0" and tqc["default"] == "0")
+    base_lp = list(TRANSPORT_QUIET_STRIP_ALLOW_PREFIXES) + ["CG_DAMAGE_", "OTHER"]
+    base_mp = ["KEEP_MUTE"]
+    lp_a, mp_a, ap_a = apply_transport_quiet_filters(base_lp, base_mp, False, False)
+    ok("TQ02_off_both_noop", ap_a is False and lp_a == base_lp and mp_a == base_mp)
+    lp_b, mp_b, ap_b = apply_transport_quiet_filters(base_lp, base_mp, True, False)
+    ok("TQ03_fixed_only_without_quiet_noop", ap_b is False and lp_b == base_lp and mp_b == base_mp)
+    lp_c, mp_c, ap_c = apply_transport_quiet_filters(base_lp, base_mp, False, True)
+    ok("TQ04_quiet_without_fixed_only_noop", ap_c is False and lp_c == base_lp and mp_c == base_mp)
+    lp_d, mp_d, ap_d = apply_transport_quiet_filters(base_lp, base_mp, True, True)
+    ok("TQ05_dual_gate_applies", ap_d is True)
+    ok("TQ06_regime_stripped",
+       all(p not in lp_d for p in TRANSPORT_QUIET_STRIP_ALLOW_PREFIXES)
+       and not any(str(p).startswith("CG_REGIME_TIME") for p in lp_d))
+    ok("TQ07_regime_muted", "CG_REGIME_TIME_" in mp_d and "KEEP_MUTE" in mp_d)
+    ok("TQ08_d0_prefixes_kept",
+       all(p in lp_d for p in TRANSPORT_QUIET_KEEP_PREFIXES) and "OTHER" in lp_d)
+    # suppression cannot mutate research counters/targets
+    before_ctr = dict(rt_a.counters)
+    before_tg = {"SPY": 0.5, "gross": 1.0}
+    _ = apply_transport_quiet_filters(["CG_REGIME_TIME_PENDING"], [], True, True)
+    ok("TQ09_no_state_mutation",
+       rt_a.counters == before_ctr and before_tg == {"SPY": 0.5, "gross": 1.0})
+    line = compact_closeout_text(payload)
+    ok("TQ10_compact_still_emitted", line.startswith(D0_COMPACT_PREFIX + ","))
+    proj = project_transport_budget_bytes(nbytes)
+    ok("TQ11_budget_projection_under_100kb", proj < ORDINARY_LOG_LIMIT, detail=str(proj))
+    ok("TQ12_no_per_checkpoint_requirement",
+       tqc["per_checkpoint_d0_logs"] == "FORBIDDEN_WHEN_QUIET")
+    # simulate log gate: muted message starts with CG_REGIME_TIME_
+    muted = any("CG_REGIME_TIME_PENDING".startswith(p) for p in mp_d)
+    ok("TQ13_regime_line_would_mute", muted is True)
+    ok("TQ14_compact_not_muted",
+       not any(D0_COMPACT_PREFIX.startswith(p) for p in mp_d))
+
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
         "eoa_payload_size_bytes": nbytes,
+        "transport_budget_projection_bytes": proj,
         "aggregate_fixture_parity": "PASS" if failed == 0 else "FAIL",
         "sample_cap_invariance_gate": "PASS" if failed == 0 else "FAIL",
+        "transport_quiet_gate": "PASS" if failed == 0 else "FAIL",
     }
 
 

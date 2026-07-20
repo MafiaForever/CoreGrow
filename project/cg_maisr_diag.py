@@ -1043,7 +1043,8 @@ class CgMaisrDiagMixin(_DD01, CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMai
             # Macro A1 owns a separate EOA/artifact budget; do not starve it with P1 lines.
             if (str(msg).startswith("CG_MACRO_A1_") or str(msg).startswith("CG_MACRO_RESID_B1_")
                     or str(msg).startswith("CG_MACRO_RESID_B11_")
-                    or str(msg).startswith("CG_MACRO_A1_CLOSEOUT") or str(msg).startswith("CG_MAISR_CLOSEOUT")):
+                    or str(msg).startswith("CG_MACRO_A1_CLOSEOUT") or str(msg).startswith("CG_MAISR_CLOSEOUT")
+                    or str(msg).startswith("D0_COMPACT_CLOSEOUT") or str(msg).startswith("CG_DAMAGE_")):
                 self.log(msg)
                 return
             # P1 console budget target <45 KB; leave headroom for FINAL lines.

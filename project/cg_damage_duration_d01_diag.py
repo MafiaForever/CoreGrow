@@ -33,6 +33,7 @@ from cg_damage_duration_d03b_runtime import (
     ModelAShadowRuntimeAccounting, run_all_d03b1_static_tests,
     EXPERIMENT as D03B_EXPERIMENT, PHASE as D03B_PHASE,
 )
+from cg_damage_duration_d03b_compact_export import apply_transport_quiet_filters
 
 _SH_ACTIVE = frozenset(("HEDGED", "ENTRY_PENDING", "EXIT_PENDING"))
 
@@ -47,6 +48,8 @@ class CgDamageDurationD01DiagMixin:
         self.cg_damage_duration_d03b_enable = _bool("cg_damage_duration_d03b_enable", "0")
         self.cg_damage_duration_d03b_fixed_only_shadow_enable = _bool(
             "cg_damage_duration_d03b_fixed_only_shadow_enable", "0")
+        self.cg_damage_duration_d03b_cloud_transport_quiet_enable = _bool(
+            "cg_damage_duration_d03b_cloud_transport_quiet_enable", "0")
 
     def _DamageD01MaybeEnableMs(self):
         if getattr(self, "cg_damage_duration_d01_enable", False) or getattr(
@@ -71,6 +74,29 @@ class CgDamageDurationD01DiagMixin:
             self._DamageD03bInitHooks()
         except Exception:
             self._ms_err = int(getattr(self, "_ms_err", 0) or 0) + 1
+        try:
+            self._DamageD03bApplyCloudTransportQuiet()
+        except Exception:
+            self._ms_err = int(getattr(self, "_ms_err", 0) or 0) + 1
+
+    def _DamageD03bApplyCloudTransportQuiet(self):
+        # Dual-gate only: fixed-only + transport-quiet. Mute CG_REGIME_TIME_*
+        # even when regime-time init re-appended those prefixes to log_only.
+        fo = bool(getattr(self, "cg_damage_duration_d03b_fixed_only_shadow_enable", False))
+        q = bool(getattr(self, "cg_damage_duration_d03b_cloud_transport_quiet_enable", False))
+        lp, mp, applied = apply_transport_quiet_filters(
+            getattr(self, "log_only_prefixes", None),
+            getattr(self, "log_mute_prefixes", None),
+            fo, q,
+        )
+        if not applied:
+            return
+        self.log_only_prefixes = lp
+        self.log_mute_prefixes = mp
+        self._DamageD01Log(
+            "CG_DAMAGE_D03B_TRANSPORT_QUIET,enable=1,muted=CG_REGIME_TIME_,"
+            "fixed_only=1,budget_target_lt_100kb=1"
+        )
 
     def _DamageD01OnAcceptedBarSafe(self, tk, et, o, h, l, c):
         if getattr(self, "cg_damage_duration_d01_enable", False):

@@ -398,6 +398,8 @@ def run_damage_d03b1_static_tests(param_map=None):
     # --- D0.3B2A fixed-only shadow contract ---
     ok("F01_fixed_only_flag_default_off",
        RRX_PARAMS.get("cg_damage_duration_d03b_fixed_only_shadow_enable") == "0")
+    ok("F01b_transport_quiet_default_off",
+       RRX_PARAMS.get("cg_damage_duration_d03b_cloud_transport_quiet_enable") == "0")
     ok("F02_disabled_noop_unchanged",
        ModelAShadowRuntimeAccounting().update(None, None, None, d03b_enabled=False) is None)
     ctr = fixed_only_shadow_contract()

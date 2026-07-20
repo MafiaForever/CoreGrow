@@ -46,6 +46,7 @@ RRX_PARAMS = {
     "cg_damage_duration_d03a_enable":  "0",
     "cg_damage_duration_d03b_enable":  "0",
     "cg_damage_duration_d03b_fixed_only_shadow_enable": "0",
+    "cg_damage_duration_d03b_cloud_transport_quiet_enable": "0",
     "spyg_sat_cap":                    "0.25",
     "spyg_sat_cap_min":                "0.00",
     "spyg_sat_cap_max":                "0.30",
