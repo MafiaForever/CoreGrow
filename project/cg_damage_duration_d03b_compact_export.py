@@ -1,6 +1,7 @@
 # cg_damage_duration_d03b_compact_export.py -- D0.3B2B compact streaming aggregates.
 # Diagnostic only. No ObjectStore/filesystem persistence. Bounded samples stay samples.
 from __future__ import annotations
+import ast
 import hashlib
 import json
 import re
@@ -418,6 +419,176 @@ def transport_quiet_contract():
     }
 
 
+_STATIC_SUITE_NAME_RE = re.compile(
+    r"^(?:run_all_)?.*static_tests$|^run_d0_eoa_dispatch_static_tests$"
+)
+
+
+def _call_func_name(node: ast.AST):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def scan_runtime_static_test_invocations(source_text, module_name=""):
+    """AST: count run_*static_tests calls inside non-test runtime methods."""
+    hits = []
+    try:
+        tree = ast.parse(source_text or "")
+    except SyntaxError as e:
+        return [{"module": module_name, "line": e.lineno or 0, "func": "PARSE_FAIL",
+                 "callee": str(e)}]
+    for node in tree.body:
+        funcs = []
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    funcs.append(item)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.append(node)
+        for fn in funcs:
+            if _STATIC_SUITE_NAME_RE.match(fn.name or ""):
+                continue
+            if "static_test" in (fn.name or ""):
+                continue
+            for sub in ast.walk(fn):
+                if not isinstance(sub, ast.Call):
+                    continue
+                callee = _call_func_name(sub.func)
+                if not callee or not _STATIC_SUITE_NAME_RE.match(callee):
+                    continue
+                hits.append({
+                    "module": module_name,
+                    "line": getattr(sub, "lineno", 0) or 0,
+                    "func": fn.name,
+                    "callee": callee,
+                })
+    return hits
+
+
+def run_runtime_test_isolation_static_tests():
+    """Prove D0 Initialize never invokes static suites / failure fixtures."""
+    import inspect
+    import cg_damage_duration_d01_core as m_d01
+    import cg_damage_duration_d02_sensor as m_d02a
+    import cg_damage_duration_d02_features as m_d02b
+    import cg_damage_duration_d02_structure as m_d02c
+    import cg_damage_duration_d03a_shadow as m_d03a
+    import cg_damage_duration_d03b_runtime as m_d03b
+    import cg_damage_duration_d03b_compact_export as m_cex
+    from cg_damage_duration_d01_diag import CgDamageDurationD01DiagMixin
+
+    rows, passed, failed = [], 0, 0
+
+    def ok(n, c, detail=""):
+        nonlocal passed, failed
+        if c:
+            passed += 1
+            rows.append({"name": n, "pass": True, "detail": detail})
+        else:
+            failed += 1
+            rows.append({"name": n, "pass": False, "detail": str(detail)})
+
+    src_map = {
+        "cg_damage_duration_d01_diag.py": inspect.getsource(
+            __import__("cg_damage_duration_d01_diag", fromlist=["*"])),
+        "cg_damage_duration_d03b_runtime.py": inspect.getsource(m_d03b),
+        "cg_damage_duration_d03b_compact_export.py": inspect.getsource(m_cex),
+    }
+    all_hits = []
+    for name, src in src_map.items():
+        all_hits.extend(scan_runtime_static_test_invocations(src, name))
+    ok("ISO01_runtime_static_call_count_zero", len(all_hits) == 0, detail=str(all_hits))
+
+    boom_calls = []
+
+    def _boom(*_a, **_k):
+        boom_calls.append(1)
+        raise RuntimeError("static_suite_must_not_run_from_runtime_init")
+
+    targets = [
+        (m_d01, "run_damage_d01_static_tests"),
+        (m_d02a, "run_damage_d02a_static_tests"),
+        (m_d02b, "run_all_d02b_static_tests"),
+        (m_d02c, "run_all_d02c_static_tests"),
+        (m_d03a, "run_all_d03a_static_tests"),
+        (m_d03b, "run_all_d03b1_static_tests"),
+        (m_d03b, "run_damage_d03b1_static_tests"),
+        (m_cex, "run_compact_export_static_tests"),
+        (m_cex, "run_d0_eoa_dispatch_static_tests"),
+    ]
+    originals = []
+    for mod, attr in targets:
+        originals.append((mod, attr, getattr(mod, attr)))
+        setattr(mod, attr, _boom)
+
+    class _H(CgDamageDurationD01DiagMixin):
+        def __init__(self):
+            self.logs = []
+            self._ms_err = 0
+            self.cg_damage_duration_d01_enable = True
+            self.cg_damage_duration_d02_enable = True
+            self.cg_damage_duration_d03a_enable = True
+            self.cg_damage_duration_d03b_enable = True
+            self.cg_damage_duration_d03b_fixed_only_shadow_enable = True
+            self.cg_damage_duration_d03b_cloud_transport_quiet_enable = False
+            self.log_only_prefixes = []
+            self.log_mute_prefixes = []
+
+        def _DamageD01Log(self, msg):
+            self.logs.append(str(msg))
+
+        def _MsLog(self, msg):
+            self.logs.append(str(msg))
+
+        def log(self, msg):
+            self.logs.append(str(msg))
+
+    init_ok = False
+    init_err = ""
+    try:
+        h = _H()
+        h._DamageD01InitHooksSafe()
+        init_ok = True
+        ok("ISO02_init_survives_suite_boom", True)
+        ok("ISO03_boom_never_invoked", len(boom_calls) == 0, detail=str(len(boom_calls)))
+        ok("ISO04_d03b_accounting_ready", getattr(h, "_dmg_d03b", None) is not None)
+        ok("ISO05_external_only_markers",
+           int((getattr(h, "_dmg_d03b_static", {}) or {}).get("external_only", 0) or 0) == 1
+           and int((getattr(h, "_dmg_static", {}) or {}).get("external_only", 0) or 0) == 1)
+        ok("ISO06_init_logs_external_only",
+           any("tests=EXTERNAL_ONLY" in x for x in h.logs if "D03B_INIT" in x))
+        ok("ISO07_no_order_mut", int(getattr(h, "_dmg_real_orders", 0) or 0) == 0)
+        ok("ISO08_no_target_mut", int(getattr(h, "_dmg_target_mut", 0) or 0) == 0)
+        ok("ISO09_no_sub_mut", int(getattr(h, "_dmg_sub_changes", 0) or 0) == 0)
+    except Exception as e:
+        init_err = f"{type(e).__name__}:{e}"
+        ok("ISO02_init_survives_suite_boom", False, detail=init_err)
+        ok("ISO03_boom_never_invoked", False, detail=str(boom_calls))
+    finally:
+        for mod, attr, orig in originals:
+            setattr(mod, attr, orig)
+
+    eoa = m_cex.run_d0_eoa_dispatch_static_tests()
+    ok("ISO10_external_eoa_suite_still_runs", eoa.get("failed", 1) == 0,
+       detail=str(eoa.get("failed")))
+    fail_rows = [r for r in (eoa.get("rows") or []) if r.get("name") == "E12_failure_containment"]
+    ok("ISO11_failure_containment_external",
+       bool(fail_rows) and fail_rows[0].get("pass") is True)
+
+    return {
+        "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
+        "runtime_reachable_static_test_call_count": len(all_hits),
+        "runtime_static_test_hits": all_hits,
+        "runtime_test_isolation_gate": "PASS" if failed == 0 and init_ok else "FAIL",
+        "init_ok": init_ok,
+        "init_err": init_err,
+        "boom_invocations": len(boom_calls),
+    }
+
+
 def run_compact_export_static_tests():
     """D0.3B2B repair tests; returns {passed,failed,total,rows,...}."""
     from datetime import timedelta
@@ -628,6 +799,16 @@ def run_compact_export_static_tests():
         else:
             failed += 1
 
+    # --- Runtime init must not invoke static suites ---
+    iso = run_runtime_test_isolation_static_tests()
+    ok("ISO00_suite", iso.get("failed", 1) == 0, detail=str(iso.get("failed")))
+    for irow in iso.get("rows") or []:
+        rows.append({"name": "ISO_" + irow["name"], "pass": irow["pass"], "detail": irow.get("detail", "")})
+        if irow["pass"]:
+            passed += 1
+        else:
+            failed += 1
+
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
         "eoa_payload_size_bytes": nbytes,
@@ -636,6 +817,10 @@ def run_compact_export_static_tests():
         "sample_cap_invariance_gate": "PASS" if failed == 0 else "FAIL",
         "transport_quiet_gate": "PASS" if failed == 0 else "FAIL",
         "d0_eoa_dispatch": eoa,
+        "runtime_test_isolation": iso,
+        "runtime_reachable_static_test_call_count": iso.get(
+            "runtime_reachable_static_test_call_count", -1),
+        "runtime_test_isolation_gate": iso.get("runtime_test_isolation_gate", "FAIL"),
     }
 
 

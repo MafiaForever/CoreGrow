@@ -242,6 +242,36 @@ def verify_pythonnet_and_sizes(project_dir=None):
     }
 
 
+def scan_runtime_static_test_reachability(project_dir=None):
+    """Cursor-local: zero run_*static_tests calls in D0 runtime init/EOA paths."""
+    import sys
+    sys.path.insert(0, str(PROJ))
+    from cg_damage_duration_d03b_compact_export import scan_runtime_static_test_invocations
+    root = Path(project_dir) if project_dir else PROJ
+    targets = (
+        "cg_damage_duration_d01_diag.py",
+        "cg_damage_duration_d03b_runtime.py",
+        "cg_damage_duration_d03b_compact_export.py",
+        "cg_maisr_diag.py",
+    )
+    hits = []
+    per_file = {}
+    for name in targets:
+        path = root / name
+        if not path.exists():
+            continue
+        file_hits = scan_runtime_static_test_invocations(
+            path.read_text(encoding="utf-8"), name)
+        per_file[name] = file_hits
+        hits.extend(file_hits)
+    return {
+        "runtime_reachable_static_test_call_count": len(hits),
+        "hits": hits,
+        "per_file": per_file,
+        "gate": "PASS" if len(hits) == 0 else "FAIL",
+    }
+
+
 def _selftest_ast_excludes_comments_strings():
     """AST executable scan must ignore comments/strings."""
     tok = "open"
@@ -320,6 +350,7 @@ def run_cloudsafe_gate():
     scan = scan_closure()
     raw = scan_raw_lexical_closure()
     py = verify_pythonnet_and_sizes()
+    rt_iso = scan_runtime_static_test_reachability()
     rows = []
     passed = failed = 0
 
@@ -343,6 +374,9 @@ def run_cloudsafe_gate():
     ok("CS06_ast_detects_executable", _selftest_ast_detects_executable())
     ok("CS07_raw_includes_comments_strings_docs", _selftest_raw_includes_comments_strings_docstrings())
     ok("CS08_raw_ignores_identifier_suffix", _selftest_raw_ignores_identifier_suffix())
+    ok("CS11_runtime_static_test_isolation",
+       rt_iso["runtime_reachable_static_test_call_count"] == 0,
+       detail=str(rt_iso.get("hits")))
     for name in (
         "cg_damage_duration_d03b_runtime.py",
         "cg_damage_duration_d03b_compact_export.py",
@@ -365,6 +399,7 @@ def run_cloudsafe_gate():
         "scan": scan,
         "raw_lexical": raw,
         "pythonnet_sizes": py,
+        "runtime_static_test_isolation": rt_iso,
     }
 
 

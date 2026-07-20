@@ -9,31 +9,32 @@ from cg_damage_duration_d01_core import (
     EXPERIMENT, PHASE, FROZEN_PRODUCTION_DEFAULTS, CONFIRMATION_WINDOW_MINUTES,
     EV_PROTECTION, EV_D30, EV_D45,
     DamageEpisodeLedger, empty_counters, protection_source_from_snapshot,
-    material_protection_active, run_damage_d01_static_tests, scan_forbidden_apis,
+    material_protection_active, scan_forbidden_apis,
     verify_frozen_defaults, build_technical_counters_csv,
 )
 from cg_damage_duration_d02_sensor import (
-    DamageD02Sensor, run_damage_d02a_static_tests, D02_FROZEN_DEFAULTS,
+    DamageD02Sensor,
     PRIOR_ATR_SOURCE, D30_D45_RUNTIME_SOURCE, EXPERIMENT as D02_EXPERIMENT,
     PHASE as D02_PHASE, empty_sensor_counters,
 )
 from cg_damage_duration_d02_features import (
-    FeatureCollector, run_all_d02b_static_tests, SCHEMA_VERSION as D02B_SCHEMA,
+    FeatureCollector, SCHEMA_VERSION as D02B_SCHEMA,
     EXPERIMENT as D02B_EXPERIMENT, PHASE as D02B_PHASE,
 )
 from cg_damage_duration_d02_structure import (
-    D02CCollector, run_all_d02c_static_tests, EXPERIMENT as D02C_EXPERIMENT,
+    D02CCollector, EXPERIMENT as D02C_EXPERIMENT,
     PHASE as D02C_PHASE,
 )
 from cg_damage_duration_d03a_shadow import (
-    ModelAShadowRouter, run_all_d03a_static_tests, EXPERIMENT as D03A_EXPERIMENT,
+    ModelAShadowRouter, EXPERIMENT as D03A_EXPERIMENT,
     PHASE as D03A_PHASE,
 )
 from cg_damage_duration_d03b_runtime import (
-    ModelAShadowRuntimeAccounting, run_all_d03b1_static_tests,
+    ModelAShadowRuntimeAccounting,
     EXPERIMENT as D03B_EXPERIMENT, PHASE as D03B_PHASE,
 )
 from cg_damage_duration_d03b_compact_export import apply_transport_quiet_filters
+from cg_damage_duration_d03b_accounting import P0_SOURCE_VERDICT
 
 _SH_ACTIVE = frozenset(("HEDGED", "ENTRY_PENDING", "EXIT_PENDING"))
 
@@ -203,14 +204,14 @@ class CgDamageDurationD01DiagMixin:
             core_src = diag_src = ""
         hits = scan_forbidden_apis(core_src + "\n" + diag_src)
         fr_ok, _ = verify_frozen_defaults(FROZEN_PRODUCTION_DEFAULTS)
-        rep = run_damage_d01_static_tests(FROZEN_PRODUCTION_DEFAULTS, core_src, diag_src)
-        self._dmg_static = rep
+        # Static suites run only via explicit Cursor/local tooling (not Initialize).
+        self._dmg_static = {"passed": 0, "failed": 0, "total": 0, "external_only": 1}
         self._DamageD01Log(
-            f"CG_DAMAGE_D01_INIT,enable=1,tests={rep['passed']}/{rep['total']},"
+            f"CG_DAMAGE_D01_INIT,enable=1,tests=EXTERNAL_ONLY,"
             f"forbidden_api={len(hits)},frozen_ok={int(fr_ok)},"
             f"diagnostic_real_orders=0,subscription_changes=0,target_mutations=0"
         )
-        if rep["failed"] or hits or not fr_ok:
+        if hits or not fr_ok:
             self._dmg_err += 1
 
     def _DamageD02InitHooks(self):
@@ -233,38 +234,24 @@ class CgDamageDurationD01DiagMixin:
             if pref not in lp:
                 lp.append(pref)
         self.log_only_prefixes = lp
-        try:
-            import inspect
-            sens_src = inspect.getsource(__import__("cg_damage_duration_d02_sensor", fromlist=["*"]))
-        except Exception:
-            sens_src = ""
-        rep = run_damage_d02a_static_tests(D02_FROZEN_DEFAULTS, sens_src, "")
-        self._dmg_d02_static = rep
-        try:
-            rep_b = run_all_d02b_static_tests()
-        except Exception:
-            rep_b = {"passed": 0, "failed": 1, "total": 1}
-        self._dmg_d02b_static = rep_b
-        try:
-            rep_c = run_all_d02c_static_tests()
-        except Exception:
-            rep_c = {"passed": 0, "failed": 1, "total": 1}
-        self._dmg_d02c_static = rep_c
+        # Static suites: EXTERNAL_ONLY (Cursor/local). Never invoke from Initialize.
+        _ext = {"passed": 0, "failed": 0, "total": 0, "external_only": 1}
+        self._dmg_d02_static = dict(_ext)
+        self._dmg_d02b_static = dict(_ext)
+        self._dmg_d02c_static = dict(_ext)
         self._DamageD01Log(
-            f"CG_DAMAGE_D02A_INIT,enable=1,tests={rep['passed']}/{rep['total']},"
+            f"CG_DAMAGE_D02A_INIT,enable=1,tests=EXTERNAL_ONLY,"
             f"atr_source={PRIOR_ATR_SOURCE},runtime_source={D30_D45_RUNTIME_SOURCE},"
             f"macro_resid_b1_required=0,diagnostic_real_orders=0"
         )
         self._DamageD01Log(
-            f"CG_DAMAGE_D02B_INIT,enable=1,tests={rep_b.get('passed', 0)}/{rep_b.get('total', 0)},"
+            f"CG_DAMAGE_D02B_INIT,enable=1,tests=EXTERNAL_ONLY,"
             f"schema={D02B_SCHEMA},feature_collector=1,event_memory=1"
         )
         self._DamageD01Log(
-            f"CG_DAMAGE_D02C_INIT,enable=1,tests={rep_c.get('passed', 0)}/{rep_c.get('total', 0)},"
+            f"CG_DAMAGE_D02C_INIT,enable=1,tests=EXTERNAL_ONLY,"
             f"changepoint=1,structure=1,veto=FORBIDDEN"
         )
-        if rep["failed"] or int(rep_b.get("failed", 1) or 0) or int(rep_c.get("failed", 1) or 0):
-            self._dmg_d02_err += 1
 
     def _DamageD03aInitHooks(self):
         # Initialize only when both D0.2 and D0.3A are enabled; else no-op.
@@ -280,17 +267,11 @@ class CgDamageDurationD01DiagMixin:
         if "CG_DAMAGE_D03A_" not in lp:
             lp.append("CG_DAMAGE_D03A_")
         self.log_only_prefixes = lp
-        try:
-            rep = run_all_d03a_static_tests()
-        except Exception:
-            rep = {"passed": 0, "failed": 1, "total": 1}
-        self._dmg_d03a_static = rep
+        self._dmg_d03a_static = {"passed": 0, "failed": 0, "total": 0, "external_only": 1}
         self._DamageD01Log(
-            f"CG_DAMAGE_D03A_INIT,enable=1,tests={rep.get('passed', 0)}/{rep.get('total', 0)},"
-            f"model_a=1,shadow=1,production_actions=0"
+            "CG_DAMAGE_D03A_INIT,enable=1,tests=EXTERNAL_ONLY,"
+            "model_a=1,shadow=1,production_actions=0"
         )
-        if int(rep.get("failed", 1) or 0):
-            self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1
 
     def _DamageD03bInitHooks(self):
         # D0.3B1 accounting/export; requires D0.3A. Default OFF.
@@ -304,14 +285,14 @@ class CgDamageDurationD01DiagMixin:
         if "CG_DAMAGE_D03B_" not in lp:
             lp.append("CG_DAMAGE_D03B_")
         self.log_only_prefixes = lp
-        try:
-            rep = run_all_d03b1_static_tests()
-        except Exception:
-            rep = {"passed": 0, "failed": 1, "total": 1}
-        self._dmg_d03b_static = rep
+        # Never run static suites / failure-containment monkeypatches from Initialize.
+        self._dmg_d03b_static = {
+            "passed": 0, "failed": 0, "total": 0, "external_only": 1,
+            "p0_verdict": P0_SOURCE_VERDICT, "phase_verdict": "RUNTIME_INIT_OK",
+        }
         self._DamageD01Log(
-            f"CG_DAMAGE_D03B_INIT,enable=1,tests={rep.get('passed', 0)}/{rep.get('total', 0)},"
-            f"p0={rep.get('p0_verdict', 'UNRESOLVED')},verdict={rep.get('phase_verdict', 'REPAIR_REQUIRED')}"
+            f"CG_DAMAGE_D03B_INIT,enable=1,tests=EXTERNAL_ONLY,"
+            f"p0={P0_SOURCE_VERDICT},verdict=RUNTIME_INIT_OK"
         )
 
     def _DamageD01Log(self, msg):
