@@ -323,6 +323,11 @@ class CgDamageDurationD01DiagMixin:
                 "CG_DAMAGE_D03B_PROXY_REPLAY,enable=1,underlying=SPY,cost_bps=0,"
                 "gate=fixed_only_shadow"
             )
+            self._DamageD01Log(
+                "CG_DAMAGE_D04A_ABLATION,enable=1,variants="
+                "P5_NO_CHANGEPOINT|P5_NO_STRUCTURE|P5_NO_HYSTERESIS|P5_NO_ABSTENTION,"
+                "p5_full=P5_DYNAMIC_MIRROR,shadow_only=1"
+            )
 
     def _DamageD01Log(self, msg):
         try:

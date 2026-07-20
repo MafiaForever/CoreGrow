@@ -21,6 +21,7 @@ BLOCKS = {
     "2022_2026": (2022, 2026),
 }
 P123 = ("P1_HOLD_TO_CLOSE", "P2_HOLD_TO_NEXT_CLOSE", "P3_HOLD_3D")
+SCHEDULED_FRACTION_POLICIES = ("P4_GRADUAL_FIXED", "P5_DYNAMIC")
 
 
 def _session_close_dt(day):
@@ -166,17 +167,18 @@ class _Episode:
     __slots__ = (
         "episode_id", "open_time", "open_day", "sessions", "sleeves",
         "confirm_time", "pending_liq_after", "closed", "excluded",
-        "exclude_reason", "wealth", "episode_dd", "switches",
+        "exclude_reason", "wealth", "episode_dd", "switches", "policy_ids",
     )
 
-    def __init__(self, episode_id, open_time):
+    def __init__(self, episode_id, open_time, policy_ids):
         self.episode_id = str(episode_id)
         self.open_time = open_time
         self.open_day = open_time.date() if isinstance(open_time, datetime) else None
         self.sessions = []
         if self.open_day is not None:
             self.sessions = [self.open_day]
-        self.sleeves = {pid: _Sleeve() for pid in FIXED_ONLY_POLICIES}
+        self.policy_ids = tuple(policy_ids)
+        self.sleeves = {pid: _Sleeve() for pid in self.policy_ids}
         self.confirm_time = None
         self.pending_liq_after = None
         self.closed = False
@@ -190,16 +192,20 @@ class _Episode:
 class FixedOnlySpyProxyReplay:
     """Per-episode SPY proxy sleeves for P1–P5; cost-free comparative diagnostic."""
 
-    def __init__(self):
+    def __init__(self, extra_policies=None, blocks=None):
         self.enabled = False
+        self.extra_policies = tuple(extra_policies or ())
+        self.policy_ids = tuple(FIXED_ONLY_POLICIES) + tuple(
+            p for p in self.extra_policies if p not in FIXED_ONLY_POLICIES)
+        self.blocks = dict(blocks) if blocks is not None else dict(BLOCKS)
         self.active = {}
         self.completed = []  # list[_Episode]
         self.excluded = []
         self.last_spy_time = None
         self.last_spy_px = None
-        self.chrono_equity = {pid: 1.0 for pid in FIXED_ONLY_POLICIES}
-        self.chrono_peak = {pid: 1.0 for pid in FIXED_ONLY_POLICIES}
-        self.chrono_dd = {pid: 0.0 for pid in FIXED_ONLY_POLICIES}
+        self.chrono_equity = {pid: 1.0 for pid in self.policy_ids}
+        self.chrono_peak = {pid: 1.0 for pid in self.policy_ids}
+        self.chrono_dd = {pid: 0.0 for pid in self.policy_ids}
         self.counters = {
             "spy_bars": 0, "opens": 0, "confirms": 0, "abandons": 0,
             "completed": 0, "excluded": 0, "same_bar_blocked": 0,
@@ -230,7 +236,7 @@ class FixedOnlySpyProxyReplay:
         eid = str(episode_id)
         if eid in self.active:
             return False
-        self.active[eid] = _Episode(eid, open_time)
+        self.active[eid] = _Episode(eid, open_time, self.policy_ids)
         self.counters["opens"] += 1
         return True
 
@@ -282,11 +288,14 @@ class FixedOnlySpyProxyReplay:
             return
         self.observe_session(decision_time.date())
         fm = dict(frac_map or {})
-        for pid in ("P4_GRADUAL_FIXED", "P5_DYNAMIC"):
+        for pid in self.policy_ids:
+            if pid in P123:
+                continue
             raw = fm.get(pid, UNAVAILABLE)
             if not _avail(raw):
                 continue
-            ep.sleeves[pid].schedule(_f(raw), decision_time)
+            if pid in ep.sleeves:
+                ep.sleeves[pid].schedule(_f(raw), decision_time)
 
     def on_spy_bar(self, bar_time, px, ticker=None):
         if not self.enabled:
@@ -355,7 +364,7 @@ class FixedOnlySpyProxyReplay:
                     ep.switches[pid] = sl.switches
                     if sl.missing_price:
                         ok_all = False
-                if not ok_all or len(ep.wealth) < len(FIXED_ONLY_POLICIES):
+                if not ok_all or len(ep.wealth) < len(self.policy_ids):
                     ep.excluded = True
                     ep.exclude_reason = "MISSING_COMMON_SPY_PATH"
                     self.active.pop(eid, None)
@@ -367,7 +376,7 @@ class FixedOnlySpyProxyReplay:
                 self.active.pop(eid, None)
                 self.completed.append(ep)
                 self.counters["completed"] += 1
-                for pid in FIXED_ONLY_POLICIES:
+                for pid in self.policy_ids:
                     w = float(ep.wealth[pid])
                     self.chrono_equity[pid] *= w
                     e = self.chrono_equity[pid]
@@ -420,9 +429,9 @@ class FixedOnlySpyProxyReplay:
     def snapshot(self):
         eps = self._episode_rows()
         # recompute chrono metrics over full completed set (already maintained)
-        metrics = {pid: self._metrics_for(eps, pid) for pid in FIXED_ONLY_POLICIES}
+        metrics = {pid: self._metrics_for(eps, pid) for pid in self.policy_ids}
         # ensure final wealth / dd use chrono trackers for full sample
-        for pid in FIXED_ONLY_POLICIES:
+        for pid in self.policy_ids:
             metrics[pid]["final_wealth_factor"] = self.chrono_equity[pid]
             metrics[pid]["max_drawdown"] = self.chrono_dd[pid]
             metrics[pid]["paired_episode_count"] = len(eps)
@@ -434,6 +443,8 @@ class FixedOnlySpyProxyReplay:
 
         pairwise = {}
         for rhs in FIXED_ONLY_BASELINES:
+            if "P5_DYNAMIC" not in metrics or rhs not in metrics:
+                continue
             pairwise[rhs] = {
                 "lhs": "P5_DYNAMIC", "rhs": rhs,
                 "n": len(eps),
@@ -452,11 +463,11 @@ class FixedOnlySpyProxyReplay:
             }
 
         blocks = {}
-        for bname, (y0, y1) in BLOCKS.items():
+        for bname, (y0, y1) in self.blocks.items():
             beps = [ep for ep in eps
                     if isinstance(ep.open_time, datetime) and y0 <= ep.open_time.year <= y1]
             bmet = {}
-            for pid in FIXED_ONLY_POLICIES:
+            for pid in self.policy_ids:
                 ws = [float(ep.wealth.get(pid, 1.0)) for ep in beps]
                 rets = [w - 1.0 for w in ws]
                 n = len(ws)
@@ -481,6 +492,8 @@ class FixedOnlySpyProxyReplay:
                     }
             bpw = {}
             for rhs in FIXED_ONLY_BASELINES:
+                if rhs not in bmet or "P5_DYNAMIC" not in bmet:
+                    continue
                 if not beps or not _avail(bmet["P5_DYNAMIC"]["final_wealth_factor"]):
                     bpw[rhs] = {"n": 0, "wealth_diff": UNAVAILABLE, "dd_diff": UNAVAILABLE}
                 else:
@@ -506,6 +519,7 @@ class FixedOnlySpyProxyReplay:
             "policy_metrics": metrics,
             "pairwise": pairwise,
             "blocks": blocks,
+            "policy_ids": list(self.policy_ids),
             "counters": dict(self.counters),
             "p0_excluded": True,
         }

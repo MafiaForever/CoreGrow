@@ -28,6 +28,10 @@ from cg_damage_duration_d03b_compact_export import (
     D0_COMPACT_PART_PREFIX, EXPORT_MODE, FULL_HISTORY_RAW_EXPORT, AGGREGATE_COVERAGE,
 )
 from cg_damage_duration_d03b_proxy_replay import FixedOnlySpyProxyReplay
+from cg_damage_duration_d04a_ablation import (
+    ModelAAblationBank, EXTRA_PROXY_POLICIES, D04A_BLOCKS, P5_FULL,
+    enrich_proxy_snap_d04a, run_d04a_ablation_static_tests,
+)
 
 FORBIDDEN_RE = re.compile(
     r"(?<![A-Za-z_])(History|AddEquity|AddData|SetHoldings|MarketOrder|LimitOrder|"
@@ -48,7 +52,9 @@ class ModelAShadowRuntimeAccounting:
         self.episode_ids = []
         self.exporter = PolicyRuntimeExporter()
         self.aggregates = CompactStreamingAggregates()
-        self.proxy = FixedOnlySpyProxyReplay()
+        self.proxy = FixedOnlySpyProxyReplay(
+            extra_policies=EXTRA_PROXY_POLICIES, blocks=D04A_BLOCKS)
+        self.ablation = ModelAAblationBank()
         self.p0_audit = dict(P0_AUDIT)
         self.counters = {
             "snapshots": 0, "duplicate_blocked": 0, "stale_blocked": 0,
@@ -64,6 +70,7 @@ class ModelAShadowRuntimeAccounting:
         self.enabled = True
         self.fixed_only = bool(fixed_only_shadow_enable)
         self.proxy.set_enabled(self.fixed_only)
+        self.ablation.set_enabled(self.fixed_only)
         if snap_b is None or shadow_out is None:
             return None
         b = deepcopy(snap_b)
@@ -165,10 +172,16 @@ class ModelAShadowRuntimeAccounting:
             len(self.exporter.checkpoint_rows), len(self.exporter.episode_rows))
         self.aggregates.note_gate("TIMESTAMP_OK" if ok_ts else "TIMESTAMP_SOFT_FAIL")
 
-        # Fixed-only SPY proxy: schedule P4/P5 from recorded restore fractions only.
+        # Fixed-only SPY proxy: schedule P4/P5 + D0.4A ablations from fractions.
         if self.fixed_only and eid not in (None, UNAVAILABLE):
+            fm = dict(frac_map)
+            if "P5_DYNAMIC" in fm:
+                fm[P5_FULL] = fm["P5_DYNAMIC"]
+            abl = self.ablation.update(b, c) if self.ablation.enabled else {}
+            for k, v in (abl or {}).items():
+                fm[k] = v
             self.proxy.on_checkpoint(
-                dt if isinstance(dt, datetime) else None, eid, frac_map)
+                dt if isinstance(dt, datetime) else None, eid, fm)
 
         self.last_checkpoint = ck
         if ck is not None:
@@ -221,7 +234,7 @@ class ModelAShadowRuntimeAccounting:
         proxy_snap = None
         if self.fixed_only and self.proxy is not None:
             self.proxy.finalize_eoa()
-            proxy_snap = self.proxy.snapshot()
+            proxy_snap = enrich_proxy_snap_d04a(self.proxy.snapshot())
         return build_compact_closeout(
             self.aggregates,
             runtime_counters=self.counters,
@@ -518,6 +531,24 @@ def run_damage_d03b1_static_tests(param_map=None):
         else:
             failed += 1
 
+    d04 = run_d04a_ablation_static_tests()
+    ok("B08_d04a_suite", d04.get("failed", 1) == 0, detail=str(d04.get("failed")))
+    for arow in d04.get("rows") or []:
+        rows.append({"name": "A_" + arow["name"], "pass": arow["pass"], "detail": arow.get("detail", "")})
+        if arow["pass"]:
+            passed += 1
+        else:
+            failed += 1
+
+    # D0.4A proxy extras present on fixed-only runtime
+    ok("B09_d04a_proxy_extras",
+       P5_FULL in getattr(rt_fo.proxy, "policy_ids", ())
+       and all(v in rt_fo.proxy.policy_ids for v in (
+           "P5_NO_CHANGEPOINT", "P5_NO_STRUCTURE", "P5_NO_HYSTERESIS", "P5_NO_ABSTENTION")))
+    ok("B10_d04a_in_closeout",
+       isinstance((payload or {}).get("proxy_replay"), dict)
+       and isinstance(((payload or {}).get("proxy_replay") or {}).get("d04a"), dict))
+
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
         "p0_verdict": P0_SOURCE_VERDICT,
@@ -528,6 +559,7 @@ def run_damage_d03b1_static_tests(param_map=None):
         "fixed_only_shadow_contract": "READY" if failed == 0 else "INVALID",
         "compact_export": cex,
         "proxy_replay": pr,
+        "d04a_ablation": d04,
         "eoa_payload_size_bytes": cex.get("eoa_payload_size_bytes"),
         "d01": d01, "d03a": d03a, "p4_repair": p4,
     }
