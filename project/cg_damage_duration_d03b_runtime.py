@@ -24,7 +24,8 @@ from cg_damage_duration_d03b_export import (
 from cg_damage_duration_d03b_compact_export import (
     CompactStreamingAggregates, build_compact_closeout, compact_closeout_text,
     compact_payload_bytes, export_mode_labels, run_compact_export_static_tests,
-    EXPORT_MODE, FULL_HISTORY_RAW_EXPORT, AGGREGATE_COVERAGE,
+    frame_compact_closeout_parts, reconstruct_compact_closeout_parts,
+    D0_COMPACT_PART_PREFIX, EXPORT_MODE, FULL_HISTORY_RAW_EXPORT, AGGREGATE_COVERAGE,
 )
 
 FORBIDDEN_RE = re.compile(
@@ -208,7 +209,7 @@ class ModelAShadowRuntimeAccounting:
         }
 
     def compact_closeout_payload(self, source_manifest_hash=None, lifecycle_yearly=None,
-                                 lifecycle_counters=None):
+                                 lifecycle_counters=None, transport_meta=None):
         return build_compact_closeout(
             self.aggregates,
             runtime_counters=self.counters,
@@ -217,13 +218,25 @@ class ModelAShadowRuntimeAccounting:
             p0_audit=self.p0_audit,
             lifecycle_yearly=lifecycle_yearly,
             lifecycle_counters=lifecycle_counters,
+            transport_meta=transport_meta,
         )
 
-    def compact_closeout_line(self, source_manifest_hash=None, lifecycle_yearly=None,
-                              lifecycle_counters=None):
-        return compact_closeout_text(self.compact_closeout_payload(
+    def compact_closeout_part_lines(self, source_manifest_hash=None, lifecycle_yearly=None,
+                                    lifecycle_counters=None, transport_meta=None,
+                                    run_id=None):
+        payload = self.compact_closeout_payload(
             source_manifest_hash, lifecycle_yearly=lifecycle_yearly,
-            lifecycle_counters=lifecycle_counters))
+            lifecycle_counters=lifecycle_counters, transport_meta=transport_meta)
+        status, lines, meta = frame_compact_closeout_parts(payload, run_id=run_id)
+        return status, lines, meta, payload
+
+    def compact_closeout_line(self, source_manifest_hash=None, lifecycle_yearly=None,
+                              lifecycle_counters=None, transport_meta=None):
+        # Test helper only: returns first PART line (not legacy full JSON).
+        _st, lines, _meta, _payload = self.compact_closeout_part_lines(
+            source_manifest_hash, lifecycle_yearly=lifecycle_yearly,
+            lifecycle_counters=lifecycle_counters, transport_meta=transport_meta)
+        return lines[0] if lines else ""
 
 
 def run_damage_d03b1_static_tests(param_map=None):
@@ -461,8 +474,13 @@ def run_damage_d03b1_static_tests(param_map=None):
     ok("B02_has_aggregates", hasattr(rt_fo, "aggregates")
        and rt_fo.aggregates.valid_checkpoints >= 1)
     line = rt_fo.compact_closeout_line(source_manifest_hash="STATIC")
-    ok("B03_compact_eoa_prefix", line.startswith("D0_COMPACT_CLOSEOUT,"))
-    ok("B04_compact_eoa_size", compact_payload_bytes(rt_fo.compact_closeout_payload()) < ORDINARY_LOG_LIMIT)
+    ok("B03_compact_eoa_prefix", line.startswith(D0_COMPACT_PART_PREFIX + ","))
+    st, lines, meta, payload = rt_fo.compact_closeout_part_lines(
+        source_manifest_hash="STATIC")
+    ok("B03b_parts_ok", st == "OK" and len(lines) >= 1)
+    recon, rrep = reconstruct_compact_closeout_parts(lines)
+    ok("B03c_recon", rrep.get("ok") is True and recon is not None)
+    ok("B04_compact_eoa_size", compact_payload_bytes(payload) < ORDINARY_LOG_LIMIT)
     ok("B05_no_objectstore_mutation",
        rt_fo.counters["diagnostic_real_orders"] == 0
        and rt_fo.counters["target_mutations"] == 0

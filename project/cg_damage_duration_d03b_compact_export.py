@@ -23,10 +23,17 @@ CHECKPOINT_SAMPLE_MODE = "BOUNDED_DIAGNOSTIC_SAMPLE"
 EPISODE_SAMPLE_MODE = "BOUNDED_DIAGNOSTIC_SAMPLE"
 COMPACT_SCHEMA_VERSION = "D03B2B_COMPACT_AGGREGATE_V1"
 D0_COMPACT_PREFIX = "D0_COMPACT_CLOSEOUT"
+D0_COMPACT_PART_PREFIX = "D0_COMPACT_CLOSEOUT_PART"
+COMPACT_PART_PROTOCOL = "D0_COMPACT_CLOSEOUT_PART_V1"
+MAX_PAYLOAD_CHUNK_UTF8_BYTES = 6000
+MAX_COMPACT_PARTS = 8
+MAX_TOTAL_PAYLOAD_UTF8_BYTES = 48000
+QC_LOG_HARD_LIMIT_CHARS = 8192
 TRANSPORT_QUIET_PARAM = "cg_damage_duration_d03b_cloud_transport_quiet_enable"
 TRANSPORT_QUIET_MUTE_PREFIXES = ("CG_REGIME_TIME_",)
 TRANSPORT_QUIET_KEEP_PREFIXES = (
-    "D0_COMPACT_CLOSEOUT", "CG_DAMAGE_", "CG_MAISR_", "CG_MACRO_",
+    "D0_COMPACT_CLOSEOUT", "D0_COMPACT_CLOSEOUT_PART",
+    "CG_DAMAGE_", "CG_MAISR_", "CG_MACRO_",
 )
 # High-frequency regime-time allowlist tokens re-injected by regime-time init.
 TRANSPORT_QUIET_STRIP_ALLOW_PREFIXES = (
@@ -235,7 +242,7 @@ class CompactStreamingAggregates:
 
 def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_hash=None,
                            fixed_only=False, p0_audit=None, lifecycle_yearly=None,
-                           lifecycle_counters=None):
+                           lifecycle_counters=None, transport_meta=None):
     """Deterministic compact EOA payload; ordinary-log safe."""
     agg = aggregates.snapshot() if aggregates is not None else {}
     labels = export_mode_labels()
@@ -247,6 +254,7 @@ def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_ha
     for y, bucket in sorted((lifecycle_yearly or {}).items()):
         ly[str(y)] = dict(bucket or {})
     lc = dict(lifecycle_counters or {})
+    tm = dict(transport_meta or {})
     payload = {
         "prefix": D0_COMPACT_PREFIX,
         "schema_version": COMPACT_SCHEMA_VERSION,
@@ -259,6 +267,18 @@ def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_ha
             "units": UNITS_NORMALIZED_SHADOW_SLEEVE,
             "production_comparison_available": False,
             "production_claim_eligible": False,
+        },
+        "transport": {
+            "protocol": COMPACT_PART_PROTOCOL,
+            "quiet_requested": bool(tm.get("quiet_requested", False)),
+            "quiet_effective": bool(tm.get("quiet_effective", False)),
+            "quiet_effective_source": str(
+                tm.get("quiet_effective_source") or UNAVAILABLE),
+            "fixed_only_requested": bool(
+                tm.get("fixed_only_requested", fixed_only)),
+            "max_chunk_utf8_bytes": MAX_PAYLOAD_CHUNK_UTF8_BYTES,
+            "max_parts": MAX_COMPACT_PARTS,
+            "max_total_utf8_bytes": MAX_TOTAL_PAYLOAD_UTF8_BYTES,
         },
         "runtime_counters": dict(runtime_counters or {}),
         "lifecycle_counters": lc,
@@ -276,15 +296,227 @@ def build_compact_closeout(aggregates, runtime_counters=None, source_manifest_ha
     return payload
 
 
+def serialize_compact_payload_json(payload):
+    """Deterministic JSON body (ASCII). Not a QC log line."""
+    return json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"),
+        sort_keys=True, default=str)
+
+
 def compact_closeout_text(payload):
-    """Single-line machine-readable closeout + size metadata."""
-    body = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
-    line = "%s,%s" % (D0_COMPACT_PREFIX, body)
-    return line
+    """Legacy single-line form retained for size/determinism tests only.
+    Runtime must not emit this as a full JSON payload line."""
+    return "%s,%s" % (D0_COMPACT_PREFIX, serialize_compact_payload_json(payload))
 
 
 def compact_payload_bytes(payload):
-    return len(compact_closeout_text(payload).encode("utf-8"))
+    return len(serialize_compact_payload_json(payload).encode("utf-8"))
+
+
+def _utf8_chunks(body_text, max_bytes):
+    raw = (body_text or "").encode("utf-8")
+    out, i, n = [], 0, len(raw)
+    while i < n:
+        end = min(i + int(max_bytes), n)
+        out.append(raw[i:end].decode("utf-8"))
+        i = end
+    return out if out else [""]
+
+
+def frame_compact_closeout_parts(payload, run_id=None):
+    """Frame one logical payload as bounded PART lines. Never truncates silently."""
+    body = serialize_compact_payload_json(payload)
+    body_b = body.encode("utf-8")
+    total = len(body_b)
+    digest = hashlib.sha256(body_b).hexdigest()
+    rid = str(run_id or digest[:16])
+    meta = {
+        "run_id": rid,
+        "total_utf8_bytes": total,
+        "payload_sha256": digest,
+        "protocol": COMPACT_PART_PROTOCOL,
+        "status": "OK",
+        "part_count": 0,
+        "max_line_utf8_bytes": 0,
+    }
+    if total > MAX_TOTAL_PAYLOAD_UTF8_BYTES:
+        meta["status"] = "PAYLOAD_CAP_EXCEEDED"
+        line = (
+            "%s,status=PAYLOAD_CAP_EXCEEDED,run_id=%s,total_utf8_bytes=%d,"
+            "max_total_utf8_bytes=%d,payload_sha256=%s,part_count=0"
+            % (D0_COMPACT_PART_PREFIX, rid, total,
+               MAX_TOTAL_PAYLOAD_UTF8_BYTES, digest)
+        )
+        meta["max_line_utf8_bytes"] = len(line.encode("utf-8"))
+        return meta["status"], [line], meta
+    chunks = _utf8_chunks(body, MAX_PAYLOAD_CHUNK_UTF8_BYTES)
+    if len(chunks) > MAX_COMPACT_PARTS:
+        meta["status"] = "PAYLOAD_CAP_EXCEEDED"
+        meta["part_count"] = len(chunks)
+        line = (
+            "%s,status=PAYLOAD_CAP_EXCEEDED,run_id=%s,total_utf8_bytes=%d,"
+            "max_total_utf8_bytes=%d,max_parts=%d,would_part_count=%d,"
+            "payload_sha256=%s,part_count=0"
+            % (D0_COMPACT_PART_PREFIX, rid, total, MAX_TOTAL_PAYLOAD_UTF8_BYTES,
+               MAX_COMPACT_PARTS, len(chunks), digest)
+        )
+        meta["max_line_utf8_bytes"] = len(line.encode("utf-8"))
+        return meta["status"], [line], meta
+    lines = []
+    pc = len(chunks)
+    meta["part_count"] = pc
+    for i, chunk in enumerate(chunks):
+        line = (
+            "%s,run_id=%s,part_index=%d,part_count=%d,total_utf8_bytes=%d,"
+            "payload_sha256=%s,chunk_utf8_bytes=%d,data=%s"
+            % (D0_COMPACT_PART_PREFIX, rid, i, pc, total, digest,
+               len(chunk.encode("utf-8")), chunk)
+        )
+        lb = len(line.encode("utf-8"))
+        if lb > meta["max_line_utf8_bytes"]:
+            meta["max_line_utf8_bytes"] = lb
+        if lb >= QC_LOG_HARD_LIMIT_CHARS:
+            meta["status"] = "PAYLOAD_CAP_EXCEEDED"
+            fail = (
+                "%s,status=PAYLOAD_CAP_EXCEEDED,run_id=%s,reason=LINE_OVER_QC_LIMIT,"
+                "line_utf8_bytes=%d,qc_limit=%d,payload_sha256=%s,part_count=0"
+                % (D0_COMPACT_PART_PREFIX, rid, lb, QC_LOG_HARD_LIMIT_CHARS, digest)
+            )
+            return meta["status"], [fail], meta
+        lines.append(line)
+    return "OK", lines, meta
+
+
+def parse_compact_closeout_part_line(line):
+    """Parse one PART frame. Returns dict or None."""
+    s = str(line or "")
+    idx = s.find(D0_COMPACT_PART_PREFIX + ",")
+    if idx < 0:
+        return None
+    body = s[idx + len(D0_COMPACT_PART_PREFIX) + 1:]
+    if body.startswith("status="):
+        fields = {}
+        for tok in body.split(","):
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                fields[k] = v
+        fields["frame"] = "CAP_OR_STATUS"
+        return fields
+    marker = ",data="
+    di = body.find(marker)
+    if di < 0:
+        return None
+    head, data = body[:di], body[di + len(marker):]
+    fields = {}
+    for tok in head.split(","):
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            fields[k] = v
+    fields["data"] = data
+    fields["frame"] = "CHUNK"
+    return fields
+
+
+def reconstruct_compact_closeout_parts(log_lines, run_id=None):
+    """Reconstruct logical payload from PART frames. Strict index/count/hash."""
+    frames = []
+    for line in log_lines or []:
+        fr = parse_compact_closeout_part_line(line)
+        if fr is None:
+            continue
+        if run_id is not None and str(fr.get("run_id") or "") != str(run_id):
+            continue
+        frames.append(fr)
+    if not frames:
+        return None, {
+            "ok": False, "error": "MISSING", "payload": None,
+            "legacy_oversized_payload_line_count": _count_legacy_oversized(log_lines),
+        }
+    caps = [f for f in frames if f.get("frame") == "CAP_OR_STATUS"]
+    if caps and any(c.get("status") == "PAYLOAD_CAP_EXCEEDED" for c in caps):
+        return None, {
+            "ok": False, "error": "PAYLOAD_CAP_EXCEEDED", "payload": None,
+            "cap_frame": caps[0],
+            "legacy_oversized_payload_line_count": _count_legacy_oversized(log_lines),
+        }
+    chunks = [f for f in frames if f.get("frame") == "CHUNK"]
+    if not chunks:
+        return None, {
+            "ok": False, "error": "NO_CHUNKS", "payload": None,
+            "legacy_oversized_payload_line_count": _count_legacy_oversized(log_lines),
+        }
+    by_run = {}
+    for f in chunks:
+        by_run.setdefault(str(f.get("run_id") or ""), []).append(f)
+    if run_id is None:
+        if len(by_run) != 1:
+            return None, {
+                "ok": False, "error": "AMBIGUOUS_OR_MISMATCHED_RUN",
+                "payload": None, "run_ids": sorted(by_run.keys()),
+                "legacy_oversized_payload_line_count": _count_legacy_oversized(log_lines),
+            }
+        run_id = next(iter(by_run.keys()))
+    parts = by_run.get(str(run_id), [])
+    if not parts:
+        return None, {
+            "ok": False, "error": "MISMATCHED_RUN", "payload": None,
+            "legacy_oversized_payload_line_count": _count_legacy_oversized(log_lines),
+        }
+    try:
+        part_count = int(parts[0].get("part_count"))
+        total = int(parts[0].get("total_utf8_bytes"))
+        digest = str(parts[0].get("payload_sha256") or "")
+    except Exception:
+        return None, {"ok": False, "error": "MALFORMED_HEADER", "payload": None}
+    for p in parts:
+        if (int(p.get("part_count")) != part_count
+                or int(p.get("total_utf8_bytes")) != total
+                or str(p.get("payload_sha256") or "") != digest):
+            return None, {"ok": False, "error": "HEADER_INCONSISTENT", "payload": None}
+    idxs = [int(p.get("part_index")) for p in parts]
+    if len(idxs) != len(set(idxs)):
+        return None, {"ok": False, "error": "DUPLICATE_PART", "payload": None}
+    if sorted(idxs) != list(range(part_count)):
+        return None, {"ok": False, "error": "MISSING_OR_OUT_OF_RANGE", "payload": None}
+    ordered = sorted(parts, key=lambda p: int(p.get("part_index")))
+    body = "".join(p.get("data") or "" for p in ordered)
+    body_b = body.encode("utf-8")
+    if len(body_b) != total:
+        return None, {"ok": False, "error": "BYTE_COUNT_MISMATCH", "payload": None}
+    got = hashlib.sha256(body_b).hexdigest()
+    if got != digest:
+        return None, {"ok": False, "error": "HASH_MISMATCH", "payload": None,
+                      "expected": digest, "got": got}
+    try:
+        payload = json.loads(body)
+    except Exception as e:
+        return None, {"ok": False, "error": "JSON_PARSE:%s" % type(e).__name__,
+                      "payload": None}
+    return payload, {
+        "ok": True, "error": None, "payload": payload,
+        "run_id": run_id, "part_count": part_count,
+        "total_utf8_bytes": total, "payload_sha256": digest,
+        "legacy_oversized_payload_line_count": _count_legacy_oversized(log_lines),
+    }
+
+
+def _count_legacy_oversized(log_lines):
+    """Count legacy full-JSON D0_COMPACT_CLOSEOUT lines (especially >= QC limit)."""
+    n = 0
+    for line in log_lines or []:
+        s = str(line or "")
+        i = s.find(D0_COMPACT_PREFIX + ",{")
+        if i < 0:
+            continue
+        # status frames use D0_COMPACT_CLOSEOUT,status= — not counted
+        body = s[i + len(D0_COMPACT_PREFIX) + 1:]
+        if body.startswith("{"):
+            n += 1
+    return n
+
+
+def count_legacy_full_json_closeout_lines(log_lines):
+    return _count_legacy_oversized(log_lines)
 
 
 def scan_export_forbidden(source_text):
@@ -816,7 +1048,12 @@ def run_compact_export_static_tests():
     ok("TQ09_no_state_mutation",
        rt_a.counters == before_ctr and before_tg == {"SPY": 0.5, "gross": 1.0})
     line = compact_closeout_text(payload)
-    ok("TQ10_compact_still_emitted", line.startswith(D0_COMPACT_PREFIX + ","))
+    ok("TQ10_legacy_text_helper_exists", line.startswith(D0_COMPACT_PREFIX + ","))
+    st, parts, pmeta = frame_compact_closeout_parts(payload, run_id="tq10")
+    ok("TQ10b_parts_emit_ok", st == "OK" and len(parts) >= 1)
+    ok("TQ10c_parts_under_qc_limit",
+       all(len(x.encode("utf-8")) < QC_LOG_HARD_LIMIT_CHARS for x in parts)
+       and int(pmeta.get("max_line_utf8_bytes") or 0) < QC_LOG_HARD_LIMIT_CHARS)
     proj = project_transport_budget_bytes(nbytes)
     ok("TQ11_budget_projection_under_100kb", proj < ORDINARY_LOG_LIMIT, detail=str(proj))
     ok("TQ12_no_per_checkpoint_requirement",
@@ -825,7 +1062,20 @@ def run_compact_export_static_tests():
     muted = any("CG_REGIME_TIME_PENDING".startswith(p) for p in mp_d)
     ok("TQ13_regime_line_would_mute", muted is True)
     ok("TQ14_compact_not_muted",
-       not any(D0_COMPACT_PREFIX.startswith(p) for p in mp_d))
+       not any(D0_COMPACT_PREFIX.startswith(p) for p in mp_d)
+       and not any(D0_COMPACT_PART_PREFIX.startswith(p) for p in mp_d))
+    ok("TQ15_part_prefix_kept", D0_COMPACT_PART_PREFIX in TRANSPORT_QUIET_KEEP_PREFIXES)
+
+    # --- bounded multi-part transport protocol ---
+    trx = run_compact_transport_static_tests()
+    ok("TR00_suite", trx.get("failed", 1) == 0, detail=str(trx.get("failed")))
+    for trow in trx.get("rows") or []:
+        rows.append({"name": "TR_" + trow["name"], "pass": trow["pass"],
+                     "detail": trow.get("detail", "")})
+        if trow["pass"]:
+            passed += 1
+        else:
+            failed += 1
 
     # --- D0 fixed-only EOA dispatch independence ---
     eoa = run_d0_eoa_dispatch_static_tests()
@@ -854,11 +1104,156 @@ def run_compact_export_static_tests():
         "aggregate_fixture_parity": "PASS" if failed == 0 else "FAIL",
         "sample_cap_invariance_gate": "PASS" if failed == 0 else "FAIL",
         "transport_quiet_gate": "PASS" if failed == 0 else "FAIL",
+        "compact_transport_gate": trx.get("compact_transport_gate", "FAIL"),
         "d0_eoa_dispatch": eoa,
         "runtime_test_isolation": iso,
         "runtime_reachable_static_test_call_count": iso.get(
             "runtime_reachable_static_test_call_count", -1),
         "runtime_test_isolation_gate": iso.get("runtime_test_isolation_gate", "FAIL"),
+    }
+
+
+def run_compact_transport_static_tests():
+    """External-only: chunk framing, reconstruction, hash, caps, dual-gate quiet."""
+    from rrx_params import RRX_PARAMS
+
+    rows, passed, failed = [], 0, 0
+
+    def ok(n, c, detail=""):
+        nonlocal passed, failed
+        if c:
+            passed += 1
+            rows.append({"name": n, "pass": True, "detail": detail})
+        else:
+            failed += 1
+            rows.append({"name": n, "pass": False, "detail": str(detail)})
+
+    # just below one-chunk boundary
+    small = {"k": "x" * 100, "n": 1}
+    st, lines, meta = frame_compact_closeout_parts(small, run_id="small1")
+    ok("T01_small_ok", st == "OK" and meta["part_count"] == 1)
+    ok("T02_small_line_lt_qc", meta["max_line_utf8_bytes"] < QC_LOG_HARD_LIMIT_CHARS)
+    p, rep = reconstruct_compact_closeout_parts(lines, run_id="small1")
+    ok("T03_small_recon", rep.get("ok") is True and p == small)
+
+    # force multi-part: body > chunk and > QC single-line hard limit
+    big_body = {"pad": "A" * 9000, "marker": "EDGE"}
+    body_n = compact_payload_bytes(big_body)
+    ok("T04_above_chunk_and_8192",
+       body_n > MAX_PAYLOAD_CHUNK_UTF8_BYTES and body_n > QC_LOG_HARD_LIMIT_CHARS,
+       detail=str(body_n))
+    st2, lines2, meta2 = frame_compact_closeout_parts(big_body, run_id="big1")
+    ok("T05_multipart", st2 == "OK" and meta2["part_count"] >= 2)
+    ok("T06_each_line_safe",
+       all(len(x.encode("utf-8")) < QC_LOG_HARD_LIMIT_CHARS for x in lines2)
+       and meta2["max_line_utf8_bytes"] < QC_LOG_HARD_LIMIT_CHARS)
+    ok("T07_no_legacy_full_json_emit",
+       count_legacy_full_json_closeout_lines(lines2) == 0)
+    p2, rep2 = reconstruct_compact_closeout_parts(lines2)
+    ok("T08_recon_hash", rep2.get("ok") is True and p2 == big_body
+       and rep2.get("payload_sha256") == meta2["payload_sha256"])
+
+    # out-of-order
+    shuffled = list(reversed(lines2))
+    p3, rep3 = reconstruct_compact_closeout_parts(shuffled, run_id="big1")
+    ok("T09_ooo_ok", rep3.get("ok") is True and p3 == big_body)
+
+    # duplicate part
+    dup = list(lines2) + [lines2[0]]
+    _, rep_dup = reconstruct_compact_closeout_parts(dup, run_id="big1")
+    ok("T10_dup_reject", rep_dup.get("ok") is False and rep_dup.get("error") == "DUPLICATE_PART")
+
+    # missing part
+    missing = [x for x in lines2 if "part_index=0," not in x]
+    if meta2["part_count"] > 1:
+        _, rep_miss = reconstruct_compact_closeout_parts(missing, run_id="big1")
+        ok("T11_missing_reject",
+           rep_miss.get("ok") is False
+           and rep_miss.get("error") == "MISSING_OR_OUT_OF_RANGE")
+    else:
+        ok("T11_missing_reject", True, detail="SKIP_SINGLE_PART")
+
+    # mismatched run
+    st_o, lines_o, _ = frame_compact_closeout_parts({"z": 1}, run_id="other")
+    mixed = list(lines2) + list(lines_o)
+    _, rep_mix = reconstruct_compact_closeout_parts(mixed)
+    ok("T12_ambiguous_run",
+       rep_mix.get("ok") is False
+       and rep_mix.get("error") == "AMBIGUOUS_OR_MISMATCHED_RUN")
+    p_ok, rep_ok = reconstruct_compact_closeout_parts(mixed, run_id="big1")
+    ok("T13_explicit_run_filters", rep_ok.get("ok") is True and p_ok == big_body)
+
+    # invalid hash
+    tampered = list(lines2)
+    tampered[0] = tampered[0].replace(
+        meta2["payload_sha256"], "0" * 64)
+    # if replace also hits data section rare; force header-only tamper via parse path
+    if meta2["payload_sha256"] in tampered[0].split(",data=")[0]:
+        _, rep_h = reconstruct_compact_closeout_parts(tampered, run_id="big1")
+        ok("T14_hash_or_header_reject", rep_h.get("ok") is False)
+    else:
+        ok("T14_hash_or_header_reject", True, detail="SKIP")
+
+    # corrupt data hash
+    bad = []
+    for ln in lines2:
+        fr = parse_compact_closeout_part_line(ln)
+        if int(fr.get("part_index")) == 0:
+            ln2 = ln[:-1] + ("B" if not ln.endswith("B") else "C")
+            bad.append(ln2)
+        else:
+            bad.append(ln)
+    _, rep_bad = reconstruct_compact_closeout_parts(bad, run_id="big1")
+    ok("T15_data_hash_reject",
+       rep_bad.get("ok") is False
+       and rep_bad.get("error") in ("HASH_MISMATCH", "BYTE_COUNT_MISMATCH", "JSON_PARSE:JSONDecodeError"))
+
+    # cap exceeded
+    huge = {"pad": "Z" * (MAX_TOTAL_PAYLOAD_UTF8_BYTES + 100)}
+    st_c, lines_c, meta_c = frame_compact_closeout_parts(huge, run_id="cap1")
+    ok("T16_cap_status", st_c == "PAYLOAD_CAP_EXCEEDED" and len(lines_c) == 1)
+    ok("T17_cap_no_pseudo_payload",
+       "status=PAYLOAD_CAP_EXCEEDED" in lines_c[0] and ",data=" not in lines_c[0])
+    _, rep_c = reconstruct_compact_closeout_parts(lines_c)
+    ok("T18_cap_recon_fail",
+       rep_c.get("ok") is False and rep_c.get("error") == "PAYLOAD_CAP_EXCEEDED")
+
+    # UTF-8 / ASCII safety: ensure_ascii roundtrip
+    uni = {"note": "café—Δ", "n": 2}
+    st_u, lines_u, meta_u = frame_compact_closeout_parts(uni, run_id="uni1")
+    body_u = serialize_compact_payload_json(uni)
+    ok("T19_ensure_ascii", "\\u" in body_u or "caf" in body_u)
+    ok("T20_ascii_line_bytes",
+       all(all(ord(ch) < 128 for ch in ln) for ln in lines_u))
+    p_u, rep_u = reconstruct_compact_closeout_parts(lines_u)
+    ok("T21_unicode_roundtrip", rep_u.get("ok") is True and p_u == uni)
+
+    # exactly-one logical payload framing
+    ok("T22_one_logical", meta_u["part_count"] >= 1 and st_u == "OK")
+
+    # quiet override precedence + dual gate (defaults remain 0)
+    ok("T23_quiet_default_0",
+       RRX_PARAMS.get(TRANSPORT_QUIET_PARAM) == "0")
+    ok("T24_dual_gate",
+       transport_quiet_active(True, True) is True
+       and transport_quiet_active(True, False) is False
+       and transport_quiet_active(False, True) is False)
+    lp0, mp0, ap0 = apply_transport_quiet_filters(
+        ["CG_REGIME_TIME_PENDING"], [], True, True)
+    ok("T25_quiet_applies_when_both",
+       ap0 is True and "CG_REGIME_TIME_" in mp0)
+
+    ok("T26_protocol_constants",
+       MAX_PAYLOAD_CHUNK_UTF8_BYTES <= 6000
+       and MAX_COMPACT_PARTS <= 8
+       and MAX_TOTAL_PAYLOAD_UTF8_BYTES <= 48000)
+
+    return {
+        "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
+        "compact_transport_gate": "PASS" if failed == 0 else "FAIL",
+        "payload_fixture_reconstruction": "PASS" if failed == 0 else "FAIL",
+        "payload_fixture_hash_gate": "PASS" if failed == 0 else "FAIL",
+        "payload_fixture_cap_gate": "PASS" if failed == 0 else "FAIL",
     }
 
 

@@ -33,7 +33,9 @@ from cg_damage_duration_d03b_runtime import (
     ModelAShadowRuntimeAccounting,
     EXPERIMENT as D03B_EXPERIMENT, PHASE as D03B_PHASE,
 )
-from cg_damage_duration_d03b_compact_export import apply_transport_quiet_filters
+from cg_damage_duration_d03b_compact_export import (
+    apply_transport_quiet_filters, transport_quiet_active,
+)
 from cg_damage_duration_d03b_accounting import P0_SOURCE_VERDICT
 
 _SH_ACTIVE = frozenset(("HEDGED", "ENTRY_PENDING", "EXIT_PENDING"))
@@ -51,6 +53,19 @@ class CgDamageDurationD01DiagMixin:
             "cg_damage_duration_d03b_fixed_only_shadow_enable", "0")
         self.cg_damage_duration_d03b_cloud_transport_quiet_enable = _bool(
             "cg_damage_duration_d03b_cloud_transport_quiet_enable", "0")
+        # Audit-only: record quiet override source (QC > RRX fallback > hard default).
+        try:
+            qv = self.get_parameter(
+                "cg_damage_duration_d03b_cloud_transport_quiet_enable")
+        except Exception:
+            qv = None
+        if qv is not None and str(qv).strip() != "":
+            self._dmg_transport_quiet_source = "QC_PARAMETER"
+        elif (getattr(self, "_rrx_param_overrides", {}) or {}).get(
+                "cg_damage_duration_d03b_cloud_transport_quiet_enable") is not None:
+            self._dmg_transport_quiet_source = "RRX_FALLBACK"
+        else:
+            self._dmg_transport_quiet_source = "HARD_DEFAULT"
 
     def _DamageD01MaybeEnableMs(self):
         if getattr(self, "cg_damage_duration_d01_enable", False) or getattr(
@@ -85,18 +100,22 @@ class CgDamageDurationD01DiagMixin:
         # even when regime-time init re-appended those prefixes to log_only.
         fo = bool(getattr(self, "cg_damage_duration_d03b_fixed_only_shadow_enable", False))
         q = bool(getattr(self, "cg_damage_duration_d03b_cloud_transport_quiet_enable", False))
-        lp, mp, applied = apply_transport_quiet_filters(
+        applied = transport_quiet_active(fo, q)
+        self._dmg_transport_quiet_requested = q
+        self._dmg_transport_quiet_effective = applied
+        lp, mp, did = apply_transport_quiet_filters(
             getattr(self, "log_only_prefixes", None),
             getattr(self, "log_mute_prefixes", None),
             fo, q,
         )
-        if not applied:
+        if not did:
             return
         self.log_only_prefixes = lp
         self.log_mute_prefixes = mp
+        src = str(getattr(self, "_dmg_transport_quiet_source", "UNAVAILABLE") or "UNAVAILABLE")
         self._DamageD01Log(
             "CG_DAMAGE_D03B_TRANSPORT_QUIET,enable=1,muted=CG_REGIME_TIME_,"
-            "fixed_only=1,budget_target_lt_100kb=1"
+            "fixed_only=1,budget_target_lt_100kb=1,source=%s,effective=1" % src
         )
 
     def _DamageD01OnAcceptedBarSafe(self, tk, et, o, h, l, c):
@@ -623,8 +642,8 @@ class CgDamageDurationD01DiagMixin:
                     f"verdict={rep_b3.get('phase_verdict', 'REPAIR_REQUIRED')},"
                     f"next=D0.3B2B_FIXED_ONLY_SHADOW_HISTORICAL_BACKTEST_RERUN"
                 )
-                # Compact aggregate closeout (full valid observation set; samples remain bounded).
-                if d03b is not None and hasattr(d03b, "compact_closeout_line"):
+                # Compact aggregate closeout (bounded PART frames; no legacy full JSON line).
+                if d03b is not None and hasattr(d03b, "compact_closeout_part_lines"):
                     try:
                         ly = None
                         lc_ctr = None
@@ -635,18 +654,62 @@ class CgDamageDurationD01DiagMixin:
                             except Exception:
                                 ly = dict(getattr(led, "lifecycle_yearly", {}) or {})
                             lc_ctr = dict(getattr(led, "counters", {}) or {})
-                        line = d03b.compact_closeout_line(
-                            source_manifest_hash=getattr(self, "_dmg_source_manifest_hash", None),
+                        fo = bool(getattr(
+                            self, "cg_damage_duration_d03b_fixed_only_shadow_enable", False))
+                        q_req = bool(getattr(
+                            self, "cg_damage_duration_d03b_cloud_transport_quiet_enable", False))
+                        q_eff = bool(getattr(
+                            self, "_dmg_transport_quiet_effective",
+                            transport_quiet_active(fo, q_req)))
+                        tmeta = {
+                            "quiet_requested": q_req,
+                            "quiet_effective": q_eff,
+                            "quiet_effective_source": str(getattr(
+                                self, "_dmg_transport_quiet_source", "UNAVAILABLE")
+                                or "UNAVAILABLE"),
+                            "fixed_only_requested": fo,
+                        }
+                        rid = str(
+                            getattr(self, "algorithm_id", None)
+                            or getattr(self, "AlgorithmId", None)
+                            or "D0"
+                        )
+                        status, lines, meta, _payload = d03b.compact_closeout_part_lines(
+                            source_manifest_hash=getattr(
+                                self, "_dmg_source_manifest_hash", None),
                             lifecycle_yearly=ly,
                             lifecycle_counters=lc_ctr,
+                            transport_meta=tmeta,
+                            run_id=rid,
                         )
-                        if line and len(line.encode("utf-8")) < 100 * 1024:
-                            self._DamageD01Log(line)
+                        if status == "OK" and lines:
+                            for ln in lines:
+                                self._DamageD01Log(ln)
+                        elif lines:
+                            for ln in lines:
+                                self._DamageD01Log(ln)
                         else:
                             self._DamageD01Log(
                                 "D0_COMPACT_CLOSEOUT,status=OVERSIZE_OR_EMPTY,"
                                 "export_mode=CLOUD_COMPACT_AGGREGATE"
                             )
+                    except Exception:
+                        self._DamageD01Log(
+                            "D0_COMPACT_CLOSEOUT,status=EOA_EMIT_FAIL,"
+                            "export_mode=CLOUD_COMPACT_AGGREGATE"
+                        )
+                elif d03b is not None and hasattr(d03b, "compact_closeout_line"):
+                    # Defensive: older accounting object without PART API.
+                    try:
+                        from cg_damage_duration_d03b_compact_export import (
+                            frame_compact_closeout_parts as _frame_parts,
+                        )
+                        payload = d03b.compact_closeout_payload(
+                            source_manifest_hash=getattr(
+                                self, "_dmg_source_manifest_hash", None))
+                        _st, lines, _meta = _frame_parts(payload)
+                        for ln in lines:
+                            self._DamageD01Log(ln)
                     except Exception:
                         self._DamageD01Log(
                             "D0_COMPACT_CLOSEOUT,status=EOA_EMIT_FAIL,"
