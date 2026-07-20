@@ -265,10 +265,8 @@ def same_session_close(session_days, event_time, close_tod_minutes=960):
         return None
     d = event_time.date() if isinstance(event_time, datetime) else event_time
     days = map_exchange_sessions(session_days)
-    if d not in days and days:
-        # event on a mapped session day only
-        if d not in days:
-            return None
+    if d not in days:
+        return None
     return session_close_dt(d, close_tod_minutes)
 
 
@@ -296,33 +294,43 @@ def max_label_horizon_end(session_days, event_time, close_tod_minutes=960):
 
 def assign_duration_class(event_time, resolution_time, session_days, close_tod_minutes=960):
     """
-    Assign T0-T4 from resolution_time. Returns (class_or_None, right_censored_bool, reason).
-    Incomplete horizon => RIGHT_CENSORED (not T4).
+    Assign T0-T4 from resolution_time. Returns (class_or_None, label_incomplete_bool, reason).
+
+    Thresholds unchanged. Classification is causal-safe: T0/T1 need no forward sessions;
+    T2 needs the event session day; T3/T4 require only sessions already present in
+    session_days (caller must pass sessions observed through resolution).
+
+    label_incomplete_bool means duration label unavailable — it is NOT the EOA
+    right-censor flag (that is set only via mark_right_censored for still-open episodes).
     """
     if event_time is None or resolution_time is None:
         return None, True, "MISSING_TIMES"
     if resolution_time <= event_time:
         return None, False, "NON_POSITIVE_DURATION"
     mins = (resolution_time - event_time).total_seconds() / 60.0
-    sc = same_session_close(session_days, event_time, close_tod_minutes)
-    nc = next_session_close(session_days, event_time, close_tod_minutes)
-    tc = third_session_close(session_days, event_time, close_tod_minutes)
-    hz = max_label_horizon_end(session_days, event_time, close_tod_minutes)
-    if sc is None or nc is None or tc is None or hz is None:
-        return None, True, "INCOMPLETE_SESSION_CALENDAR"
-    if resolution_time > hz:
-        return None, True, "BEYOND_MAX_HORIZON"
+    # Minute-bounded classes first: no forward session calendar required.
     if mins <= T0_MAX_MIN:
         return T0, False, "OK"
     if mins <= T1_MAX_MIN:
         return T1, False, "OK"
+    sc = same_session_close(session_days, event_time, close_tod_minutes)
+    if sc is None:
+        return None, True, "INCOMPLETE_SESSION_CALENDAR"
     if resolution_time <= sc:
         return T2, False, "OK"
+    nc = next_session_close(session_days, event_time, close_tod_minutes)
+    if nc is None:
+        return None, True, "INCOMPLETE_SESSION_CALENDAR"
     if resolution_time <= nc:
         return T3, False, "OK"
+    tc = third_session_close(session_days, event_time, close_tod_minutes)
+    hz = max_label_horizon_end(session_days, event_time, close_tod_minutes)
+    if tc is None or hz is None:
+        return None, True, "INCOMPLETE_SESSION_CALENDAR"
+    if resolution_time > hz:
+        return None, True, "BEYOND_MAX_HORIZON"
     if resolution_time <= tc:
         return T4, False, "OK"
-    # between third close and horizon end still T4 per max horizon definition
     if resolution_time <= hz:
         return T4, False, "OK"
     return None, True, "UNCLASSIFIED"
@@ -488,6 +496,30 @@ class DamageEpisodeLedger:
         if b is not None:
             b[field] = int(b.get(field, 0) or 0) + int(n)
 
+    def observe_session_day(self, day):
+        """Record a causally observed exchange session date (no synthetic fill)."""
+        if day is None:
+            return False
+        if isinstance(day, datetime):
+            day = day.date()
+        elif not isinstance(day, date):
+            try:
+                day = date.fromisoformat(str(day)[:10])
+            except Exception:
+                return False
+        if day in self.session_days:
+            return False
+        self.session_days = sorted(set(self.session_days) | {day})
+        return True
+
+    def sessions_through(self, as_of):
+        """Sessions observed on or before as_of (causal cutoff)."""
+        if as_of is None:
+            return list(self.session_days)
+        if isinstance(as_of, datetime):
+            as_of = as_of.date()
+        return [d for d in self.session_days if d <= as_of]
+
     def current_open(self):
         for eid in reversed(self.open_ids):
             ep = self.episodes.get(eid)
@@ -590,21 +622,17 @@ class DamageEpisodeLedger:
             return False
         if ep.state != EP_OPEN:
             return False
-        cls, rc, _reason = assign_duration_class(
-            ep.decision_time, resolution_time, self.session_days, self.close_tod_minutes)
-        hz = max_label_horizon_end(self.session_days, ep.decision_time, self.close_tod_minutes)
+        # Causal calendar: only sessions observed through resolution_time.
+        days = self.sessions_through(resolution_time)
+        cls, _label_incomplete, _reason = assign_duration_class(
+            ep.decision_time, resolution_time, days, self.close_tod_minutes)
+        hz = max_label_horizon_end(days, ep.decision_time, self.close_tod_minutes)
         ep.resolution_time = resolution_time
         ep.duration_class = cls
-        ep.right_censored = bool(rc)
-        if rc:
-            self._bump("right_censored_episodes", 1)
-            ep.label_finalization_time = hz
-            ep.label_availability = LAB_RIGHT_CENSORED
-            # incomplete => do not lock as labeled T*; remain open or mark censored lock path
-            ep.state = EP_PROVISIONAL
-            self._bump("provisional_closes", 1)
-            self._bump_year(resolution_time, "provisional_close", 1)
-            return True
+        # EOA-only right-censor: do not mark right_censored from duration labeling.
+        # Incomplete/beyond-horizon labels leave duration_class=None and still use
+        # the normal confirmation window (no confirm short-circuit).
+        ep.right_censored = False
         ep.provisional_close_time = resolution_time
         ep.label_finalization_time = label_finalization_time(
             resolution_time, self.confirmation_minutes, hz, right_censored=False)
@@ -625,8 +653,9 @@ class DamageEpisodeLedger:
             return False
         if ep.state != EP_PROVISIONAL:
             return False
+        # right_censored episodes are EOA-terminalized via mark_right_censored;
+        # normal confirm path always requires the confirmation window.
         if ep.right_censored:
-            # lock as censored terminal
             ok = self._lock(ep, confirm_time)
             if ok:
                 self._bump("confirmed_closes", 1)
@@ -962,12 +991,18 @@ def run_damage_d01_static_tests(param_map=None, core_src=None, diag_src=None):
     ok("10_same_bar_outcome_rejected", (not ok_ts) and dlt["same_bar_action_violations"] >= 1)
     ok("11_action_eligible_strictly_later", act is not None and act > t0 and feat is not None and feat <= t0)
 
-    # right-censor incomplete calendar
+    # incomplete forward calendar must not EOA-censor; T1 still classifies by minutes
     led3 = DamageEpisodeLedger([date(2024, 3, 11)])  # insufficient forward sessions
     e3 = led3.observe_open_trigger(EV_D30, t0, "NONE", bars)
     led3.provisional_close(e3.episode_id, t0 + timedelta(minutes=40), now_t=t0 + timedelta(minutes=40))
-    ok("12_right_edge_incomplete_censored",
-       led3.episodes[e3.episode_id].right_censored and led3.episodes[e3.episode_id].duration_class is None)
+    ok("12_incomplete_label_not_eoa_censor",
+       (not led3.episodes[e3.episode_id].right_censored)
+       and led3.episodes[e3.episode_id].duration_class == T1
+       and led3.episodes[e3.episode_id].state == EP_PROVISIONAL
+       and led3.counters["right_censored_episodes"] == 0)
+    # T0 still classifies without any session days (causal minute bound)
+    ok("12b_t0_without_forward_sessions",
+       assign_duration_class(t0, t0 + timedelta(minutes=20), [])[0] == T0)
 
     # T0-T4 boundaries
     def _cls(res):
@@ -1181,176 +1216,10 @@ def _disabled_runtime_noop_probe():
 
 
 def run_damage_d01_lifecycle_static_tests():
-    """D0.3B2D RELEASE_CHECK close/confirm/reopen wiring tests."""
-    rows, passed, failed = [], 0, 0
+    """Re-export: lifecycle suite lives in d01_diag (char-budget)."""
+    from cg_damage_duration_d01_diag import run_damage_d01_lifecycle_static_tests as _lc
+    return _lc()
 
-    def ok(n, c, detail=""):
-        nonlocal passed, failed
-        if c:
-            passed += 1
-            rows.append({"name": n, "pass": True, "detail": detail})
-        else:
-            failed += 1
-            rows.append({"name": n, "pass": False, "detail": str(detail)})
-
-    t0 = datetime(2024, 3, 11, 10, 0, 0)
-    bars = [t0 - timedelta(minutes=5), t0, t0 + timedelta(minutes=5)]
-    sessions = [date(2024, 3, 11), date(2024, 3, 12), date(2024, 3, 13),
-                date(2024, 3, 14), date(2024, 3, 15), date(2024, 3, 18)]
-
-    # predicate: protection falling edge
-    led = DamageEpisodeLedger(sessions)
-    ev = led.observe_open_trigger(EV_PROTECTION, t0, "W2", bars)
-    ep = led.episodes[ev.episode_id]
-    ok("L01_open", ep.state == EP_OPEN)
-    do, reason = release_check_close_predicate(
-        ep, protection_active=False, prev_protection_active=True, d_severity="D30")
-    ok("L02_prot_release_predicate", do and reason == RELEASE_PROT)
-
-    # no close before confirmation window
-    r = led.process_release_check(
-        t0 + timedelta(minutes=5), protection_active=False, prev_protection_active=True,
-        d_severity="NONE", protection_source="NONE", bar_end_times=bars, checkpoint_key=(1, 1))
-    ok("L03_provisional", r["action"] == "PROVISIONAL_CLOSE" and ep.state == EP_PROVISIONAL)
-    early = t0 + timedelta(minutes=5 + 10)  # < 30m confirmation
-    r2 = led.process_release_check(
-        early, protection_active=False, prev_protection_active=False,
-        d_severity="NONE", checkpoint_key=(1, 2))
-    ok("L04_no_confirm_early", r2["action"] == "HOLD_PROVISIONAL" and ep.state == EP_PROVISIONAL)
-
-    # relapse before confirmation reopens
-    r3 = led.process_release_check(
-        early + timedelta(minutes=1), protection_active=True, prev_protection_active=False,
-        d_severity="NONE", protection_source="W2", checkpoint_key=(1, 3))
-    ok("L05_relapse_reopen", r3["action"] == "RELAPSE_REOPEN" and ep.state == EP_OPEN)
-
-    # provisional again then confirm after window
-    led.process_release_check(
-        early + timedelta(minutes=2), protection_active=False, prev_protection_active=True,
-        d_severity="NONE", checkpoint_key=(1, 4))
-    fin = ep.label_finalization_time
-    ok("L06_fin_set", fin is not None)
-    r4 = led.process_release_check(
-        fin, protection_active=False, prev_protection_active=False,
-        d_severity="NONE", checkpoint_key=(1, 5))
-    ok("L07_confirm_close", r4["action"] == "CONFIRMED_CLOSE" and ep.locked and ep.state == EP_LOCKED)
-
-    # new trigger after confirm creates new episode
-    t_new = fin + timedelta(minutes=5)
-    bars2 = [t_new - timedelta(minutes=5), t_new, t_new + timedelta(minutes=5)]
-    ev2 = led.observe_open_trigger(EV_PROTECTION, t_new, "IDS", bars2)
-    ok("L08_new_episode_after_confirm",
-       ev2 is not None and ev2.episode_id != ep.episode_id and led.counters["episodes_created"] == 2)
-
-    # repeated D30 while open only attaches
-    n_ep = led.counters["episodes_created"]
-    n_att = led.counters["attach_to_open"]
-    led.observe_open_trigger(EV_D30, t_new + timedelta(minutes=5), "IDS", bars2)
-    ok("L09_attach_only",
-       led.counters["episodes_created"] == n_ep and led.counters["attach_to_open"] == n_att + 1)
-
-    # duplicate checkpoint idempotence
-    r5 = led.process_release_check(
-        t_new + timedelta(minutes=10), protection_active=False, prev_protection_active=True,
-        checkpoint_key=(2, 9))
-    r6 = led.process_release_check(
-        t_new + timedelta(minutes=10), protection_active=False, prev_protection_active=True,
-        checkpoint_key=(2, 9))
-    ok("L10_dup_idempotent", r6["action"] == "DUP_BLOCKED" and r5["mutated"] is True)
-
-    # D-only open closes on DAMAGE_CLEARED
-    led3 = DamageEpisodeLedger(sessions)
-    e3 = led3.observe_open_trigger(EV_D30, t0, "NONE", bars)
-    do3, rs3 = release_check_close_predicate(
-        led3.episodes[e3.episode_id], protection_active=False,
-        prev_protection_active=False, d_severity="NONE")
-    ok("L11_damage_cleared_predicate", do3 and rs3 == RELEASE_DMG)
-
-    # no future-data: confirm uses decision_time only vs label_finalization_time
-    ok("L12_confirm_uses_elapsed_causal_time",
-       CONFIRMATION_WINDOW_MINUTES == 30 and fin == ep.provisional_close_time + timedelta(minutes=30)
-       if ep.provisional_close_time else False)
-
-    # no production mutation counters
-    ok("L13_no_prod_mut",
-       led.counters["diagnostic_real_orders"] == 0 and led.counters["target_mutations"] == 0
-       and led.counters["subscription_changes"] == 0)
-
-    # yearly aggregates non-empty
-    ok("L14_yearly_open", any(v.get("open", 0) > 0 for v in led.lifecycle_yearly.values()))
-    ok("L15_yearly_confirmed", any(v.get("confirmed_close", 0) > 0 for v in led.lifecycle_yearly.values()))
-
-    # state-lock: confirmed close never rewrites locked label
-    before_cls = ep.duration_class
-    ok("L16_state_lock", led.try_mutate_locked(ep.episode_id, "duration_class", "T999") is False
-       and ep.duration_class == before_cls and ep.locked)
-
-    # same-bar / future-bar: feature_cutoff <= decision; action > decision
-    ok("L17_same_bar_contract",
-       all((ev.feature_cutoff is None or ev.feature_cutoff <= ev.decision_time)
-           and (ev.action_eligible_time is None or ev.action_eligible_time > ev.decision_time)
-           for ev in led.events.values()))
-
-    # Event Memory reset only after confirmed close (not provisional)
-    from cg_damage_duration_d02_memory import EventMemoryStore
-    store = EventMemoryStore()
-    led_m = DamageEpisodeLedger(sessions)
-    ev_m = led_m.observe_open_trigger(EV_PROTECTION, t0, "W2", bars)
-    ep_m = led_m.episodes[ev_m.episode_id]
-    store.sync_open_episode(ep_m, t0, t0, "D30", 1.0, 100.0, "W2")
-    ok("L18_memory_active_on_open", store.active is not None and store.active.episode_id == ep_m.episode_id)
-    led_m.process_release_check(
-        t0 + timedelta(minutes=5), protection_active=False, prev_protection_active=True,
-        d_severity="NONE", checkpoint_key=("M", 1))
-    ok("L19_memory_preserved_provisional",
-       store.active is not None and ep_m.state == EP_PROVISIONAL)
-    fin_m = ep_m.label_finalization_time
-    led_m.process_release_check(
-        fin_m, protection_active=False, prev_protection_active=False,
-        d_severity="NONE", checkpoint_key=("M", 2))
-    store.sync_open_episode(None, fin_m, fin_m, "NONE", None, None, "NONE")
-    ok("L20_memory_reset_after_confirm",
-       ep_m.locked and store.active is None and len(store.completed) >= 1)
-
-    # P4 schedule resets when episode_id becomes UNAVAILABLE after confirm (existing interface)
-    from cg_damage_duration_d03a_shadow import ModelAShadowRouter, _snap_b, _snap_c, UNAVAILABLE as U
-    rtr = ModelAShadowRouter()
-    rtr.update(_snap_b(t0, 0, episode_id=ep_m.episode_id), _snap_c(t0, 0))
-    ok("L21_p4_bound_to_episode", rtr.episode_id == ep_m.episode_id)
-    rtr.update(_snap_b(fin_m, 1, episode_id=U), _snap_c(fin_m, 1))
-    ok("L22_p4_reset_after_confirm_unavailable",
-       rtr.episode_id == U and abs(float(rtr.p4_fraction)) < 1e-12)
-
-    # runtime wiring: RELEASE_CHECK calls process_release_check from diag
-    import inspect
-    import cg_damage_duration_d01_diag as d01_diag
-    diag_src = inspect.getsource(d01_diag)
-    ok("L23_runtime_wire_present",
-       "process_release_check" in diag_src
-       and "RELEASE_CHECK" in diag_src
-       and "CONFIRMED_CLOSE" in diag_src)
-
-    # no hard AND-gate of RecoveryScore in close predicate
-    pred_src = inspect.getsource(release_check_close_predicate)
-    ok("L24_no_hard_and_gate",
-       "RecoveryScore" not in pred_src.split('"""')[-1]
-       and "all(" not in pred_src.split('"""')[-1])
-
-    # yearly eoy finalize
-    ly = led.finalize_lifecycle_yearly_eoy(as_of=fin)
-    ok("L25_eoy_finalize", isinstance(ly, dict) and any("eoy_open_count" in v for v in ly.values()))
-
-    # fixture parity: yearly open count matches episodes_created for this ledger path
-    ysum_open = sum(int(v.get("open", 0) or 0) for v in led.lifecycle_yearly.values())
-    ok("L26_yearly_open_parity", ysum_open == int(led.counters.get("episodes_created", 0) or 0))
-
-    return {
-        "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
-        "runtime_close_predicate_found": "YES",
-        "runtime_close_predicate_owner": (
-            "cg_damage_duration_d01_core.py:release_check_close_predicate"),
-        "hard_and_gate_found": "NO",
-    }
 
 
 def build_technical_counters_csv(counters):
