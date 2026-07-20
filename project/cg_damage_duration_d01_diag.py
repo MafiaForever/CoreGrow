@@ -445,7 +445,7 @@ class CgDamageDurationD01DiagMixin:
                 if isinstance(vp, dict):
                     b1_vp = vp
             sens_snap = sens.evaluate(
-                t, atr_map, force_macro_resid_enabled=b1_on, b1_variant_pass=b1_vp)
+                t, atr_map, source_macro_resid_enabled=b1_on, b1_variant_pass=b1_vp)
             ck = (t.date().toordinal(), int(tod))
             d_sev = None if sens_snap is None else sens_snap.get("strongest_severity")
             # RELEASE_CHECK before open/attach; existing causal predicates only.
@@ -656,3 +656,143 @@ class CgDamageDurationD01DiagMixin:
             self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1
             self._DamageD01Log(f"CG_DAMAGE_D02A_EOA_FAIL,err={type(e).__name__}")
         return True
+
+
+def run_damage_d01_diag_signature_static_tests():
+    """External-only regression: D02 evaluate keyword binding through real OnEval path."""
+    import ast
+    import inspect
+    import re
+    import sys
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    rows, passed, failed = [], 0, 0
+
+    def ok(n, c, detail=""):
+        nonlocal passed, failed
+        if c:
+            passed += 1
+            rows.append({"name": n, "pass": True, "detail": detail})
+        else:
+            failed += 1
+            rows.append({"name": n, "pass": False, "detail": str(detail)})
+
+    sig = inspect.signature(DamageD02Sensor.evaluate)
+    ok("S01_callee_has_source_macro", "source_macro_resid_enabled" in sig.parameters)
+    ok("S02_callee_no_force_macro", "force_macro_resid_enabled" not in sig.parameters)
+
+    src = inspect.getsource(CgDamageDurationD01DiagMixin._DamageD02OnEval)
+    ok("S03_caller_uses_source_macro", "source_macro_resid_enabled=" in src)
+    ok("S04_caller_absent_force_macro", "force_macro_resid_enabled" not in src)
+
+    tree = ast.parse(inspect.getsource(CgDamageDurationD01DiagMixin))
+    eval_kws = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "evaluate":
+                eval_kws = [kw.arg for kw in node.keywords if kw.arg]
+    ok("S05_ast_evaluate_kw_source", "source_macro_resid_enabled" in eval_kws)
+    ok("S06_ast_evaluate_kw_no_force", "force_macro_resid_enabled" not in eval_kws)
+
+    sens = DamageD02Sensor()
+    t0 = datetime(2024, 3, 11, 10, 0, 0)
+    try:
+        out = sens.evaluate(t0, {}, source_macro_resid_enabled=False, b1_variant_pass=None)
+        ok("S07_evaluate_source_kw_ok", True, detail=str(type(out)))
+    except TypeError as e:
+        ok("S07_evaluate_source_kw_ok", False, detail=str(e))
+    try:
+        sens.evaluate(t0, {}, force_macro_resid_enabled=False)
+        ok("S08_evaluate_force_kw_rejected", False, detail="unexpected_accept")
+    except TypeError as e:
+        ok("S08_evaluate_force_kw_rejected", "force_macro_resid_enabled" in str(e), detail=str(e))
+
+    class _RecSensor(DamageD02Sensor):
+        def __init__(self):
+            super().__init__()
+            self.last_kwargs = None
+
+        def evaluate(self, decision_time, atr_map, source_macro_resid_enabled=False,
+                     b1_variant_pass=None, extras=None):
+            self.last_kwargs = {
+                "source_macro_resid_enabled": source_macro_resid_enabled,
+                "b1_variant_pass": b1_variant_pass,
+            }
+            return super().evaluate(
+                decision_time, atr_map,
+                source_macro_resid_enabled=source_macro_resid_enabled,
+                b1_variant_pass=b1_variant_pass, extras=extras)
+
+    class _Host(CgDamageDurationD01DiagMixin):
+        def __init__(self):
+            self.cg_damage_duration_d02_enable = True
+            self.cg_damage_duration_d03a_enable = False
+            self.cg_damage_duration_d03b_enable = False
+            self.cg_macro_resid_b1_enable = False
+            self.time = t0
+            self._dmg_ledger = DamageEpisodeLedger()
+            self._dmg_d02_sensor = _RecSensor()
+            self._dmg_d02_features = None
+            self._dmg_d02c = None
+            self._dmg_d03a = None
+            self._dmg_d03b = None
+            self._dmg_prev_prot = False
+            self._dmg_bar_ends = [t0 - timedelta(minutes=5), t0, t0 + timedelta(minutes=5)]
+            self._ms_atr = {}
+            self._dmg_d02_err = 0
+            self.portfolio = SimpleNamespace(total_portfolio_value=100000.0)
+
+        def _DamageD01ProtectionSnap(self):
+            return {"w2_active": False, "ids_state": "NORMAL", "panic_state": "NORMAL",
+                    "emergency_active": False, "reduce_only_active": False}
+
+        def _DamageD01ShActive(self):
+            return False
+
+    host = _Host()
+    host._DamageD02OnEval("POST", 600, b"", None)
+    kw = host._dmg_d02_sensor.last_kwargs or {}
+    ok("S09_runtime_path_invoked",
+       kw.get("source_macro_resid_enabled") is False
+       and "force_macro_resid_enabled" not in kw)
+    ok("S10_feature_cutoff_contract",
+       all((ev.feature_cutoff is None or ev.feature_cutoff <= ev.decision_time)
+           for ev in host._dmg_ledger.events.values()) if host._dmg_ledger.events else True)
+
+    init_blob = "\n".join([
+        inspect.getsource(CgDamageDurationD01DiagMixin._DamageD01InitHooks),
+        inspect.getsource(CgDamageDurationD01DiagMixin._DamageD02InitHooks),
+        inspect.getsource(CgDamageDurationD01DiagMixin._DamageD01InitHooksSafe),
+    ])
+    hits = re.findall(r"run_\w*static_tests\s*\(", init_blob)
+    ok("S11_init_no_static_suite", len(hits) == 0, detail=str(hits))
+
+    runtime_src = inspect.getsource(CgDamageDurationD01DiagMixin._DamageD02OnEval)
+    ok("S12_force_absent_runtime_method", "force_macro_resid_enabled" not in runtime_src)
+
+    # Char count without filesystem file-read APIs (Cloudsafe-forbidden).
+    mod = sys.modules.get("cg_damage_duration_d01_diag") or sys.modules[__name__]
+    n_chars = len(inspect.getsource(mod))
+    ok("S13_diag_below_64000", n_chars < 64000, detail=str(n_chars))
+
+    return {
+        "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
+        "old_keyword": "force_macro_resid_enabled",
+        "corrected_keyword": "source_macro_resid_enabled",
+        "callee_signature": str(sig),
+        "runtime_reachable_static_test_call_count": len(hits),
+        "d01_diag_chars": n_chars,
+    }
+
+
+if __name__ == "__main__":
+    import json as _json
+    rep = run_damage_d01_diag_signature_static_tests()
+    print(_json.dumps({
+        "passed": rep["passed"], "failed": rep["failed"], "total": rep["total"],
+        "d01_diag_chars": rep.get("d01_diag_chars"),
+    }))
+    for row in rep["rows"]:
+        if not row["pass"]:
+            print("FAIL", row["name"], row["detail"])
