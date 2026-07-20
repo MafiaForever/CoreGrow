@@ -618,6 +618,16 @@ def run_compact_export_static_tests():
     ok("TQ14_compact_not_muted",
        not any(D0_COMPACT_PREFIX.startswith(p) for p in mp_d))
 
+    # --- D0 fixed-only EOA dispatch independence ---
+    eoa = run_d0_eoa_dispatch_static_tests()
+    ok("EOA00_suite", eoa.get("failed", 1) == 0, detail=str(eoa.get("failed")))
+    for erow in eoa.get("rows") or []:
+        rows.append({"name": "EOA_" + erow["name"], "pass": erow["pass"], "detail": erow.get("detail", "")})
+        if erow["pass"]:
+            passed += 1
+        else:
+            failed += 1
+
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
         "eoa_payload_size_bytes": nbytes,
@@ -625,6 +635,125 @@ def run_compact_export_static_tests():
         "aggregate_fixture_parity": "PASS" if failed == 0 else "FAIL",
         "sample_cap_invariance_gate": "PASS" if failed == 0 else "FAIL",
         "transport_quiet_gate": "PASS" if failed == 0 else "FAIL",
+        "d0_eoa_dispatch": eoa,
+    }
+
+
+def run_d0_eoa_dispatch_static_tests():
+    """EOA dispatch independence from _sr_on / cg_maisr_diag_enable."""
+    from cg_damage_duration_d01_diag import CgDamageDurationD01DiagMixin
+    from cg_maisr_diag import CgMaisrDiagMixin
+    from rrx_params import RRX_PARAMS
+
+    rows, passed, failed = [], 0, 0
+
+    def ok(n, c, detail=""):
+        nonlocal passed, failed
+        if c:
+            passed += 1
+            rows.append({"name": n, "pass": True, "detail": detail})
+        else:
+            failed += 1
+            rows.append({"name": n, "pass": False, "detail": str(detail)})
+
+    class _H(CgMaisrDiagMixin, CgDamageDurationD01DiagMixin):
+        def __init__(self):
+            self.logs = []
+            self._ms_err = 0
+            self._ms_emitted = False
+            self._ms_on = False
+            self._sr_on = False
+            self._sr_emitted = False
+            self.cg_maisr_diag_enable = False
+            self.cg_damage_duration_d01_enable = True
+            self.cg_damage_duration_d02_enable = True
+            self.cg_damage_duration_d03a_enable = True
+            self.cg_damage_duration_d03b_enable = True
+            self.cg_damage_duration_d03b_fixed_only_shadow_enable = True
+            self._dmg_d03b = None
+            self._dmg_d0_eoa_emitted = False
+            self._dmg_real_orders = 0
+            self._dmg_sub_changes = 0
+            self._dmg_target_mut = 0
+            self._dmg_d02_err = 0
+            self._ms_bd_seen = self._ms_bd_accept = self._ms_bd_dup = 0
+            self._ms_bd_conflict = self._ms_bd_oo = 0
+            self._ms_eval_seen = self._ms_eval_uniq = self._ms_eval_dup = 0
+
+        def _DamageD01Log(self, msg):
+            self.logs.append(str(msg))
+
+        def _MsLog(self, msg):
+            self.logs.append(str(msg))
+
+        def log(self, msg):
+            self.logs.append(str(msg))
+
+        def CgDamageD02OnEndOfAlgorithm(self, parity_ok):
+            self.logs.append("D0_COMPACT_CLOSEOUT,{\"test\":1,\"parity\":%s}" % int(bool(parity_ok)))
+            return True
+
+        def CgDamageD01OnEndOfAlgorithm(self, parity_ok):
+            self.logs.append("CG_DAMAGE_D01_EOA,parity=%s" % int(bool(parity_ok)))
+            return True
+
+    ok("E01_maisr_diag_default_off", RRX_PARAMS.get("cg_maisr_diag_enable", "0") == "0")
+    h = _H()
+    ok("E02_predicate_true", h._DamageD0FixedOnlyEOAPredicate() is True)
+    ok("E03_sr_off", h._sr_on is False and h.cg_maisr_diag_enable is False)
+    h.CgShadowReplayEmitFinal()
+    compact = [l for l in h.logs if l.startswith("D0_COMPACT_CLOSEOUT")]
+    maisr_final = [l for l in h.logs if "CG_MAISR_P1_BAR_DEDUP_FINAL" in l or "CG_MAISR_D0_PARITY" in l]
+    ok("E04_compact_with_sr_off", len(compact) == 1, detail=str(len(compact)))
+    ok("E05_generic_maisr_not_activated", len(maisr_final) == 0 and h._ms_emitted is False)
+    ok("E06_emitted_flag", h._dmg_d0_eoa_emitted is True)
+    # exactly once
+    h.CgShadowReplayEmitFinal()
+    compact2 = [l for l in h.logs if l.startswith("D0_COMPACT_CLOSEOUT")]
+    ok("E07_exactly_once", len(compact2) == 1, detail=str(len(compact2)))
+    # TryEOA no-op after emit (generic MAISR path must not duplicate)
+    ok("E08_try_eoa_noop_after", h.CgDamageD01TryEOA(True) is False)
+    compact3 = [l for l in h.logs if l.startswith("D0_COMPACT_CLOSEOUT")]
+    ok("E09_no_dup_via_try_eoa", len(compact3) == 1)
+
+    # all D0 flags off => no emit
+    h2 = _H()
+    h2.cg_damage_duration_d03b_enable = False
+    h2.cg_damage_duration_d03b_fixed_only_shadow_enable = False
+    ok("E10_predicate_off", h2._DamageD0FixedOnlyEOAPredicate() is False)
+    h2.CgShadowReplayEmitFinal()
+    ok("E11_no_emit_when_off",
+       not any(l.startswith("D0_COMPACT_CLOSEOUT") for l in h2.logs))
+
+    # failure containment
+    h3 = _H()
+
+    def _boom(parity_ok):
+        raise RuntimeError("inject_fail")
+
+    h3.CgDamageD02OnEndOfAlgorithm = _boom
+    h3.CgShadowReplayEmitFinal()
+    fail_lines = [l for l in h3.logs if l.startswith("D0_COMPACT_CLOSEOUT") and "EOA_FAIL" in l]
+    ok("E12_failure_containment", len(fail_lines) == 1 and "RuntimeError" in fail_lines[0])
+    ok("E13_failure_idempotent_flag", h3._dmg_d0_eoa_emitted is True)
+
+    # no state mutation from dispatch
+    h4 = _H()
+    h4._targets = {"SPY": 0.5}
+    h4._gross = 1.0
+    h4.CgShadowReplayEmitFinal()
+    ok("E14_no_state_mutation",
+       h4._targets == {"SPY": 0.5} and h4._gross == 1.0
+       and int(getattr(h4, "_dmg_real_orders", 0) or 0) == 0)
+
+    return {
+        "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
+        "d0_fixed_only_eoa_gate": "PASS" if failed == 0 else "FAIL",
+        "d0_eoa_exactly_once_gate": "PASS" if failed == 0 else "FAIL",
+        "d0_eoa_failure_containment_gate": "PASS" if failed == 0 else "FAIL",
+        "cg_maisr_diag_enable_required": "NO",
+        "sr_on_required_for_d0_eoa": "NO",
+        "generic_maisr_activation_found": "NO",
     }
 
 

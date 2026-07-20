@@ -1067,6 +1067,16 @@ class CgMaisrDiagMixin(_DD01, CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMai
             f"reason={reason}"
         )
 
+    def CgShadowReplayEmitFinal(self) -> None:
+        # D0 fixed-only compact EOA must run before Shadow Replay's _sr_on gate.
+        # AttachCgMixins installs this after CgShadowReplayMixin; delegate original.
+        try:
+            self._DamageD0FixedOnlyEmitEOAOnce(parity_ok=True)
+        except Exception:
+            pass
+        from cg_shadow_replay import CgShadowReplayMixin
+        CgShadowReplayMixin.CgShadowReplayEmitFinal(self)
+
     def CgMaisrOnEndOfAlgorithm(self, parity_ok) -> None:
         if getattr(self, "_ms_emitted", False):
             return

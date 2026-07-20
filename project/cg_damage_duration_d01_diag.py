@@ -121,7 +121,45 @@ class CgDamageDurationD01DiagMixin:
         elif getattr(self, "cg_damage_duration_d01_enable", False):
             self._DamageD01OnEval(kind, tod, states, feat)
 
+    def _DamageD0FixedOnlyEOAPredicate(self):
+        # Fixed-only D0 finalization must not depend on _sr_on / cg_maisr_diag_enable.
+        return bool(getattr(self, "cg_damage_duration_d03b_enable", False)) and bool(
+            getattr(self, "cg_damage_duration_d03b_fixed_only_shadow_enable", False))
+
+    def _DamageD0FixedOnlyEmitEOAOnce(self, parity_ok=True):
+        """Idempotent D0 compact EOA. Export-only; no state/target/order mutation."""
+        if not self._DamageD0FixedOnlyEOAPredicate():
+            return False
+        if getattr(self, "_dmg_d0_eoa_emitted", False):
+            return False
+        try:
+            d01 = bool(getattr(self, "cg_damage_duration_d01_enable", False))
+            d02 = bool(getattr(self, "cg_damage_duration_d02_enable", False))
+            if not d01 and not d02:
+                self._DamageD01Log(
+                    "D0_COMPACT_CLOSEOUT,status=EOA_SKIPPED,reason=D01_D02_DISABLED,"
+                    "export_mode=CLOUD_COMPACT_AGGREGATE"
+                )
+            else:
+                if d02:
+                    self.CgDamageD02OnEndOfAlgorithm(parity_ok)
+                if d01 and not d02:
+                    self.CgDamageD01OnEndOfAlgorithm(parity_ok)
+        except Exception as e:
+            try:
+                self._DamageD01Log(
+                    f"D0_COMPACT_CLOSEOUT,status=EOA_FAIL,err={type(e).__name__},"
+                    f"export_mode=CLOUD_COMPACT_AGGREGATE"
+                )
+            except Exception:
+                pass
+        finally:
+            self._dmg_d0_eoa_emitted = True
+        return True
+
     def CgDamageD01TryEOA(self, parity_ok):
+        if getattr(self, "_dmg_d0_eoa_emitted", False):
+            return False
         d01 = bool(getattr(self, "cg_damage_duration_d01_enable", False))
         d02 = bool(getattr(self, "cg_damage_duration_d02_enable", False))
         if not d01 and not d02:
@@ -134,8 +172,10 @@ class CgDamageDurationD01DiagMixin:
             elif d01 and d02:
                 # D0.2A owns EOA when both on; d01 ledger already shared
                 pass
+            self._dmg_d0_eoa_emitted = True
         except Exception:
             self._ms_err = int(getattr(self, "_ms_err", 0) or 0) + 1
+            self._dmg_d0_eoa_emitted = True
         return True
 
     def _DamageD01InitHooks(self):
