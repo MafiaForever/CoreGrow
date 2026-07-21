@@ -29,11 +29,15 @@ from cg_damage_duration_d03b_compact_export import (
 )
 from cg_damage_duration_d03b_proxy_replay import FixedOnlySpyProxyReplay
 from cg_damage_duration_d04a_ablation import (
-    ModelAAblationBank, EXTRA_PROXY_POLICIES, D04A_BLOCKS, P5_FULL,
+    ModelAAblationBank, EXTRA_PROXY_POLICIES, D04A_BLOCKS, P5_FULL, P5_NO_ABSTENTION,
     enrich_proxy_snap_d04a, run_d04a_ablation_static_tests,
 )
 from cg_damage_duration_d04b_robustness import (
     ModelARobustnessGrid, enrich_proxy_snap_d04b, run_d04b_robustness_static_tests,
+)
+from cg_damage_duration_d05b_core import P5B_SOFT_CONFIDENCE_BLEND
+from cg_damage_duration_d05b_proxy import (
+    ModelBChallengerBank, enrich_proxy_snap_d05b, run_d05b_proxy_static_tests,
 )
 
 FORBIDDEN_RE = re.compile(
@@ -59,6 +63,8 @@ class ModelAShadowRuntimeAccounting:
             extra_policies=EXTRA_PROXY_POLICIES, blocks=D04A_BLOCKS)
         self.ablation = ModelAAblationBank()
         self.robustness = ModelARobustnessGrid()
+        self.model_b = ModelBChallengerBank()
+        self.d05b_enable = False
         self.p0_audit = dict(P0_AUDIT)
         self.counters = {
             "snapshots": 0, "duplicate_blocked": 0, "stale_blocked": 0,
@@ -67,15 +73,55 @@ class ModelAShadowRuntimeAccounting:
             "target_mutations": 0, "production_gross_mutations": 0,
         }
 
+    def on_proxy_spy_bar(self, tk, et, c):
+        proxy = self.proxy
+        if proxy is None or not getattr(proxy, "enabled", False):
+            return
+        proxy.on_spy_bar(et, c, tk)
+        rob = self.robustness
+        if rob is not None and getattr(rob, "enabled", False):
+            rob.on_spy_bar(et, c, tk)
+        mb = self.model_b
+        if mb is not None and getattr(mb, "enabled", False):
+            mb.on_spy_bar(et, c, tk)
+
+    def on_proxy_life(self, act, eid, t, cur_open=None):
+        proxy = self.proxy
+        if proxy is None or not getattr(proxy, "enabled", False):
+            return
+        rob = self.robustness
+        mb = self.model_b
+        if act == "CONFIRMED_CLOSE" and eid:
+            proxy.on_confirmed_close(eid, t)
+            if rob is not None and getattr(rob, "enabled", False):
+                rob.on_confirmed_close(eid, t)
+            if mb is not None and getattr(mb, "enabled", False):
+                mb.on_confirmed_close(eid, t)
+        elif act == "RELAPSE_REOPEN" and eid:
+            proxy.on_abandon(eid, "REOPEN")
+            if rob is not None and getattr(rob, "enabled", False):
+                rob.on_abandon(eid, "REOPEN")
+            if mb is not None and getattr(mb, "enabled", False):
+                mb.on_abandon(eid, "REOPEN")
+        if cur_open is not None and str(getattr(cur_open, "episode_id", "")) not in proxy.active:
+            ot = getattr(cur_open, "decision_time", None) or t
+            proxy.on_open(cur_open.episode_id, ot)
+            if rob is not None and getattr(rob, "enabled", False):
+                rob.on_open(cur_open.episode_id, ot)
+            if mb is not None and getattr(mb, "enabled", False):
+                mb.on_open(cur_open.episode_id, ot)
+
     def update(self, snap_b, snap_c, shadow_out, d03b_enabled=True, prod_state=None,
-               fixed_only_shadow_enable=False):
+               fixed_only_shadow_enable=False, d05b_enable=False):
         if not d03b_enabled:
             return None
         self.enabled = True
         self.fixed_only = bool(fixed_only_shadow_enable)
+        self.d05b_enable = bool(d05b_enable) and self.fixed_only
         self.proxy.set_enabled(self.fixed_only)
         self.ablation.set_enabled(self.fixed_only)
         self.robustness.set_enabled(self.fixed_only)
+        self.model_b.set_enabled(self.d05b_enable)
         if snap_b is None or shadow_out is None:
             return None
         b = deepcopy(snap_b)
@@ -189,6 +235,15 @@ class ModelAShadowRuntimeAccounting:
                 dt if isinstance(dt, datetime) else None, eid, fm)
             self.robustness.on_checkpoint(
                 dt if isinstance(dt, datetime) else None, eid, fm)
+            if self.d05b_enable:
+                p5b = self.model_b.update_fraction(b, c)
+                fm_b = {
+                    P5_FULL: fm.get(P5_FULL, UNAVAILABLE),
+                    P5_NO_ABSTENTION: fm.get(P5_NO_ABSTENTION, UNAVAILABLE),
+                    P5B_SOFT_CONFIDENCE_BLEND: p5b,
+                }
+                self.model_b.on_checkpoint(
+                    dt if isinstance(dt, datetime) else None, eid, fm_b)
 
         self.last_checkpoint = ck
         if ck is not None:
@@ -242,9 +297,14 @@ class ModelAShadowRuntimeAccounting:
         if self.fixed_only and self.proxy is not None:
             self.proxy.finalize_eoa()
             self.robustness.finalize_eoa()
+            if self.d05b_enable:
+                self.model_b.finalize_eoa()
             proxy_snap = enrich_proxy_snap_d04a(self.proxy.snapshot())
             proxy_snap = enrich_proxy_snap_d04b(
                 proxy_snap, self.robustness.snapshot())
+            if self.d05b_enable:
+                proxy_snap = enrich_proxy_snap_d05b(
+                    proxy_snap, self.model_b.snapshot())
         return build_compact_closeout(
             self.aggregates,
             runtime_counters=self.counters,
@@ -559,6 +619,15 @@ def run_damage_d03b1_static_tests(param_map=None):
         else:
             failed += 1
 
+    d05b = run_d05b_proxy_static_tests()
+    ok("B08c_d05b_suite", d05b.get("failed", 1) == 0, detail=str(d05b.get("failed")))
+    for brow in d05b.get("rows") or []:
+        rows.append({"name": "MB_" + brow["name"], "pass": brow["pass"], "detail": brow.get("detail", "")})
+        if brow["pass"]:
+            passed += 1
+        else:
+            failed += 1
+
     # D0.4A proxy extras present on fixed-only runtime
     ok("B09_d04a_proxy_extras",
        P5_FULL in getattr(rt_fo.proxy, "policy_ids", ())
@@ -570,6 +639,9 @@ def run_damage_d03b1_static_tests(param_map=None):
     ok("B11_d04b_grid_wired",
        getattr(rt_fo, "robustness", None) is not None
        and len(getattr(rt_fo.robustness, "cells", {}) or {}) == 9)
+    ok("B12_d05b_bank_wired",
+       getattr(rt_fo, "model_b", None) is not None
+       and len(getattr(rt_fo.model_b, "cells", {}) or {}) == 6)
 
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
@@ -583,6 +655,7 @@ def run_damage_d03b1_static_tests(param_map=None):
         "proxy_replay": pr,
         "d04a_ablation": d04,
         "d04b_robustness": d04b,
+        "d05b_model_b": d05b,
         "eoa_payload_size_bytes": cex.get("eoa_payload_size_bytes"),
         "d01": d01, "d03a": d03a, "p4_repair": p4,
     }

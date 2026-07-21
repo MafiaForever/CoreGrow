@@ -53,6 +53,8 @@ class CgDamageDurationD01DiagMixin:
             "cg_damage_duration_d03b_fixed_only_shadow_enable", "0")
         self.cg_damage_duration_d03b_cloud_transport_quiet_enable = _bool(
             "cg_damage_duration_d03b_cloud_transport_quiet_enable", "0")
+        self.cg_damage_duration_d05b_enable = _bool(
+            "cg_damage_duration_d05b_enable", "0")
         # Audit-only: record quiet override source (QC > RRX fallback > hard default).
         try:
             qv = self.get_parameter(
@@ -332,6 +334,11 @@ class CgDamageDurationD01DiagMixin:
                 "CG_DAMAGE_D04B_ROBUSTNESS,enable=1,lags=0|5|15,costs_bps=0|1|5,"
                 "eval_only=1,shadow_only=1"
             )
+            if bool(getattr(self, "cg_damage_duration_d05b_enable", False)):
+                self._DamageD01Log(
+                    "CG_DAMAGE_D05B_MODEL_B,enable=1,variant=P5B_SOFT_CONFIDENCE_BLEND,"
+                    "lags=0|5,costs_bps=0|1|5,shadow_only=1"
+                )
 
     def _DamageD01Log(self, msg):
         try:
@@ -348,41 +355,23 @@ class CgDamageDurationD01DiagMixin:
 
     def _DamageD03bProxySpyBar(self, tk, et, c):
         d03b = getattr(self, "_dmg_d03b", None)
-        proxy = getattr(d03b, "proxy", None) if d03b is not None else None
-        if proxy is None or not getattr(proxy, "enabled", False):
+        if d03b is None:
             return
         try:
-            proxy.on_spy_bar(et, c, tk)
-            rob = getattr(d03b, "robustness", None)
-            if rob is not None and getattr(rob, "enabled", False):
-                rob.on_spy_bar(et, c, tk)
+            d03b.on_proxy_spy_bar(tk, et, c)
         except Exception:
             pass
 
     def _DamageD03bProxyLife(self, lc, t):
         d03b = getattr(self, "_dmg_d03b", None)
-        proxy = getattr(d03b, "proxy", None) if d03b is not None else None
-        if proxy is None or not getattr(proxy, "enabled", False):
+        if d03b is None:
             return
         try:
             act = (lc or {}).get("action")
             eid = (lc or {}).get("episode_id")
-            rob = getattr(d03b, "robustness", None)
-            if act == "CONFIRMED_CLOSE" and eid:
-                proxy.on_confirmed_close(eid, t)
-                if rob is not None and getattr(rob, "enabled", False):
-                    rob.on_confirmed_close(eid, t)
-            elif act == "RELAPSE_REOPEN" and eid:
-                proxy.on_abandon(eid, "REOPEN")
-                if rob is not None and getattr(rob, "enabled", False):
-                    rob.on_abandon(eid, "REOPEN")
             led = getattr(self, "_dmg_ledger", None)
             cur = led.current_open() if led is not None else None
-            if cur is not None and str(getattr(cur, "episode_id", "")) not in proxy.active:
-                ot = getattr(cur, "decision_time", None) or t
-                proxy.on_open(cur.episode_id, ot)
-                if rob is not None and getattr(rob, "enabled", False):
-                    rob.on_open(cur.episode_id, ot)
+            d03b.on_proxy_life(act, eid, t, cur_open=cur)
         except Exception:
             pass
 
@@ -611,6 +600,8 @@ class CgDamageDurationD01DiagMixin:
                         prod_state={"production_nav_read_only": nav},
                         fixed_only_shadow_enable=bool(
                             getattr(self, "cg_damage_duration_d03b_fixed_only_shadow_enable", False)),
+                        d05b_enable=bool(
+                            getattr(self, "cg_damage_duration_d05b_enable", False)),
                     )
             self._dmg_prev_prot = active
             self._dmg_d02_ctr = dict(sens.counters)
