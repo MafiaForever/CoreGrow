@@ -1,6 +1,7 @@
 # region imports
 from AlgorithmImports import *
 from datetime import date, datetime, timedelta
+from cg_alpha_identity_diag import CgAlphaIdentityDiagMixin
 # endregion
 # cg_regime_rebal_time_trade.py
 # CG-REGIME-TIME-T1: defer ExecuteTargets to fixed/deferred slots.
@@ -32,7 +33,7 @@ def _rtt_gross(w):
     return g
 
 
-class CgRegimeRebalTimeTradeMixin:
+class CgRegimeRebalTimeTradeMixin(CgAlphaIdentityDiagMixin):
     """Real deferred rebalance execution. No signal recalculation at later slots."""
 
     def CgRegimeRebalTimeTradeInitialize(self):
@@ -310,6 +311,13 @@ class CgRegimeRebalTimeTradeMixin:
                     )
             except Exception:
                 pass
+            try:
+                if bool(getattr(self, "cg_alpha_identity_enable", False)):
+                    obs_a = getattr(self, "AlphaIdentityObserveCapture", None)
+                    if callable(obs_a) and not reduce_only:
+                        obs_a(combined, slot_minutes=int(_SIGNAL_SLOT))
+            except Exception:
+                pass
             return True
         slot, rg = self._RtTradeSlotForRegime(regime)
         self._cg_rt_n_cap += 1
@@ -318,6 +326,13 @@ class CgRegimeRebalTimeTradeMixin:
             try:
                 if getattr(self, "_sr_on", False):
                     self.CgShadowReplayCapture(combined, rg, slot, False, False)
+            except Exception:
+                pass
+            try:
+                if bool(getattr(self, "cg_alpha_identity_enable", False)):
+                    obs_a = getattr(self, "AlphaIdentityObserveCapture", None)
+                    if callable(obs_a):
+                        obs_a(combined, slot_minutes=int(slot))
             except Exception:
                 pass
             return True
@@ -354,6 +369,14 @@ class CgRegimeRebalTimeTradeMixin:
                 obs = getattr(self, "_D06bP0ObserveIntended", None)
                 if callable(obs):
                     obs(getattr(self, "time", None), self._cg_rt_pending)
+        except Exception:
+            pass
+        # Alpha-identity: intended targets before dispatch (never holdings/fills).
+        try:
+            if bool(getattr(self, "cg_alpha_identity_enable", False)):
+                obs_a = getattr(self, "AlphaIdentityObserveCapture", None)
+                if callable(obs_a):
+                    obs_a(self._cg_rt_pending, slot_minutes=int(slot))
         except Exception:
             pass
         return False
@@ -516,6 +539,10 @@ class CgRegimeRebalTimeTradeMixin:
                     f"duplicate_blocked={self._cg_rt_n_dup},"
                     f"unknown_regime={self._cg_rt_n_unk},trade=1"
                 )
+        except Exception:
+            pass
+        try:
+            self.CgAlphaIdentityTryEOA(True)
         except Exception:
             pass
         try:

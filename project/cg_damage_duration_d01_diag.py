@@ -134,6 +134,12 @@ class CgDamageDurationD01DiagMixin:
                     fc.on_accepted_bar(tk, et, o, h, l, c, decision_time=t)
                 except Exception:
                     self._dmg_d02_err = int(getattr(self, "_dmg_d02_err", 0) or 0) + 1
+        try:
+            if getattr(self, "cg_alpha_identity_enable", False):
+                self._AlphaIdentityOnAcceptedBar(tk, et, o, h, l, c)
+                self.AlphaIdentityMaybeMarkNav()
+        except Exception:
+            pass
 
     def _DamageD01WantEval(self):
         return bool(getattr(self, "cg_damage_duration_d01_enable", False)

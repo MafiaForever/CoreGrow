@@ -64,6 +64,10 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
         except Exception:
             pass
         try:
+            self.AlphaIdentityBootstrap()
+        except Exception:
+            pass
+        try:
             self.CgMaisrInit()
         except Exception:
             pass
@@ -263,9 +267,19 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
                 _p0_tok = None
             eq_b = self._DftEqGross(out, eq_set)
             cash_add = 0.0
+            _pre_w2 = dict(out)
             if active:
                 out, cash_add = self._DftScaleEquity(out, eq_set, 0.80)
             eq_a = self._DftEqGross(out, eq_set)
+            # Alpha-identity F: causal pre/post intended vectors at W2 scale only.
+            try:
+                if (active and bool(getattr(self, "cg_alpha_identity_enable", False))
+                        and abs(eq_a - eq_b) > 1e-12):
+                    _ap = getattr(self, "AlphaIdentityObserveProtectionPair", None)
+                    if callable(_ap):
+                        _ap(_pre_w2, out)
+            except Exception:
+                pass
             changed = (
                 active != getattr(self, "_cg_w2_last_active", None)
                 or (active and abs(eq_a - float(getattr(self, "_cg_w2_last_eq", eq_a) or eq_a)) > 1e-6)

@@ -125,6 +125,7 @@ class CgMaisrDiagMixin(_DD01, CgMacroResidB1DiagMixin, CgMacroA1DiagMixin, CgMai
             self._ms_on = True
             self.cg_maisr_diag_enable = True
         self._DamageD01MaybeEnableMs()
+        self._AlphaIdentityMaybeEnableMs()
         self._ms_grid_on = bool(self._ms_on and self.cg_maisr_grid_enable)
         self._ms_emit = bool(self._ms_on and self.cg_maisr_emit_events)
         self._ms_log_used = 0
