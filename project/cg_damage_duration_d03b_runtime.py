@@ -32,6 +32,9 @@ from cg_damage_duration_d04a_ablation import (
     ModelAAblationBank, EXTRA_PROXY_POLICIES, D04A_BLOCKS, P5_FULL,
     enrich_proxy_snap_d04a, run_d04a_ablation_static_tests,
 )
+from cg_damage_duration_d04b_robustness import (
+    ModelARobustnessGrid, enrich_proxy_snap_d04b, run_d04b_robustness_static_tests,
+)
 
 FORBIDDEN_RE = re.compile(
     r"(?<![A-Za-z_])(History|AddEquity|AddData|SetHoldings|MarketOrder|LimitOrder|"
@@ -55,6 +58,7 @@ class ModelAShadowRuntimeAccounting:
         self.proxy = FixedOnlySpyProxyReplay(
             extra_policies=EXTRA_PROXY_POLICIES, blocks=D04A_BLOCKS)
         self.ablation = ModelAAblationBank()
+        self.robustness = ModelARobustnessGrid()
         self.p0_audit = dict(P0_AUDIT)
         self.counters = {
             "snapshots": 0, "duplicate_blocked": 0, "stale_blocked": 0,
@@ -71,6 +75,7 @@ class ModelAShadowRuntimeAccounting:
         self.fixed_only = bool(fixed_only_shadow_enable)
         self.proxy.set_enabled(self.fixed_only)
         self.ablation.set_enabled(self.fixed_only)
+        self.robustness.set_enabled(self.fixed_only)
         if snap_b is None or shadow_out is None:
             return None
         b = deepcopy(snap_b)
@@ -182,6 +187,8 @@ class ModelAShadowRuntimeAccounting:
                 fm[k] = v
             self.proxy.on_checkpoint(
                 dt if isinstance(dt, datetime) else None, eid, fm)
+            self.robustness.on_checkpoint(
+                dt if isinstance(dt, datetime) else None, eid, fm)
 
         self.last_checkpoint = ck
         if ck is not None:
@@ -234,7 +241,10 @@ class ModelAShadowRuntimeAccounting:
         proxy_snap = None
         if self.fixed_only and self.proxy is not None:
             self.proxy.finalize_eoa()
+            self.robustness.finalize_eoa()
             proxy_snap = enrich_proxy_snap_d04a(self.proxy.snapshot())
+            proxy_snap = enrich_proxy_snap_d04b(
+                proxy_snap, self.robustness.snapshot())
         return build_compact_closeout(
             self.aggregates,
             runtime_counters=self.counters,
@@ -540,6 +550,15 @@ def run_damage_d03b1_static_tests(param_map=None):
         else:
             failed += 1
 
+    d04b = run_d04b_robustness_static_tests()
+    ok("B08b_d04b_suite", d04b.get("failed", 1) == 0, detail=str(d04b.get("failed")))
+    for brow in d04b.get("rows") or []:
+        rows.append({"name": "RB_" + brow["name"], "pass": brow["pass"], "detail": brow.get("detail", "")})
+        if brow["pass"]:
+            passed += 1
+        else:
+            failed += 1
+
     # D0.4A proxy extras present on fixed-only runtime
     ok("B09_d04a_proxy_extras",
        P5_FULL in getattr(rt_fo.proxy, "policy_ids", ())
@@ -548,6 +567,9 @@ def run_damage_d03b1_static_tests(param_map=None):
     ok("B10_d04a_in_closeout",
        isinstance((payload or {}).get("proxy_replay"), dict)
        and isinstance(((payload or {}).get("proxy_replay") or {}).get("d04a"), dict))
+    ok("B11_d04b_grid_wired",
+       getattr(rt_fo, "robustness", None) is not None
+       and len(getattr(rt_fo.robustness, "cells", {}) or {}) == 9)
 
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
@@ -560,6 +582,7 @@ def run_damage_d03b1_static_tests(param_map=None):
         "compact_export": cex,
         "proxy_replay": pr,
         "d04a_ablation": d04,
+        "d04b_robustness": d04b,
         "eoa_payload_size_bytes": cex.get("eoa_payload_size_bytes"),
         "d01": d01, "d03a": d03a, "p4_repair": p4,
     }

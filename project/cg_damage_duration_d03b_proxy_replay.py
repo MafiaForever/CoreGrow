@@ -85,10 +85,10 @@ def p123_decision_time_for_target(policy_id, open_time, session_days, target_f):
 class _Sleeve:
     __slots__ = (
         "cash", "shares", "frac", "pending_frac", "pending_after",
-        "peak", "max_dd", "switches", "missing_price",
+        "peak", "max_dd", "switches", "missing_price", "cost_bps", "lag_minutes",
     )
 
-    def __init__(self):
+    def __init__(self, cost_bps=0, lag_minutes=0):
         self.cash = 1.0
         self.shares = 0.0
         self.frac = 0.0
@@ -98,11 +98,20 @@ class _Sleeve:
         self.max_dd = 0.0
         self.switches = 0
         self.missing_price = 0
+        self.cost_bps = float(cost_bps or 0)
+        self.lag_minutes = int(lag_minutes or 0)
 
     def equity(self, px):
         if px is None or px <= 0:
             return self.cash
         return self.cash + self.shares * float(px)
+
+    def _eligible(self, bar_time, after_time):
+        if not isinstance(bar_time, datetime) or after_time is None:
+            return False
+        if self.lag_minutes <= 0:
+            return bar_time > after_time
+        return bar_time >= after_time
 
     def schedule(self, target_f, decision_time):
         if not isinstance(decision_time, datetime):
@@ -110,22 +119,25 @@ class _Sleeve:
         if target_f is None or not _avail(target_f):
             return False
         tf = max(0.0, min(1.0, float(target_f)))
+        after = decision_time
+        if self.lag_minutes > 0:
+            after = decision_time + timedelta(minutes=self.lag_minutes)
         if self.pending_frac is not None and abs(tf - float(self.pending_frac)) < EPS:
             # keep earliest decision for same target
-            if decision_time < self.pending_after:
-                self.pending_after = decision_time
+            if after < self.pending_after:
+                self.pending_after = after
             return True
         if abs(tf - self.frac) < EPS and self.pending_frac is None:
             return False
         self.pending_frac = tf
-        self.pending_after = decision_time
+        self.pending_after = after
         return True
 
     def apply_pending(self, bar_time, px):
         if self.pending_frac is None or self.pending_after is None:
             return False
-        if not isinstance(bar_time, datetime) or bar_time <= self.pending_after:
-            return False  # same-bar / not-yet rejected
+        if not self._eligible(bar_time, self.pending_after):
+            return False  # same-bar / lag-not-yet / missing forward
         return self._set_frac(self.pending_frac, px, clear_pending=True)
 
     def _set_frac(self, new_f, px, clear_pending=False):
@@ -134,15 +146,23 @@ class _Sleeve:
             return False
         new_f = max(0.0, min(1.0, float(new_f)))
         e = self.equity(px)
+        turnover = abs(new_f - self.frac) * e
+        if self.cost_bps > EPS and turnover > EPS:
+            e = max(0.0, e - turnover * (self.cost_bps / 10000.0))
         if abs(new_f - self.frac) > EPS:
             self.switches += 1
-        self.shares = (new_f * e) / float(px)
-        self.cash = (1.0 - new_f) * e
-        self.frac = new_f
+        if e <= EPS or float(px) <= EPS:
+            self.shares = 0.0
+            self.cash = e
+            self.frac = 0.0
+        else:
+            self.shares = (new_f * e) / float(px)
+            self.cash = (1.0 - new_f) * e
+            self.frac = new_f
         if clear_pending:
             self.pending_frac = None
             self.pending_after = None
-        self._dd(e)
+        self._dd(self.equity(px) if float(px) > 0 else e)
         return True
 
     def mtm(self, px):
@@ -170,7 +190,7 @@ class _Episode:
         "exclude_reason", "wealth", "episode_dd", "switches", "policy_ids",
     )
 
-    def __init__(self, episode_id, open_time, policy_ids):
+    def __init__(self, episode_id, open_time, policy_ids, cost_bps=0, lag_minutes=0):
         self.episode_id = str(episode_id)
         self.open_time = open_time
         self.open_day = open_time.date() if isinstance(open_time, datetime) else None
@@ -178,7 +198,10 @@ class _Episode:
         if self.open_day is not None:
             self.sessions = [self.open_day]
         self.policy_ids = tuple(policy_ids)
-        self.sleeves = {pid: _Sleeve() for pid in self.policy_ids}
+        self.sleeves = {
+            pid: _Sleeve(cost_bps=cost_bps, lag_minutes=lag_minutes)
+            for pid in self.policy_ids
+        }
         self.confirm_time = None
         self.pending_liq_after = None
         self.closed = False
@@ -190,13 +213,19 @@ class _Episode:
 
 
 class FixedOnlySpyProxyReplay:
-    """Per-episode SPY proxy sleeves for P1–P5; cost-free comparative diagnostic."""
+    """Per-episode SPY proxy sleeves for P1–P5; comparative diagnostic."""
 
-    def __init__(self, extra_policies=None, blocks=None):
+    def __init__(self, extra_policies=None, blocks=None, cost_bps=0, lag_minutes=0,
+                 policy_ids=None):
         self.enabled = False
         self.extra_policies = tuple(extra_policies or ())
-        self.policy_ids = tuple(FIXED_ONLY_POLICIES) + tuple(
-            p for p in self.extra_policies if p not in FIXED_ONLY_POLICIES)
+        self.cost_bps = float(cost_bps or 0)
+        self.lag_minutes = int(lag_minutes or 0)
+        if policy_ids is not None:
+            self.policy_ids = tuple(policy_ids)
+        else:
+            self.policy_ids = tuple(FIXED_ONLY_POLICIES) + tuple(
+                p for p in self.extra_policies if p not in FIXED_ONLY_POLICIES)
         self.blocks = dict(blocks) if blocks is not None else dict(BLOCKS)
         self.active = {}
         self.completed = []  # list[_Episode]
@@ -236,7 +265,9 @@ class FixedOnlySpyProxyReplay:
         eid = str(episode_id)
         if eid in self.active:
             return False
-        self.active[eid] = _Episode(eid, open_time, self.policy_ids)
+        self.active[eid] = _Episode(
+            eid, open_time, self.policy_ids,
+            cost_bps=self.cost_bps, lag_minutes=self.lag_minutes)
         self.counters["opens"] += 1
         return True
 
@@ -269,7 +300,10 @@ class FixedOnlySpyProxyReplay:
             self.counters["excluded"] += 1
             return False
         ep.confirm_time = confirm_time
-        ep.pending_liq_after = confirm_time
+        if self.lag_minutes > 0:
+            ep.pending_liq_after = confirm_time + timedelta(minutes=self.lag_minutes)
+        else:
+            ep.pending_liq_after = confirm_time
         self.counters["confirms"] += 1
         # if we already have a later SPY bar, liquidate immediately on next feed
         return True
@@ -325,6 +359,8 @@ class FixedOnlySpyProxyReplay:
                 continue
             # P1–P3 schedule from observed sessions / bar time
             for pid in P123:
+                if pid not in ep.sleeves:
+                    continue
                 tgt = p123_target_fraction(pid, ep.open_time, bar_time, ep.sessions)
                 sl = ep.sleeves[pid]
                 if abs(tgt - sl.frac) > EPS and (
@@ -341,18 +377,24 @@ class FixedOnlySpyProxyReplay:
                             sl.schedule(tgt, dt_dec)
 
             for pid, sl in ep.sleeves.items():
-                # same-bar guard counted when pending exists but bar_time <= pending_after
+                # same-bar / lag guard counted when pending exists but not yet eligible
                 if (
                     sl.pending_frac is not None
                     and sl.pending_after is not None
-                    and bar_time <= sl.pending_after
+                    and not sl._eligible(bar_time, sl.pending_after)
                 ):
                     self.counters["same_bar_blocked"] += 1
                 else:
                     sl.apply_pending(bar_time, px)
                 sl.mtm(px)
 
-            if ep.pending_liq_after is not None and bar_time > ep.pending_liq_after:
+            liq_ready = False
+            if ep.pending_liq_after is not None:
+                if self.lag_minutes > 0:
+                    liq_ready = bar_time >= ep.pending_liq_after
+                else:
+                    liq_ready = bar_time > ep.pending_liq_after
+            if liq_ready:
                 ok_all = True
                 for pid, sl in ep.sleeves.items():
                     # apply any remaining pending first

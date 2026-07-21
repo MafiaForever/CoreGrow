@@ -328,6 +328,10 @@ class CgDamageDurationD01DiagMixin:
                 "P5_NO_CHANGEPOINT|P5_NO_STRUCTURE|P5_NO_HYSTERESIS|P5_NO_ABSTENTION,"
                 "p5_full=P5_DYNAMIC_MIRROR,shadow_only=1"
             )
+            self._DamageD01Log(
+                "CG_DAMAGE_D04B_ROBUSTNESS,enable=1,lags=0|5|15,costs_bps=0|1|5,"
+                "eval_only=1,shadow_only=1"
+            )
 
     def _DamageD01Log(self, msg):
         try:
@@ -349,6 +353,9 @@ class CgDamageDurationD01DiagMixin:
             return
         try:
             proxy.on_spy_bar(et, c, tk)
+            rob = getattr(d03b, "robustness", None)
+            if rob is not None and getattr(rob, "enabled", False):
+                rob.on_spy_bar(et, c, tk)
         except Exception:
             pass
 
@@ -360,16 +367,22 @@ class CgDamageDurationD01DiagMixin:
         try:
             act = (lc or {}).get("action")
             eid = (lc or {}).get("episode_id")
+            rob = getattr(d03b, "robustness", None)
             if act == "CONFIRMED_CLOSE" and eid:
                 proxy.on_confirmed_close(eid, t)
+                if rob is not None and getattr(rob, "enabled", False):
+                    rob.on_confirmed_close(eid, t)
             elif act == "RELAPSE_REOPEN" and eid:
                 proxy.on_abandon(eid, "REOPEN")
+                if rob is not None and getattr(rob, "enabled", False):
+                    rob.on_abandon(eid, "REOPEN")
             led = getattr(self, "_dmg_ledger", None)
             cur = led.current_open() if led is not None else None
             if cur is not None and str(getattr(cur, "episode_id", "")) not in proxy.active:
-                proxy.on_open(
-                    cur.episode_id,
-                    getattr(cur, "decision_time", None) or t)
+                ot = getattr(cur, "decision_time", None) or t
+                proxy.on_open(cur.episode_id, ot)
+                if rob is not None and getattr(rob, "enabled", False):
+                    rob.on_open(cur.episode_id, ot)
         except Exception:
             pass
 
