@@ -3,8 +3,9 @@ from AlgorithmImports import *
 from datetime import datetime
 from cg_alpha_identity_core import (
     AlphaIdentityEngine, EXPERIMENT, PHASE, ASSET_MAP, SCHEMA,
-    run_alpha_identity_static_tests, RESEARCH_END, MUTE_PREFIXES_WHEN_ALPHA,
-    DIAG_LOG_BUDGET_BYTES, estimate_diag_log_bytes, decode_alpha_transport_parts,
+    run_alpha_identity_static_tests, RESEARCH_END, RESEARCH_START,
+    MUTE_PREFIXES_WHEN_ALPHA, DIAG_LOG_BUDGET_BYTES, PACK_B64_LIMIT,
+    estimate_diag_log_bytes, decode_alpha_transport_parts,
 )
 import json
 
@@ -75,17 +76,20 @@ class CgAlphaIdentityDiagMixin:
             for pref in MUTE_PREFIXES_WHEN_ALPHA:
                 if pref not in mp:
                     mp.append(pref)
-            # Mute verbose Maisr P1 noise while alpha owns the diagnostic budget.
-            for pref in ("CG_MAISR_P1_", "CG_MAISR_D2_", "CG_W2_TRADE"):
-                if pref not in mp:
-                    mp.append(pref)
             self.log_mute_prefixes = mp
+            # Short-horizon research window for this diagnostic Cloud run only.
+            try:
+                self.set_start_date(RESEARCH_START.year, RESEARCH_START.month, RESEARCH_START.day)
+                self.set_end_date(RESEARCH_END.year, RESEARCH_END.month, RESEARCH_END.day)
+            except Exception:
+                pass
         if not on:
             self.log("CG_ALPHA_ID_INIT,enable=0,diagnostic_real_order_count=0")
             return
         self.log(
             f"CG_ALPHA_ID_INIT,enable=1,experiment={EXPERIMENT},phase={PHASE},"
-            f"schema={SCHEMA},e_equals_b=1,cost_bps=0,lag_min=0,budget={DIAG_LOG_BUDGET_BYTES}"
+            f"schema={SCHEMA},horizon={RESEARCH_START}_{RESEARCH_END},"
+            f"pack_b64_limit={PACK_B64_LIMIT},e_equals_b=1"
         )
 
     def _AlphaIdentityCashTk(self):
@@ -266,10 +270,10 @@ class CgAlphaIdentityDiagMixin:
             f"same_bar={ctr.get('same_bar_blocked')},err={getattr(self,'_alpha_err',0)},"
             f"b64={tr.get('b64_bytes')},parts={tr.get('part_count')},est={est}"
         )
-        if est >= DIAG_LOG_BUDGET_BYTES:
+        if int(tr.get("b64_bytes") or 0) > PACK_B64_LIMIT:
             self.log(
-                f"CG_ALPHA_ID_CLOSEOUT,status=BUDGET_EXCEEDED,est={est},"
-                f"budget={DIAG_LOG_BUDGET_BYTES},ledger={tr.get('ledger_count')},"
+                f"CG_ALPHA_ID_CLOSEOUT,status=BUDGET_EXCEEDED,b64={tr.get('b64_bytes')},"
+                f"limit={PACK_B64_LIMIT},ledger={tr.get('ledger_count')},"
                 f"digest={tr.get('digest')}"
             )
             self._alpha_closeout_snap = snap

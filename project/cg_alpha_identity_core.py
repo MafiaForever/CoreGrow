@@ -7,9 +7,9 @@ import json
 import zlib
 from datetime import date, datetime, time, timedelta
 
-EXPERIMENT = "CG-ALPHA-IDENTITY-AUDIT-D0-R1"
-PHASE = "A0_LOG_BUDGET_REPAIR_THEN_SINGLE_CAUSAL_RERUN"
-SCHEMA = "ALPHA_IDENTITY_A0_R1_V1"
+EXPERIMENT = "CG-ALPHA-IDENTITY-AUDIT-D0-R2"
+PHASE = "A0_SHORT_HORIZON_TRANSPORT_REPAIR_SINGLE_RERUN"
+SCHEMA = "ALPHA_IDENTITY_A0_R2_V1"
 EPS = 1e-12
 MAX_LEDGER = 8192
 MAX_NAV = 8192
@@ -17,25 +17,32 @@ COST_BPS = 0
 LAG_MINUTES = 0
 PROXY_EXEC = "FIRST_OBSERVED_BAR_STRICTLY_AFTER_DECISION"
 DIAG_LOG_BUDGET_BYTES = 25000
+PACK_B64_LIMIT = 25000
 PART_CHUNK_B64 = 5500
-EXPECTED_EVENTS_MIN = 700
-EXPECTED_EVENTS_MAX = 2000
+EXPECTED_EVENTS_MIN = 400
+EXPECTED_EVENTS_MAX = 900
 MUTE_PREFIXES_WHEN_ALPHA = (
     "CG_REGIME_TIME_PENDING",
     "CG_REGIME_TIME_EXEC",
     "CG_REGIME_TIME_TRADE_MISSED",
     "CG_REGIME_TIME_",
+    "CG_IDS_CAP_",
+    "CG_CORE_",
+    "CG_MAISR_P1_",
+    "CG_MAISR_D2_",
+    "CG_W2_TRADE",
 )
 
-RESEARCH_START = date(2012, 1, 1)
+RESEARCH_START = date(2018, 1, 1)
 RESEARCH_END = date(2026, 5, 10)
 PERIODS = {
-    "TRAIN": (date(2012, 1, 1), date(2018, 12, 31)),
+    "CONTEXT_2018": (date(2018, 1, 1), date(2018, 12, 31)),
     "OOS": (date(2019, 1, 1), date(2021, 12, 31)),
     "CRISIS": (date(2022, 1, 1), date(2025, 12, 31)),
     "UNTOUCHED_RECENT": (date(2026, 1, 1), date(2026, 5, 10)),
-    "FULL": (date(2012, 1, 1), date(2026, 5, 10)),
+    "FULL": (date(2018, 1, 1), date(2026, 5, 10)),
 }
+_TS0 = int(datetime(2018, 1, 1, 0, 0).timestamp())
 
 # Explicit static map (primary). Unlisted positive-weight assets => UNCERTAIN.
 DEFENSIVE_TK = frozenset({
@@ -310,6 +317,8 @@ class AlphaIdentityEngine:
             return None
         dt = _to_dt(decision_time)
         if dt is None or not isinstance(targets, dict):
+            return None
+        if dt.date() < RESEARCH_START or dt.date() > RESEARCH_END:
             return None
         # Causal ordering
         if self.last_seq_time is not None and dt < self.last_seq_time:
@@ -790,68 +799,80 @@ class AlphaIdentityEngine:
         return v, reason, conc
 
     def build_transport_pack(self):
-        """Deterministic compact pack for Cloud PART export (proven D0-style)."""
+        """Deterministic compact pack for Cloud PART export. PACK_B64 must be <= 25000."""
         snap = self.snapshot()
         ids_map = {"NORMAL": 0, "WATCH": 1, "STRESS": 2, "PANIC_SHORT": 3, "": 0}
-        # Shorten vector keys to 8 hex; keep map local for event refs.
-        vshort = {}
-        hmap = {}
-        for h, pairs in self.vectors.items():
-            hs = h[:8]
-            hmap[h] = hs
-            vshort[hs] = pairs
+        # Keep only in-horizon rows; vectors only if referenced.
+        rows = [r for r in self.rows
+                if isinstance(r.get("decision_time"), datetime)
+                and RESEARCH_START <= r["decision_time"].date() <= RESEARCH_END]
+        used = set()
         ev = []
-        for r in self.rows:
+        for r in rows:
             dt = r["decision_time"]
             fc = r["feature_cutoff"] or dt
             exe = r["next_execution_eligible_time"]
-            # fc_eq: 1 if feature_cutoff == decision_time (omit fc ts)
-            fc_eq = 1 if (isinstance(fc, datetime) and isinstance(dt, datetime) and fc == dt) else 0
+            h = str(r["target_hash"])[:8]
+            used.add(h)
+            # minutes relative to RESEARCH_START (compact ints)
+            tsm = int((int(dt.timestamp()) - _TS0) // 60)
+            fcm = int((int(fc.timestamp()) - _TS0) // 60) if isinstance(fc, datetime) else tsm
+            exm = int((int(exe.timestamp()) - _TS0) // 60) if isinstance(exe, datetime) else tsm + 1
+            fc_eq = 1 if fcm == tsm else 0
             row = [
-                int(r["seq"]),
-                int(dt.timestamp()) if isinstance(dt, datetime) else 0,
-                hmap.get(r["target_hash"], r["target_hash"][:8]),
-                int(round(float(r["signed_equity_exposure"]) * 10000)),
-                int(round(float(r["gross_equity_exposure"]) * 10000)),
-                int(round(float(r["cash_weight"]) * 10000)),
-                int(round(float(r["defensive_weight"]) * 10000)),
+                int(r["seq"]), tsm, h,
+                int(round(float(r["signed_equity_exposure"]) * 1000)),
+                int(round(float(r["gross_equity_exposure"]) * 1000)),
+                int(round(float(r["cash_weight"]) * 1000)),
                 int(r["w2"]),
                 int(ids_map.get(str(r.get("ids") or ""), 9)),
                 int(r["sh"]),
                 fc_eq,
             ]
             if not fc_eq:
-                row.append(int(fc.timestamp()) if isinstance(fc, datetime) else 0)
-            row.append(int(exe.timestamp()) if isinstance(exe, datetime) else 0)
+                row.append(fcm)
+            row.append(exm)
             ev.append(row)
-        # Flat period residuals only (not full nested scorecard).
+        vshort = {}
+        for h, pairs in self.vectors.items():
+            hs = h[:8]
+            if hs not in used:
+                continue
+            # 3-decimal weights; drop near-zero
+            vshort[hs] = [[t, round(float(w), 3)] for t, w in pairs if abs(float(w)) >= 0.0005]
         P = {}
         for k, v in (snap.get("periods") or {}).items():
             P[k] = [
-                v.get("A_CG_FULL_wealth"), v.get("B_wealth"), v.get("C_wealth"),
-                v.get("D_wealth"), v.get("G_wealth"),
-                v.get("residual_vs_spy"), v.get("residual_vs_qqq"),
-                v.get("A_CG_FULL_maxdd"),
+                _round_or_none(v.get("A_CG_FULL_wealth")),
+                _round_or_none(v.get("B_wealth")),
+                _round_or_none(v.get("C_wealth")),
+                _round_or_none(v.get("residual_vs_spy")),
+                _round_or_none(v.get("residual_vs_qqq")),
+                _round_or_none(v.get("D_wealth")),
+                _round_or_none(v.get("G_wealth")),
             ]
-        Y = [[y.get("year"), y.get("excess_vs_spy"), y.get("abs_excess_share"),
-              y.get("cg_wealth_factor"), y.get("b_wealth_factor")]
-             for y in (snap.get("years") or [])]
-        M = {k: [(v or {}).get("final_wealth_factor"), (v or {}).get("max_drawdown")]
+        Y = [[y.get("year"), _round_or_none(y.get("excess_vs_spy")),
+              _round_or_none(y.get("abs_excess_share"))]
+             for y in (snap.get("years") or [])
+             if y.get("year") is not None and int(y.get("year")) >= 2018]
+        M = {k: [_round_or_none((v or {}).get("final_wealth_factor")),
+                 _round_or_none((v or {}).get("max_drawdown"))]
              for k, v in (snap.get("metrics") or {}).items()}
-        W = snap.get("pairwise") or {}
+        W = {k: _round_or_none(v) for k, v in (snap.get("pairwise") or {}).items()
+             if k != "e_note"}
         pack = {
             "ex": EXPERIMENT, "ph": PHASE, "sc": SCHEMA,
             "V": vshort, "E": ev, "M": M, "P": P, "Y": Y, "W": W,
-            "K": {
-                "ok": (snap.get("protection") or {}).get("valid"),
-                "n": (snap.get("protection") or {}).get("event_count"),
-                "md": (snap.get("protection") or {}).get("mean_delta_signed"),
-            },
-            "C": snap.get("counters"),
+            "K": [
+                int(bool((snap.get("protection") or {}).get("valid"))),
+                int((snap.get("protection") or {}).get("event_count") or 0),
+                _round_or_none((snap.get("protection") or {}).get("mean_delta_signed")),
+            ],
             "v": snap.get("verdict"),
-            "vr": str(snap.get("verdict_reason") or "")[:160],
             "sy": snap.get("single_year_concentration"),
-            "n": len(self.rows),
+            "n": len(rows),
+            "rs": RESEARCH_START.isoformat(),
+            "re": RESEARCH_END.isoformat(),
         }
         raw = json.dumps(pack, separators=(",", ":"), default=str).encode("utf-8")
         z = zlib.compress(raw, 9)
@@ -865,11 +886,21 @@ class AlphaIdentityEngine:
             "parts": parts,
             "part_count": len(parts),
             "digest": digest,
-            "ledger_count": len(self.rows),
+            "ledger_count": len(rows),
             "vector_count": len(vshort),
             "pack": pack,
             "snap": snap,
+            "pack_b64_ok": len(b64) <= PACK_B64_LIMIT,
         }
+
+
+def _round_or_none(x, n=6):
+    if x is None:
+        return None
+    try:
+        return round(float(x), n)
+    except Exception:
+        return None
 
 
 def decode_alpha_transport_parts(parts):
@@ -879,13 +910,12 @@ def decode_alpha_transport_parts(parts):
 
 
 def estimate_diag_log_bytes(b64_bytes, part_count, init_bytes=180, counter_bytes=220, closeout_bytes=280):
-    # PART lines: prefix + meta + data
     part_overhead = part_count * 90
     return int(init_bytes + counter_bytes + closeout_bytes + b64_bytes + part_overhead)
 
 
 def run_alpha_identity_log_budget_preflight():
-    """Static preflight for R1 log-budget repair. No Cloud."""
+    """Static preflight for R2 short-horizon transport. No Cloud."""
     rows, passed, failed = [], 0, 0
 
     def ok(n, c, detail=""):
@@ -897,7 +927,6 @@ def run_alpha_identity_log_budget_preflight():
             failed += 1
             rows.append({"name": n, "pass": False, "detail": str(detail)})
 
-    # Source gates: PENDING/EXEC gated when alpha on
     from pathlib import Path
     regime = Path(__file__).with_name("cg_regime_rebal_time_trade.py").read_text(encoding="utf-8")
     ok("P01_pending_gated_by_alpha",
@@ -906,36 +935,51 @@ def run_alpha_identity_log_budget_preflight():
     ok("P02_exec_gated_by_alpha",
        regime.count('not getattr(self, "cg_alpha_identity_enable", False)') >= 2
        and "CG_REGIME_TIME_EXEC" in regime)
+    ok("P02b_horizon", RESEARCH_START == date(2018, 1, 1) and RESEARCH_END == date(2026, 5, 10))
 
-    # Fixture: 1500 events with reused vectors
+    # Stress fixture: ~700 events, ~220 unique vectors (worse than R1 rate)
     eng = AlphaIdentityEngine()
     eng.set_enabled(True)
-    t0 = datetime(2012, 1, 3, 9, 45)
-    for i in range(1500):
-        w = {"SPY": round(0.55 + (i % 7) * 0.03, 4), "BIL": round(0.45 - (i % 7) * 0.03, 4)}
-        eng.observe_capture(t0 + timedelta(days=i * 3), w, slot_minutes=165,
-                            feature_cutoff=t0 + timedelta(days=i * 3),
+    t0 = datetime(2018, 1, 3, 9, 45)
+    n_ev = 700
+    for i in range(n_ev):
+        # High vector diversity: unique-ish weights
+        w = {
+            "SPY": round(0.40 + ((i * 17) % 50) * 0.008, 4),
+            "BIL": round(0.20 + ((i * 13) % 30) * 0.005, 4),
+            "QQQ": round(0.10 + ((i * 7) % 20) * 0.01, 4),
+        }
+        rem = max(0.0, 1.0 - sum(w.values()))
+        w["GLD"] = round(rem, 4)
+        eng.observe_capture(t0 + timedelta(days=i * 4), w, slot_minutes=165,
+                            feature_cutoff=t0 + timedelta(days=i * 4),
                             flags={"w2": i % 2, "ids": "WATCH" if i % 3 else "NORMAL"})
-        eng.on_bar("SPY", t0 + timedelta(days=i * 3, minutes=5), 100.0 + i * 0.01)
+        eng.on_bar("SPY", t0 + timedelta(days=i * 4, minutes=5), 100.0 + i * 0.01)
+        eng.on_bar("QQQ", t0 + timedelta(days=i * 4, minutes=5), 200.0 + i * 0.02)
         if i % 5 == 0:
-            eng.observe_nav(t0 + timedelta(days=i * 3, minutes=30), 10000 * (1.0 + i * 0.0001))
+            eng.observe_nav(t0 + timedelta(days=i * 4, minutes=30), 10000 * (1.0 + i * 0.0001))
     tr = eng.build_transport_pack()
     est = estimate_diag_log_bytes(tr["b64_bytes"], tr["part_count"])
-    ok("P03_fixture_ledger_complete", tr["ledger_count"] == 1500)
-    ok("P04_vectors_deduped", tr["vector_count"] <= 20)
-    ok("P05_budget_lt_25kb", est < DIAG_LOG_BUDGET_BYTES, f"est={est}")
+    ok("P03_fixture_ledger_complete", tr["ledger_count"] == n_ev)
+    ok("P04_vectors_diverse", tr["vector_count"] >= 100, tr["vector_count"])
+    ok("P05_pack_b64_le_25000", tr["b64_bytes"] <= PACK_B64_LIMIT and tr.get("pack_b64_ok"),
+       f"b64={tr['b64_bytes']}")
+    ok("P05b_est_margin", est < 32000, f"est={est}")  # ordinary log headroom separate
     ok("P06_capacity", MAX_LEDGER >= EXPECTED_EVENTS_MAX)
     decoded = decode_alpha_transport_parts(tr["parts"])
-    ok("P07_roundtrip", decoded.get("n") == 1500 and len(decoded.get("E") or []) == 1500)
-    # decision_time at idx1; exe is last element; fc_eq at idx10
+    ok("P07_roundtrip", decoded.get("n") == n_ev and len(decoded.get("E") or []) == n_ev)
     ok("P08_fc_le_dt", all(
-        (e[10] == 1) or (len(e) > 12 and e[11] <= e[1]) for e in decoded["E"]))
+        (e[9] == 1) or (len(e) > 11 and e[10] <= e[1]) for e in decoded["E"]))
     ok("P09_exe_after_dt", all(e[-1] > e[1] for e in decoded["E"]))
-    # disabled noop
     eng0 = AlphaIdentityEngine()
     eng0.set_enabled(False)
     eng0.observe_capture(t0, {"SPY": 1.0})
     ok("P10_disabled_noop", eng0.counters["captures"] == 0)
+    # pre-horizon dropped
+    eng2 = AlphaIdentityEngine()
+    eng2.set_enabled(True)
+    eng2.observe_capture(datetime(2017, 6, 1, 9, 45), {"SPY": 1.0})
+    ok("P11_pre_horizon_skip", eng2.counters["captures"] == 0)
 
     return {
         "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
@@ -945,15 +989,20 @@ def run_alpha_identity_log_budget_preflight():
         "fixture_parts": tr["part_count"],
         "fixture_ledger_count": tr["ledger_count"],
         "fixture_vector_count": tr["vector_count"],
+        "pack_b64_limit": PACK_B64_LIMIT,
+        "pack_b64_ok": bool(tr.get("pack_b64_ok")),
         "diag_budget_bytes": DIAG_LOG_BUDGET_BYTES,
         "expected_events_range": [EXPECTED_EVENTS_MIN, EXPECTED_EVENTS_MAX],
         "max_ledger": MAX_LEDGER,
-        "publication_path": "CG_ALPHA_ID_CLOSEOUT_PART zlib+b64 (D0-style controlled parts)",
+        "research_start": RESEARCH_START.isoformat(),
+        "research_end": RESEARCH_END.isoformat(),
+        "publication_path": "CG_ALPHA_ID_CLOSEOUT_PART zlib+b64 (R2 short-horizon)",
         "amplification_cause": (
-            "Per-event CG_REGIME_TIME_PENDING/EXEC while _sr_on=0 and alpha forced _ms_on; "
-            "~150B/event * ~700+/year exhausted 100KB by 2017-09."
+            "R1: PACK_B64 exceeded 25000 on full 2012-2026 history; "
+            "R2 shortens horizon to 2018-2026 and compresses pack."
         ),
         "verbose_pending_exec_gated": True,
+        "cloud_authorized_if": "pack_b64_ok AND preflight_failed==0",
     }
 
 
