@@ -348,6 +348,14 @@ class CgRegimeRebalTimeTradeMixin:
         except Exception:
             pass
         self._RtTradeSaveLive()
+        # D0.6B P0: passive intended-target observe (copy gross only; no mutation).
+        try:
+            if bool(getattr(self, "cg_damage_duration_d06b_p0_enable", False)):
+                obs = getattr(self, "_D06bP0ObserveIntended", None)
+                if callable(obs):
+                    obs(getattr(self, "time", None), self._cg_rt_pending)
+        except Exception:
+            pass
         return False
 
     def CgRegimeRebalTimeTradeMaybeRun(self, combined, reduce_only=False, force_immediate=False) -> None:

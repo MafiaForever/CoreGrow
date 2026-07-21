@@ -271,6 +271,14 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
                 )
             self._cg_w2_last_active = active
             self._cg_w2_last_eq = eq_a
+            # D0.6B P0: passive equity-gross observe only (no target mutation).
+            try:
+                if bool(getattr(self, "cg_damage_duration_d06b_p0_enable", False)):
+                    obs = getattr(self, "_D06bP0ObserveProtection", None)
+                    if callable(obs):
+                        obs(getattr(self, "time", None), eq_b, eq_a, active)
+            except Exception:
+                pass
 
         # E2 second
         if e2_on:

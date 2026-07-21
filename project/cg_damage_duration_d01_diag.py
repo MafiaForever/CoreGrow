@@ -55,6 +55,8 @@ class CgDamageDurationD01DiagMixin:
             "cg_damage_duration_d03b_cloud_transport_quiet_enable", "0")
         self.cg_damage_duration_d05b_enable = _bool(
             "cg_damage_duration_d05b_enable", "0")
+        self.cg_damage_duration_d06b_p0_enable = _bool(
+            "cg_damage_duration_d06b_p0_enable", "0")
         # Audit-only: record quiet override source (QC > RRX fallback > hard default).
         try:
             qv = self.get_parameter(
@@ -339,6 +341,57 @@ class CgDamageDurationD01DiagMixin:
                     "CG_DAMAGE_D05B_MODEL_B,enable=1,variant=P5B_SOFT_CONFIDENCE_BLEND,"
                     "lags=0|5,costs_bps=0|1|5,shadow_only=1"
                 )
+        # D0.6B P0 ledger (diagnostic); may run with fixed-only for historical replay.
+        if bool(getattr(self, "cg_damage_duration_d06b_p0_enable", False)):
+            try:
+                from cg_damage_duration_d06b_p0_ledger import P0EventLedger
+                from cg_damage_duration_d06b_p0_replay import P0HistoricalReplayBank
+                self._dmg_p0 = P0EventLedger()
+                self._dmg_p0.set_enabled(True)
+                if self._dmg_d03b is not None:
+                    self._dmg_d03b.p0_ledger = self._dmg_p0
+                    self._dmg_d03b.p0_replay = P0HistoricalReplayBank()
+                    self._dmg_d03b.d06b_enable = True
+                self._DamageD01Log(
+                    "CG_DAMAGE_D06B_P0,enable=1,space=equity_gross,"
+                    "hook=CgDefensiveTradeApply+Capture,shadow_only=1"
+                )
+            except Exception:
+                self._dmg_p0 = None
+
+    def _D06bP0ObserveProtection(self, decision_time, eq_b, eq_a, w2_active):
+        led = getattr(self, "_dmg_p0", None)
+        if led is None:
+            return
+        try:
+            led.observe_protection_apply(decision_time, eq_b, eq_a, w2_active)
+        except Exception:
+            pass
+
+    def _D06bP0ObserveIntended(self, decision_time, targets):
+        led = getattr(self, "_dmg_p0", None)
+        if led is None or not isinstance(targets, dict):
+            return
+        try:
+            eq_set = self._DftEqSet() if hasattr(self, "_DftEqSet") else set()
+            eq_g = self._DftEqGross(targets, eq_set) if hasattr(self, "_DftEqGross") else None
+            led.observe_intended_targets(decision_time, targets, eq_g)
+        except Exception:
+            pass
+
+    def _D06bP0BindOpen(self, episode_id, decision_time, protection_source):
+        led = getattr(self, "_dmg_p0", None)
+        if led is None:
+            return
+        try:
+            led.bind_episode(episode_id, decision_time, protection_source)
+            d03b = getattr(self, "_dmg_d03b", None)
+            if d03b is not None and led.is_not_applicable(episode_id):
+                pr = getattr(d03b, "p0_replay", None)
+                if pr is not None:
+                    pr.mark_not_applicable(episode_id)
+        except Exception:
+            pass
 
     def _DamageD01Log(self, msg):
         try:
@@ -470,6 +523,9 @@ class CgDamageDurationD01DiagMixin:
             skip_open = bool(lc.get("mutated"))
             if active and not prev and not skip_open:
                 led.observe_open_trigger(EV_PROTECTION, t, src, bars)
+                cur0 = led.current_open()
+                if cur0 is not None:
+                    self._D06bP0BindOpen(cur0.episode_id, t, src)
             # D0.1-only path: B1 residual pass-through (unresolved when B1 off; D0.2A replaces)
             if not getattr(self, "cg_damage_duration_d02_enable", False) and not skip_open:
                 vp = getattr(self, "_resid_last_variant_pass", None)
@@ -544,6 +600,9 @@ class CgDamageDurationD01DiagMixin:
             skip_open = bool(lc.get("mutated"))
             if active and not prev and not skip_open:
                 led.observe_open_trigger(EV_PROTECTION, t, src, bars)
+                cur0 = led.current_open()
+                if cur0 is not None:
+                    self._D06bP0BindOpen(cur0.episode_id, t, src)
             if sens_snap is not None and not skip_open:
                 sens.attach_to_ledger(led, sens_snap, protection_source=src,
                                       bar_end_times=bars, checkpoint_key=ck)
@@ -593,15 +652,24 @@ class CgDamageDurationD01DiagMixin:
                     sb_acc = dict(snap_b)
                     if sb_acc.get("action_eligible_time") in (None,):
                         sb_acc["action_eligible_time"] = act
+                    ie_g = None
+                    try:
+                        pend = getattr(self, "_cg_rt_pending", None)
+                        if isinstance(pend, dict) and hasattr(self, "_DftEqGross"):
+                            ie_g = self._DftEqGross(pend, self._DftEqSet())
+                    except Exception:
+                        ie_g = None
                     d03b.update(
                         sb_acc, snap_c if snap_c is not None else getattr(d02c, "last_snapshot", None),
                         shadow_out,
                         d03b_enabled=bool(getattr(self, "cg_damage_duration_d03b_enable", False)),
-                        prod_state={"production_nav_read_only": nav},
+                        prod_state={"production_nav_read_only": nav, "intended_eq_gross": ie_g},
                         fixed_only_shadow_enable=bool(
                             getattr(self, "cg_damage_duration_d03b_fixed_only_shadow_enable", False)),
                         d05b_enable=bool(
                             getattr(self, "cg_damage_duration_d05b_enable", False)),
+                        d06b_enable=bool(
+                            getattr(self, "cg_damage_duration_d06b_p0_enable", False)),
                     )
             self._dmg_prev_prot = active
             self._dmg_d02_ctr = dict(sens.counters)

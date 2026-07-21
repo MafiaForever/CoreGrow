@@ -39,6 +39,13 @@ from cg_damage_duration_d05b_core import P5B_SOFT_CONFIDENCE_BLEND
 from cg_damage_duration_d05b_proxy import (
     ModelBChallengerBank, enrich_proxy_snap_d05b, run_d05b_proxy_static_tests,
 )
+from cg_damage_duration_d06b_p0_ledger import (
+    P0_SOURCE_NAME as D06B_P0_SOURCE_NAME, run_d06b_ledger_static_tests,
+)
+from cg_damage_duration_d06b_p0_replay import (
+    P0_CURRENT as D06B_P0_CURRENT, enrich_proxy_snap_d06b,
+    run_d06b_replay_static_tests,
+)
 
 FORBIDDEN_RE = re.compile(
     r"(?<![A-Za-z_])(History|AddEquity|AddData|SetHoldings|MarketOrder|LimitOrder|"
@@ -65,6 +72,9 @@ class ModelAShadowRuntimeAccounting:
         self.robustness = ModelARobustnessGrid()
         self.model_b = ModelBChallengerBank()
         self.d05b_enable = False
+        self.d06b_enable = False
+        self.p0_ledger = None
+        self.p0_replay = None
         self.p0_audit = dict(P0_AUDIT)
         self.counters = {
             "snapshots": 0, "duplicate_blocked": 0, "stale_blocked": 0,
@@ -84,6 +94,9 @@ class ModelAShadowRuntimeAccounting:
         mb = self.model_b
         if mb is not None and getattr(mb, "enabled", False):
             mb.on_spy_bar(et, c, tk)
+        pr = self.p0_replay
+        if pr is not None and getattr(pr, "enabled", False):
+            pr.on_spy_bar(et, c, tk)
 
     def on_proxy_life(self, act, eid, t, cur_open=None):
         proxy = self.proxy
@@ -91,18 +104,23 @@ class ModelAShadowRuntimeAccounting:
             return
         rob = self.robustness
         mb = self.model_b
+        pr = self.p0_replay
         if act == "CONFIRMED_CLOSE" and eid:
             proxy.on_confirmed_close(eid, t)
             if rob is not None and getattr(rob, "enabled", False):
                 rob.on_confirmed_close(eid, t)
             if mb is not None and getattr(mb, "enabled", False):
                 mb.on_confirmed_close(eid, t)
+            if pr is not None and getattr(pr, "enabled", False):
+                pr.on_confirmed_close(eid, t)
         elif act == "RELAPSE_REOPEN" and eid:
             proxy.on_abandon(eid, "REOPEN")
             if rob is not None and getattr(rob, "enabled", False):
                 rob.on_abandon(eid, "REOPEN")
             if mb is not None and getattr(mb, "enabled", False):
                 mb.on_abandon(eid, "REOPEN")
+            if pr is not None and getattr(pr, "enabled", False):
+                pr.on_abandon(eid, "REOPEN")
         if cur_open is not None and str(getattr(cur_open, "episode_id", "")) not in proxy.active:
             ot = getattr(cur_open, "decision_time", None) or t
             proxy.on_open(cur_open.episode_id, ot)
@@ -110,18 +128,24 @@ class ModelAShadowRuntimeAccounting:
                 rob.on_open(cur_open.episode_id, ot)
             if mb is not None and getattr(mb, "enabled", False):
                 mb.on_open(cur_open.episode_id, ot)
+            if pr is not None and getattr(pr, "enabled", False):
+                pr.on_open(cur_open.episode_id, ot)
 
     def update(self, snap_b, snap_c, shadow_out, d03b_enabled=True, prod_state=None,
-               fixed_only_shadow_enable=False, d05b_enable=False):
+               fixed_only_shadow_enable=False, d05b_enable=False, d06b_enable=False):
         if not d03b_enabled:
             return None
         self.enabled = True
         self.fixed_only = bool(fixed_only_shadow_enable)
         self.d05b_enable = bool(d05b_enable) and self.fixed_only
+        self.d06b_enable = bool(d06b_enable) and self.fixed_only
         self.proxy.set_enabled(self.fixed_only)
         self.ablation.set_enabled(self.fixed_only)
         self.robustness.set_enabled(self.fixed_only)
         self.model_b.set_enabled(self.d05b_enable)
+        if self.p0_replay is not None:
+            self.p0_replay.set_enabled(self.d06b_enable)
+        # Ledger is owned/enabled by d01 init; never force-disable here.
         if snap_b is None or shadow_out is None:
             return None
         b = deepcopy(snap_b)
@@ -169,6 +193,29 @@ class ModelAShadowRuntimeAccounting:
             feature_cutoff=fc if isinstance(fc, datetime) else None,
         )
         self.p0_audit = audit
+
+        # D0.6B: event-time ledger overrides P0 numeric only when enabled+eligible.
+        eid_early = get(b, "episode_id")
+        if self.d06b_enable and self.p0_ledger is not None and eid_early not in (
+                None, UNAVAILABLE):
+            cur_g = None
+            if prod_state and prod_state.get("intended_eq_gross") is not None:
+                cur_g = prod_state.get("intended_eq_gross")
+            frac_led = self.p0_ledger.observe_checkpoint(
+                eid_early, dt if isinstance(dt, datetime) else None, cur_g)
+            if self.p0_ledger.is_not_applicable(eid_early):
+                p0_frac, p0_name, p0_conf = UNAVAILABLE, D06B_P0_SOURCE_NAME, 0.0
+                audit = dict(audit)
+                audit["verdict"] = "P0_NOT_APPLICABLE_ZERO_WITHHELD"
+                audit["accepted_source"] = D06B_P0_SOURCE_NAME
+                audit["d06b"] = True
+            elif self.p0_ledger.is_eligible(eid_early) and frac_led != UNAVAILABLE:
+                p0_frac, p0_name, p0_conf = frac_led, D06B_P0_SOURCE_NAME, 1.0
+                audit = dict(audit)
+                audit["verdict"] = "D06B_EVENT_TIME_CAPTURE"
+                audit["accepted_source"] = D06B_P0_SOURCE_NAME
+                audit["d06b"] = True
+            self.p0_audit = audit
 
         nav = get(b, "NAV") if get(b, "NAV") != UNAVAILABLE else get(b, "production_nav_read_only")
         if nav == UNAVAILABLE and prod_state and prod_state.get("production_nav_read_only") is not None:
@@ -244,6 +291,14 @@ class ModelAShadowRuntimeAccounting:
                 }
                 self.model_b.on_checkpoint(
                     dt if isinstance(dt, datetime) else None, eid, fm_b)
+            if self.d06b_enable and self.p0_replay is not None:
+                fm_p0 = dict(fm)
+                fm_p0[D06B_P0_CURRENT] = p0_frac
+                if self.p0_ledger is not None and self.p0_ledger.is_not_applicable(eid):
+                    self.p0_replay.mark_not_applicable(eid)
+                else:
+                    self.p0_replay.on_checkpoint(
+                        dt if isinstance(dt, datetime) else None, eid, fm_p0)
 
         self.last_checkpoint = ck
         if ck is not None:
@@ -263,9 +318,11 @@ class ModelAShadowRuntimeAccounting:
             "p0_source_name": p0_name,
             "p0_source_confidence": p0_conf,
             "p0_verdict": audit.get("verdict", P0_SOURCE_VERDICT),
-            "p0_comparison_eligible": False,
+            "p0_comparison_eligible": bool(
+                self.d06b_enable and audit.get("verdict") == "D06B_EVENT_TIME_CAPTURE"),
             "timestamp_gate": "PASS" if ok_ts else "FAIL",
             "fixed_only_shadow_enable": self.fixed_only,
+            "d06b_enable": self.d06b_enable,
         }
         if self.fixed_only:
             result.update({
@@ -299,12 +356,18 @@ class ModelAShadowRuntimeAccounting:
             self.robustness.finalize_eoa()
             if self.d05b_enable:
                 self.model_b.finalize_eoa()
+            if self.d06b_enable and self.p0_replay is not None:
+                self.p0_replay.finalize_eoa()
             proxy_snap = enrich_proxy_snap_d04a(self.proxy.snapshot())
             proxy_snap = enrich_proxy_snap_d04b(
                 proxy_snap, self.robustness.snapshot())
             if self.d05b_enable:
                 proxy_snap = enrich_proxy_snap_d05b(
                     proxy_snap, self.model_b.snapshot())
+            if self.d06b_enable:
+                led_snap = self.p0_ledger.snapshot() if self.p0_ledger else {}
+                pr_snap = self.p0_replay.snapshot() if self.p0_replay else {}
+                proxy_snap = enrich_proxy_snap_d06b(proxy_snap, led_snap, pr_snap)
         return build_compact_closeout(
             self.aggregates,
             runtime_counters=self.counters,
@@ -628,6 +691,44 @@ def run_damage_d03b1_static_tests(param_map=None):
         else:
             failed += 1
 
+    d06b = run_d06b_replay_static_tests()
+    ok("B08d_d06b_suite", d06b.get("failed", 1) == 0, detail=str(d06b.get("failed")))
+    for brow in d06b.get("rows") or []:
+        rows.append({"name": "P0_" + brow["name"], "pass": brow["pass"], "detail": brow.get("detail", "")})
+        if brow["pass"]:
+            passed += 1
+        else:
+            failed += 1
+
+    # D0.6B: disabled path keeps legacy P0 unobservable; enable path uses ledger.
+    ok("B08e_d06b_flag_default_off",
+       RRX_PARAMS.get("cg_damage_duration_d06b_p0_enable") == "0")
+    from cg_damage_duration_d06b_p0_ledger import P0EventLedger
+    from cg_damage_duration_d06b_p0_replay import P0HistoricalReplayBank
+    rt_p0 = ModelAShadowRuntimeAccounting()
+    rt_p0.p0_ledger = P0EventLedger()
+    rt_p0.p0_ledger.set_enabled(True)
+    rt_p0.p0_replay = P0HistoricalReplayBank()
+    t_w2 = datetime(2024, 3, 11, 9, 45, 0)
+    rt_p0.p0_ledger.observe_protection_apply(t_w2, 1.0, 0.8, True)
+    rt_p0.p0_ledger.bind_episode("EP_P0", t0, "W2")
+    sb3 = _snap_b(t0, 60)
+    sb3["episode_id"] = "EP_P0"
+    sb3["decision_time"] = t0
+    sb3["feature_cutoff"] = t0 - timedelta(minutes=5)
+    sb3["action_eligible_time"] = t0 + timedelta(minutes=5)
+    sh3 = ModelAShadowRouter().update(sb3, _snap_c(t0, 60))
+    out_p0 = rt_p0.update(
+        sb3, _snap_c(t0, 60), sh3, d03b_enabled=True,
+        fixed_only_shadow_enable=True, d06b_enable=True,
+        prod_state={"intended_eq_gross": 0.9})
+    ok("B08f_d06b_p0_numeric",
+       out_p0.get("p0_source_name") == D06B_P0_SOURCE_NAME
+       and abs(float(out_p0.get("p0_numeric_restore_fraction")) - 0.5) < 1e-9)
+    ok("B08g_d06b_comparison_flag", out_p0.get("p0_comparison_eligible") is True)
+    # Frozen P1-P5 path when d06b off: p0 still UNAVAILABLE
+    ok("B08h_p1p5_frozen_when_off", out_fo["p0_numeric_restore_fraction"] == UNAVAILABLE)
+
     # D0.4A proxy extras present on fixed-only runtime
     ok("B09_d04a_proxy_extras",
        P5_FULL in getattr(rt_fo.proxy, "policy_ids", ())
@@ -656,6 +757,7 @@ def run_damage_d03b1_static_tests(param_map=None):
         "d04a_ablation": d04,
         "d04b_robustness": d04b,
         "d05b_model_b": d05b,
+        "d06b_p0": d06b,
         "eoa_payload_size_bytes": cex.get("eoa_payload_size_bytes"),
         "d01": d01, "d03a": d03a, "p4_repair": p4,
     }
