@@ -285,11 +285,12 @@ class CgRegimeRebalTimeTradeMixin(CgAlphaIdentityDiagMixin):
             )
         except Exception:
             self._cg_rt_pending_ts = self.time
-        self.log(
-            f"CG_REGIME_TIME_PENDING,date={pd},regime={self._cg_rt_pending_regime},"
-            f"slot={slot},target_count={len(targets)},"
-            f"gross={_rtt_gross(targets):.4f},restored=1"
-        )
+        if not getattr(self, "cg_alpha_identity_enable", False):
+            self.log(
+                f"CG_REGIME_TIME_PENDING,date={pd},regime={self._cg_rt_pending_regime},"
+                f"slot={slot},target_count={len(targets)},"
+                f"gross={_rtt_gross(targets):.4f},restored=1"
+            )
 
     def CgRegimeRebalTimeTradeCapture(self, combined, regime, reduce_only=False, force_immediate=False) -> bool:
         """Return True => execute now; False => deferred (do not ExecuteTargets)."""
@@ -346,9 +347,10 @@ class CgRegimeRebalTimeTradeMixin(CgAlphaIdentityDiagMixin):
         self._cg_rt_pending_ts = self.time
         self._cg_rt_n_def += 1
         prev_rg = getattr(self, "_cg_rt_last_regime_log", None)
-        # Suppress per-event pending logs when shadow/MAISR diag is active
-        # to preserve QC log budget for final diagnostic lines.
+        # Suppress per-event pending logs when shadow is active OR alpha-identity
+        # diagnostic owns the log budget (R1: no PENDING flood).
         if (not getattr(self, "_sr_on", False)
+                and not getattr(self, "cg_alpha_identity_enable", False)
                 and (slot != _SIGNAL_SLOT or rg != prev_rg)):
             self.log(
                 f"CG_REGIME_TIME_PENDING,date={self._cg_rt_pending_date},"
@@ -447,7 +449,8 @@ class CgRegimeRebalTimeTradeMixin(CgAlphaIdentityDiagMixin):
                 self.ExecuteTargets(targets)
             self._cg_rt_pending_executed = True
             self._cg_rt_n_exe += 1
-            if not getattr(self, "_sr_on", False):
+            if (not getattr(self, "_sr_on", False)
+                    and not getattr(self, "cg_alpha_identity_enable", False)):
                 self.log(
                     f"CG_REGIME_TIME_EXEC,date={d},"
                     f"regime={self._cg_rt_pending_regime},slot={slot_minutes},"

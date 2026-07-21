@@ -1,19 +1,31 @@
 # cg_alpha_identity_core.py -- CG-ALPHA-IDENTITY-AUDIT-D0 pure diagnostics.
 # No orders, subscriptions, target mutations, or holdings-derived targets.
 from __future__ import annotations
+import base64
 import hashlib
 import json
+import zlib
 from datetime import date, datetime, time, timedelta
 
-EXPERIMENT = "CG-ALPHA-IDENTITY-AUDIT-D0"
-PHASE = "A0_CAUSAL_PRODUCTION_PATH_CAPTURE_AND_COUNTERFACTUAL_AUDIT"
-SCHEMA = "ALPHA_IDENTITY_A0_V1"
+EXPERIMENT = "CG-ALPHA-IDENTITY-AUDIT-D0-R1"
+PHASE = "A0_LOG_BUDGET_REPAIR_THEN_SINGLE_CAUSAL_RERUN"
+SCHEMA = "ALPHA_IDENTITY_A0_R1_V1"
 EPS = 1e-12
 MAX_LEDGER = 8192
 MAX_NAV = 8192
 COST_BPS = 0
 LAG_MINUTES = 0
 PROXY_EXEC = "FIRST_OBSERVED_BAR_STRICTLY_AFTER_DECISION"
+DIAG_LOG_BUDGET_BYTES = 25000
+PART_CHUNK_B64 = 5500
+EXPECTED_EVENTS_MIN = 700
+EXPECTED_EVENTS_MAX = 2000
+MUTE_PREFIXES_WHEN_ALPHA = (
+    "CG_REGIME_TIME_PENDING",
+    "CG_REGIME_TIME_EXEC",
+    "CG_REGIME_TIME_TRADE_MISSED",
+    "CG_REGIME_TIME_",
+)
 
 RESEARCH_START = date(2012, 1, 1)
 RESEARCH_END = date(2026, 5, 10)
@@ -248,6 +260,7 @@ class AlphaIdentityEngine:
         self.nav_path = []  # (datetime, nav) for A_CG_FULL
         self.last_hash = None
         self.last_seq_time = None
+        self.vectors = {}  # hash -> compact weight pairs (deduped; events keep event-time)
         self.sleeves = {p: _Sleeve() for p in PATHS if p != "A_CG_FULL"}
         # E mirrors B
         self.spy_px = None
@@ -305,10 +318,13 @@ class AlphaIdentityEngine:
         an = analyze_targets(targets, cash_tk)
         if an["uncertain"]:
             self.counters["uncertain_weight_events"] += 1
-        if an["target_hash"] == self.last_hash and self.rows and self.rows[-1].get("decision_date") == dt.date().isoformat():
-            self.counters["duplicate_hash_blocked"] += 1
-            # still allow if exposures changed flags-only? skip duplicate same-day identical hash
-            return None
+        # Always keep event-time rows. Deduplicate weight vectors by hash only.
+        if an["target_hash"] not in self.vectors:
+            self.vectors[an["target_hash"]] = [
+                [t, round(float(w), 6)] for t, w in sorted(an["weights"].items())
+            ]
+        elif an["target_hash"] == self.last_hash:
+            self.counters["duplicate_hash_blocked"] += 1  # vector reuse, event still stored
         self.seq += 1
         fc = _to_dt(feature_cutoff) if feature_cutoff is not None else dt
         if fc is not None and fc > dt:
@@ -773,6 +789,194 @@ class AlphaIdentityEngine:
             )
         return v, reason, conc
 
+    def build_transport_pack(self):
+        """Deterministic compact pack for Cloud PART export (proven D0-style)."""
+        snap = self.snapshot()
+        ids_map = {"NORMAL": 0, "WATCH": 1, "STRESS": 2, "PANIC_SHORT": 3, "": 0}
+        # Shorten vector keys to 8 hex; keep map local for event refs.
+        vshort = {}
+        hmap = {}
+        for h, pairs in self.vectors.items():
+            hs = h[:8]
+            hmap[h] = hs
+            vshort[hs] = pairs
+        ev = []
+        for r in self.rows:
+            dt = r["decision_time"]
+            fc = r["feature_cutoff"] or dt
+            exe = r["next_execution_eligible_time"]
+            # fc_eq: 1 if feature_cutoff == decision_time (omit fc ts)
+            fc_eq = 1 if (isinstance(fc, datetime) and isinstance(dt, datetime) and fc == dt) else 0
+            row = [
+                int(r["seq"]),
+                int(dt.timestamp()) if isinstance(dt, datetime) else 0,
+                hmap.get(r["target_hash"], r["target_hash"][:8]),
+                int(round(float(r["signed_equity_exposure"]) * 10000)),
+                int(round(float(r["gross_equity_exposure"]) * 10000)),
+                int(round(float(r["cash_weight"]) * 10000)),
+                int(round(float(r["defensive_weight"]) * 10000)),
+                int(r["w2"]),
+                int(ids_map.get(str(r.get("ids") or ""), 9)),
+                int(r["sh"]),
+                fc_eq,
+            ]
+            if not fc_eq:
+                row.append(int(fc.timestamp()) if isinstance(fc, datetime) else 0)
+            row.append(int(exe.timestamp()) if isinstance(exe, datetime) else 0)
+            ev.append(row)
+        # Flat period residuals only (not full nested scorecard).
+        P = {}
+        for k, v in (snap.get("periods") or {}).items():
+            P[k] = [
+                v.get("A_CG_FULL_wealth"), v.get("B_wealth"), v.get("C_wealth"),
+                v.get("D_wealth"), v.get("G_wealth"),
+                v.get("residual_vs_spy"), v.get("residual_vs_qqq"),
+                v.get("A_CG_FULL_maxdd"),
+            ]
+        Y = [[y.get("year"), y.get("excess_vs_spy"), y.get("abs_excess_share"),
+              y.get("cg_wealth_factor"), y.get("b_wealth_factor")]
+             for y in (snap.get("years") or [])]
+        M = {k: [(v or {}).get("final_wealth_factor"), (v or {}).get("max_drawdown")]
+             for k, v in (snap.get("metrics") or {}).items()}
+        W = snap.get("pairwise") or {}
+        pack = {
+            "ex": EXPERIMENT, "ph": PHASE, "sc": SCHEMA,
+            "V": vshort, "E": ev, "M": M, "P": P, "Y": Y, "W": W,
+            "K": {
+                "ok": (snap.get("protection") or {}).get("valid"),
+                "n": (snap.get("protection") or {}).get("event_count"),
+                "md": (snap.get("protection") or {}).get("mean_delta_signed"),
+            },
+            "C": snap.get("counters"),
+            "v": snap.get("verdict"),
+            "vr": str(snap.get("verdict_reason") or "")[:160],
+            "sy": snap.get("single_year_concentration"),
+            "n": len(self.rows),
+        }
+        raw = json.dumps(pack, separators=(",", ":"), default=str).encode("utf-8")
+        z = zlib.compress(raw, 9)
+        b64 = base64.b64encode(z).decode("ascii")
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        parts = [b64[i:i + PART_CHUNK_B64] for i in range(0, len(b64), PART_CHUNK_B64)] or [""]
+        return {
+            "raw_bytes": len(raw),
+            "zlib_bytes": len(z),
+            "b64_bytes": len(b64),
+            "parts": parts,
+            "part_count": len(parts),
+            "digest": digest,
+            "ledger_count": len(self.rows),
+            "vector_count": len(vshort),
+            "pack": pack,
+            "snap": snap,
+        }
+
+
+def decode_alpha_transport_parts(parts):
+    b64 = "".join(parts)
+    raw = zlib.decompress(base64.b64decode(b64.encode("ascii")))
+    return json.loads(raw.decode("utf-8"))
+
+
+def estimate_diag_log_bytes(b64_bytes, part_count, init_bytes=180, counter_bytes=220, closeout_bytes=280):
+    # PART lines: prefix + meta + data
+    part_overhead = part_count * 90
+    return int(init_bytes + counter_bytes + closeout_bytes + b64_bytes + part_overhead)
+
+
+def run_alpha_identity_log_budget_preflight():
+    """Static preflight for R1 log-budget repair. No Cloud."""
+    rows, passed, failed = [], 0, 0
+
+    def ok(n, c, detail=""):
+        nonlocal passed, failed
+        if c:
+            passed += 1
+            rows.append({"name": n, "pass": True, "detail": detail})
+        else:
+            failed += 1
+            rows.append({"name": n, "pass": False, "detail": str(detail)})
+
+    # Source gates: PENDING/EXEC gated when alpha on
+    from pathlib import Path
+    regime = Path(__file__).with_name("cg_regime_rebal_time_trade.py").read_text(encoding="utf-8")
+    ok("P01_pending_gated_by_alpha",
+       'not getattr(self, "cg_alpha_identity_enable", False)' in regime
+       and "CG_REGIME_TIME_PENDING" in regime)
+    ok("P02_exec_gated_by_alpha",
+       regime.count('not getattr(self, "cg_alpha_identity_enable", False)') >= 2
+       and "CG_REGIME_TIME_EXEC" in regime)
+
+    # Fixture: 1500 events with reused vectors
+    eng = AlphaIdentityEngine()
+    eng.set_enabled(True)
+    t0 = datetime(2012, 1, 3, 9, 45)
+    for i in range(1500):
+        w = {"SPY": round(0.55 + (i % 7) * 0.03, 4), "BIL": round(0.45 - (i % 7) * 0.03, 4)}
+        eng.observe_capture(t0 + timedelta(days=i * 3), w, slot_minutes=165,
+                            feature_cutoff=t0 + timedelta(days=i * 3),
+                            flags={"w2": i % 2, "ids": "WATCH" if i % 3 else "NORMAL"})
+        eng.on_bar("SPY", t0 + timedelta(days=i * 3, minutes=5), 100.0 + i * 0.01)
+        if i % 5 == 0:
+            eng.observe_nav(t0 + timedelta(days=i * 3, minutes=30), 10000 * (1.0 + i * 0.0001))
+    tr = eng.build_transport_pack()
+    est = estimate_diag_log_bytes(tr["b64_bytes"], tr["part_count"])
+    ok("P03_fixture_ledger_complete", tr["ledger_count"] == 1500)
+    ok("P04_vectors_deduped", tr["vector_count"] <= 20)
+    ok("P05_budget_lt_25kb", est < DIAG_LOG_BUDGET_BYTES, f"est={est}")
+    ok("P06_capacity", MAX_LEDGER >= EXPECTED_EVENTS_MAX)
+    decoded = decode_alpha_transport_parts(tr["parts"])
+    ok("P07_roundtrip", decoded.get("n") == 1500 and len(decoded.get("E") or []) == 1500)
+    # decision_time at idx1; exe is last element; fc_eq at idx10
+    ok("P08_fc_le_dt", all(
+        (e[10] == 1) or (len(e) > 12 and e[11] <= e[1]) for e in decoded["E"]))
+    ok("P09_exe_after_dt", all(e[-1] > e[1] for e in decoded["E"]))
+    # disabled noop
+    eng0 = AlphaIdentityEngine()
+    eng0.set_enabled(False)
+    eng0.observe_capture(t0, {"SPY": 1.0})
+    ok("P10_disabled_noop", eng0.counters["captures"] == 0)
+
+    return {
+        "passed": passed, "failed": failed, "total": passed + failed, "rows": rows,
+        "estimate_diag_log_bytes": est,
+        "fixture_raw_bytes": tr["raw_bytes"],
+        "fixture_b64_bytes": tr["b64_bytes"],
+        "fixture_parts": tr["part_count"],
+        "fixture_ledger_count": tr["ledger_count"],
+        "fixture_vector_count": tr["vector_count"],
+        "diag_budget_bytes": DIAG_LOG_BUDGET_BYTES,
+        "expected_events_range": [EXPECTED_EVENTS_MIN, EXPECTED_EVENTS_MAX],
+        "max_ledger": MAX_LEDGER,
+        "publication_path": "CG_ALPHA_ID_CLOSEOUT_PART zlib+b64 (D0-style controlled parts)",
+        "amplification_cause": (
+            "Per-event CG_REGIME_TIME_PENDING/EXEC while _sr_on=0 and alpha forced _ms_on; "
+            "~150B/event * ~700+/year exhausted 100KB by 2017-09."
+        ),
+        "verbose_pending_exec_gated": True,
+    }
+
+
+def _alpha_preflight_attach_unit(rep):
+    unit = run_alpha_identity_static_tests()
+    # mutate copy
+    rows = list(rep.get("rows") or [])
+    passed = int(rep.get("passed") or 0)
+    failed = int(rep.get("failed") or 0)
+    if unit["failed"] == 0:
+        passed += 1
+        rows.append({"name": "P11_unit", "pass": True, "detail": unit})
+    else:
+        failed += 1
+        rows.append({"name": "P11_unit", "pass": False, "detail": unit})
+    rep = dict(rep)
+    rep["passed"] = passed
+    rep["failed"] = failed
+    rep["total"] = passed + failed
+    rep["rows"] = rows
+    rep["unit"] = unit
+    return rep
+
 
 def run_alpha_identity_static_tests():
     rows, passed, failed = [], 0, 0
@@ -829,13 +1033,23 @@ def run_alpha_identity_static_tests():
     eng3.on_bar("QQQ", t0 + timedelta(minutes=1), 200.0)
     ok("A15_d_applied", abs(eng3._d_equity() - 1.0) < 1e-9)
     ok("A16_asset_map_e", ASSET_MAP.get("e_equals_b") is True)
+    # same-day identical hash still records event-time row
+    eng.observe_capture(t0 + timedelta(minutes=1), {"SPY": 0.6, "BIL": 0.4}, slot_minutes=165)
+    ok("A17_event_kept_on_hash_reuse", eng.counters["captures"] >= 2)
 
     return {"passed": passed, "failed": failed, "total": passed + failed, "rows": rows}
 
 
+def run_alpha_identity_log_budget_preflight_full():
+    rep = run_alpha_identity_log_budget_preflight()
+    return _alpha_preflight_attach_unit(rep)
+
+
 if __name__ == "__main__":
-    r = run_alpha_identity_static_tests()
-    print(json.dumps({k: r[k] for k in ("passed", "failed", "total")}))
+    r = run_alpha_identity_log_budget_preflight_full()
+    print(json.dumps({k: r[k] for k in (
+        "passed", "failed", "total", "estimate_diag_log_bytes",
+        "fixture_b64_bytes", "fixture_parts", "fixture_ledger_count")}, indent=2))
     for row in r["rows"]:
         if not row["pass"]:
             print("FAIL", row["name"], row["detail"])

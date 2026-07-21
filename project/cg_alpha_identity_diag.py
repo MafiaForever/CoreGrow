@@ -3,7 +3,8 @@ from AlgorithmImports import *
 from datetime import datetime
 from cg_alpha_identity_core import (
     AlphaIdentityEngine, EXPERIMENT, PHASE, ASSET_MAP, SCHEMA,
-    run_alpha_identity_static_tests, RESEARCH_END,
+    run_alpha_identity_static_tests, RESEARCH_END, MUTE_PREFIXES_WHEN_ALPHA,
+    DIAG_LOG_BUDGET_BYTES, estimate_diag_log_bytes, decode_alpha_transport_parts,
 )
 import json
 
@@ -66,13 +67,25 @@ class CgAlphaIdentityDiagMixin:
         for pref in ("CG_ALPHA_ID_", "CG_ALPHA_IDENTITY_"):
             if pref not in lp:
                 lp.append(pref)
+        # Strip regime-time allowlist reinjection so mute can suppress floods.
+        lp = [p for p in lp if not str(p).startswith("CG_REGIME_TIME")]
         self.log_only_prefixes = lp
+        if on:
+            mp = list(getattr(self, "log_mute_prefixes", None) or [])
+            for pref in MUTE_PREFIXES_WHEN_ALPHA:
+                if pref not in mp:
+                    mp.append(pref)
+            # Mute verbose Maisr P1 noise while alpha owns the diagnostic budget.
+            for pref in ("CG_MAISR_P1_", "CG_MAISR_D2_", "CG_W2_TRADE"):
+                if pref not in mp:
+                    mp.append(pref)
+            self.log_mute_prefixes = mp
         if not on:
             self.log("CG_ALPHA_ID_INIT,enable=0,diagnostic_real_order_count=0")
             return
         self.log(
             f"CG_ALPHA_ID_INIT,enable=1,experiment={EXPERIMENT},phase={PHASE},"
-            f"schema={SCHEMA},e_equals_b=1,cost_bps=0,lag_min=0"
+            f"schema={SCHEMA},e_equals_b=1,cost_bps=0,lag_min=0,budget={DIAG_LOG_BUDGET_BYTES}"
         )
 
     def _AlphaIdentityCashTk(self):
@@ -236,82 +249,52 @@ class CgAlphaIdentityDiagMixin:
         if eng is None:
             self.log("CG_ALPHA_ID_CLOSEOUT,status=NO_ENGINE")
             return
-        snap = eng.finalize()
-        # Compact multi-line export (log budget)
+        try:
+            tr = eng.build_transport_pack()
+        except Exception as e:
+            self.log(f"CG_ALPHA_ID_CLOSEOUT,status=PACK_FAIL,err={type(e).__name__}")
+            return
+        snap = tr.get("snap") or {}
         ctr = snap.get("counters") or {}
+        est = estimate_diag_log_bytes(tr["b64_bytes"], tr["part_count"])
+        # One pre-closeout technical counter line (required).
         self.log(
-            f"CG_ALPHA_ID_CLOSEOUT,status=OK,parity={int(bool(parity_ok))},"
-            f"ledger={snap.get('ledger_count')},verdict={snap.get('verdict')},"
-            f"captures={ctr.get('captures')},spy_bars={ctr.get('spy_bars')},"
+            f"CG_ALPHA_ID_COUNTERS,captures={ctr.get('captures')},ledger={tr.get('ledger_count')},"
+            f"vectors={tr.get('vector_count')},spy_bars={ctr.get('spy_bars')},"
             f"qqq_bars={ctr.get('qqq_bars')},day_marks={ctr.get('day_marks')},"
-            f"nav_marks={ctr.get('nav_marks')},err={getattr(self,'_alpha_err',0)}"
+            f"nav_marks={ctr.get('nav_marks')},ooo={ctr.get('out_of_order')},"
+            f"same_bar={ctr.get('same_bar_blocked')},err={getattr(self,'_alpha_err',0)},"
+            f"b64={tr.get('b64_bytes')},parts={tr.get('part_count')},est={est}"
         )
-        pw = snap.get("pairwise") or {}
-        self.log(
-            f"CG_ALPHA_ID_PAIRWISE,"
-            f"residual_vs_spy={pw.get('residual_vs_spy')},"
-            f"residual_vs_qqq={pw.get('residual_vs_qqq')},"
-            f"residual_oos_vs_spy={pw.get('residual_oos_vs_spy')},"
-            f"residual_oos_vs_qqq={pw.get('residual_oos_vs_qqq')},"
-            f"residual_crisis_vs_spy={pw.get('residual_crisis_vs_spy')},"
-            f"residual_crisis_vs_qqq={pw.get('residual_crisis_vs_qqq')},"
-            f"selection_effect={pw.get('selection_effect')},"
-            f"simple_trend_check={pw.get('simple_trend_check')},"
-            f"e_equals_b={int(bool(pw.get('e_equals_b')))}"
-        )
-        # Period residuals
-        for pname, prow in (snap.get("periods") or {}).items():
+        if est >= DIAG_LOG_BUDGET_BYTES:
             self.log(
-                f"CG_ALPHA_ID_PERIOD,period={pname},"
-                f"a_wf={prow.get('A_CG_FULL_wealth')},a_dd={prow.get('A_CG_FULL_maxdd')},"
-                f"b_wf={prow.get('B_wealth')},c_wf={prow.get('C_wealth')},"
-                f"d_wf={prow.get('D_wealth')},g_wf={prow.get('G_wealth')},"
-                f"r_spy={prow.get('residual_vs_spy')},r_qqq={prow.get('residual_vs_qqq')}"
+                f"CG_ALPHA_ID_CLOSEOUT,status=BUDGET_EXCEEDED,est={est},"
+                f"budget={DIAG_LOG_BUDGET_BYTES},ledger={tr.get('ledger_count')},"
+                f"digest={tr.get('digest')}"
             )
+            self._alpha_closeout_snap = snap
+            return
+        # Controlled PART protocol (same pattern as D0_COMPACT_CLOSEOUT_PART).
+        pc = int(tr["part_count"])
+        digest = tr["digest"]
+        for i, part in enumerate(tr["parts"], 1):
+            self.log(
+                f"CG_ALPHA_ID_CLOSEOUT_PART,run={digest},i={i},n={pc},"
+                f"b64={part}"
+            )
+        pw = snap.get("pairwise") or {}
         conc = snap.get("single_year_concentration") or {}
         self.log(
-            f"CG_ALPHA_ID_VERDICT,verdict={snap.get('verdict')},"
-            f"top_year={conc.get('top_year')},top_share={conc.get('top_share')},"
-            f"dominated={int(bool(conc.get('dominated_by_one_year')))},"
-            f"reason={str(snap.get('verdict_reason') or '')[:400]}"
+            f"CG_ALPHA_ID_CLOSEOUT,status=OK,parity={int(bool(parity_ok))},"
+            f"ledger={tr.get('ledger_count')},vectors={tr.get('vector_count')},"
+            f"verdict={snap.get('verdict')},digest={digest},parts={pc},"
+            f"b64={tr.get('b64_bytes')},est={est},"
+            f"r_oos_spy={pw.get('residual_oos_vs_spy')},"
+            f"r_oos_qqq={pw.get('residual_oos_vs_qqq')},"
+            f"r_cr_spy={pw.get('residual_crisis_vs_spy')},"
+            f"r_cr_qqq={pw.get('residual_crisis_vs_qqq')},"
+            f"sel={pw.get('selection_effect')},trend={pw.get('simple_trend_check')},"
+            f"top_year={conc.get('top_year')},dominated={int(bool(conc.get('dominated_by_one_year')))}"
         )
-        # Compact JSON blob parts for post-cloud publish (chunked)
-        payload = {
-            "experiment": snap.get("experiment"),
-            "phase": snap.get("phase"),
-            "schema": snap.get("schema"),
-            "asset_map": ASSET_MAP,
-            "counters": ctr,
-            "metrics": snap.get("metrics"),
-            "pairwise": pw,
-            "periods": snap.get("periods"),
-            "years": snap.get("years"),
-            "protection": {
-                "valid": (snap.get("protection") or {}).get("valid"),
-                "event_count": (snap.get("protection") or {}).get("event_count"),
-                "mean_delta_signed": (snap.get("protection") or {}).get("mean_delta_signed"),
-            },
-            "verdict": snap.get("verdict"),
-            "verdict_reason": snap.get("verdict_reason"),
-            "single_year_concentration": conc,
-            "ledger_count": snap.get("ledger_count"),
-            "cost_bps": snap.get("cost_bps"),
-            "lag_minutes": snap.get("lag_minutes"),
-            "proxy_execution_rule": snap.get("proxy_execution_rule"),
-            "alpha_err": getattr(self, "_alpha_err", 0),
-        }
-        raw = json.dumps(payload, separators=(",", ":"), default=str)
-        chunk = 3500
-        n = max(1, (len(raw) + chunk - 1) // chunk)
-        self.log(f"CG_ALPHA_ID_PAYLOAD_META,parts={n},bytes={len(raw)}")
-        for i in range(n):
-            self.log(f"CG_ALPHA_ID_PAYLOAD,{i + 1}/{n},{raw[i * chunk:(i + 1) * chunk]}")
-        # Ledger sample (bounded)
-        for row in (snap.get("rows_sample") or [])[:16]:
-            self.log(
-                f"CG_ALPHA_ID_LEDGER,seq={row.get('seq')},dt={row.get('decision_time')},"
-                f"hash={row.get('target_hash')},signed={row.get('signed_equity_exposure')},"
-                f"gross={row.get('gross_equity_exposure')},cash={row.get('cash_weight')},"
-                f"w2={row.get('w2')},ids={row.get('ids')},src={row.get('source')}"
-            )
         self._alpha_closeout_snap = snap
+        self._alpha_transport = tr
