@@ -128,8 +128,12 @@ class ModelAShadowRuntimeAccounting:
                 rob.on_open(cur_open.episode_id, ot)
             if mb is not None and getattr(mb, "enabled", False):
                 mb.on_open(cur_open.episode_id, ot)
+            # P0 bank: only open episodes with causally bound entry latch.
             if pr is not None and getattr(pr, "enabled", False):
-                pr.on_open(cur_open.episode_id, ot)
+                led = self.p0_ledger
+                eid0 = str(getattr(cur_open, "episode_id", "") or "")
+                if led is not None and eid0 in getattr(led, "rows", {}):
+                    pr.on_open(cur_open.episode_id, ot)
 
     def update(self, snap_b, snap_c, shadow_out, d03b_enabled=True, prod_state=None,
                fixed_only_shadow_enable=False, d05b_enable=False, d06b_enable=False):
@@ -358,6 +362,8 @@ class ModelAShadowRuntimeAccounting:
                 self.model_b.finalize_eoa()
             if self.d06b_enable and self.p0_replay is not None:
                 self.p0_replay.finalize_eoa()
+            if self.d06b_enable and self.p0_ledger is not None:
+                self.p0_ledger.finalize_eoa()
             proxy_snap = enrich_proxy_snap_d04a(self.proxy.snapshot())
             proxy_snap = enrich_proxy_snap_d04b(
                 proxy_snap, self.robustness.snapshot())
@@ -710,8 +716,9 @@ def run_damage_d03b1_static_tests(param_map=None):
     rt_p0.p0_ledger.set_enabled(True)
     rt_p0.p0_replay = P0HistoricalReplayBank()
     t_w2 = datetime(2024, 3, 11, 9, 45, 0)
-    rt_p0.p0_ledger.observe_protection_apply(t_w2, 1.0, 0.8, True)
-    rt_p0.p0_ledger.bind_episode("EP_P0", t0, "W2")
+    tok = rt_p0.p0_ledger.begin_latch(t_w2)
+    rt_p0.p0_ledger.complete_latch(tok, t_w2, 1.0, 0.8, True)
+    rt_p0.p0_ledger.attach_d0_episode("EP_P0", t0, "W2")
     sb3 = _snap_b(t0, 60)
     sb3["episode_id"] = "EP_P0"
     sb3["decision_time"] = t0
@@ -728,6 +735,10 @@ def run_damage_d03b1_static_tests(param_map=None):
     ok("B08g_d06b_comparison_flag", out_p0.get("p0_comparison_eligible") is True)
     # Frozen P1-P5 path when d06b off: p0 still UNAVAILABLE
     ok("B08h_p1p5_frozen_when_off", out_fo["p0_numeric_restore_fraction"] == UNAVAILABLE)
+    recon = rt_p0.p0_ledger.counter_reconciliation()
+    ok("B08i_recon", recon.get("gate") == "PASS", detail=str(recon))
+    ok("B08j_binds_gt0", rt_p0.p0_ledger.counters["bound_entry_snapshots"] > 0)
+    ok("B08k_eligible_gt0", len(rt_p0.p0_ledger.eligible_episode_ids()) > 0)
 
     # D0.4A proxy extras present on fixed-only runtime
     ok("B09_d04a_proxy_extras",

@@ -252,6 +252,15 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
         # W2 first
         if w2_on:
             active = self._DftW2Active(spy_px, ema75, spy20)
+            # D0.6B-R1: latch immutable P0 token BEFORE intended exposure mutates.
+            _p0_tok = None
+            try:
+                if bool(getattr(self, "cg_damage_duration_d06b_p0_enable", False)):
+                    _bl = getattr(self, "_D06bP0BeginLatch", None)
+                    if callable(_bl) and active:
+                        _p0_tok = _bl(getattr(self, "time", None))
+            except Exception:
+                _p0_tok = None
             eq_b = self._DftEqGross(out, eq_set)
             cash_add = 0.0
             if active:
@@ -271,12 +280,12 @@ class CgDefensiveTradeMixin(CgRegimeRebalTimeTradeMixin):
                 )
             self._cg_w2_last_active = active
             self._cg_w2_last_eq = eq_a
-            # D0.6B P0: passive equity-gross observe only (no target mutation).
+            # D0.6B-R1: complete latch with eq_b/eq_a in same causal call (no target mutation).
             try:
                 if bool(getattr(self, "cg_damage_duration_d06b_p0_enable", False)):
-                    obs = getattr(self, "_D06bP0ObserveProtection", None)
-                    if callable(obs):
-                        obs(getattr(self, "time", None), eq_b, eq_a, active)
+                    _cl = getattr(self, "_D06bP0CompleteLatch", None)
+                    if callable(_cl):
+                        _cl(_p0_tok, getattr(self, "time", None), eq_b, eq_a, active)
             except Exception:
                 pass
 

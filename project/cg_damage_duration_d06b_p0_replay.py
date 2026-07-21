@@ -8,6 +8,7 @@ from cg_damage_duration_d03b_proxy_replay import FixedOnlySpyProxyReplay
 from cg_damage_duration_d04a_ablation import P5_FULL, D04A_BLOCKS
 from cg_damage_duration_d06b_p0_ledger import (
     EXPERIMENT, PHASE, P0_SOURCE_NAME, run_d06b_ledger_static_tests,
+    CAT_NA,
 )
 
 P0_CURRENT = "P0_CURRENT"

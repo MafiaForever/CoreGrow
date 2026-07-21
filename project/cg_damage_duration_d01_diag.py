@@ -354,17 +354,26 @@ class CgDamageDurationD01DiagMixin:
                     self._dmg_d03b.d06b_enable = True
                 self._DamageD01Log(
                     "CG_DAMAGE_D06B_P0,enable=1,space=equity_gross,"
-                    "hook=CgDefensiveTradeApply+Capture,shadow_only=1"
+                    "hook=token_latch+EV_PROTECTION_attach,shadow_only=1"
                 )
             except Exception:
                 self._dmg_p0 = None
 
-    def _D06bP0ObserveProtection(self, decision_time, eq_b, eq_a, w2_active):
+    def _D06bP0BeginLatch(self, decision_time):
+        led = getattr(self, "_dmg_p0", None)
+        if led is None:
+            return None
+        try:
+            return led.begin_latch(decision_time)
+        except Exception:
+            return None
+
+    def _D06bP0CompleteLatch(self, token, decision_time, eq_b, eq_a, w2_active):
         led = getattr(self, "_dmg_p0", None)
         if led is None:
             return
         try:
-            led.observe_protection_apply(decision_time, eq_b, eq_a, w2_active)
+            led.complete_latch(token, decision_time, eq_b, eq_a, w2_active)
         except Exception:
             pass
 
@@ -384,12 +393,11 @@ class CgDamageDurationD01DiagMixin:
         if led is None:
             return
         try:
-            led.bind_episode(episode_id, decision_time, protection_source)
+            ok = led.attach_d0_episode(episode_id, decision_time, protection_source)
             d03b = getattr(self, "_dmg_d03b", None)
-            if d03b is not None and led.is_not_applicable(episode_id):
-                pr = getattr(d03b, "p0_replay", None)
-                if pr is not None:
-                    pr.mark_not_applicable(episode_id)
+            pr = getattr(d03b, "p0_replay", None) if d03b is not None else None
+            if pr is not None and (not ok or led.is_not_applicable(episode_id)):
+                pr.mark_not_applicable(episode_id)
         except Exception:
             pass
 
